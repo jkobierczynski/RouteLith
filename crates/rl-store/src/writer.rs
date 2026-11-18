@@ -711,7 +711,7 @@ fn next_wal_seq(dir: &Path, last: Option<u64>) -> Result<u64, StoreError> {
         None => Ok(1),
         Some(s) => s.checked_add(1).ok_or_else(|| StoreError::Corrupt {
             path: layout::wal_path(dir, s),
-            reason: "WAL sequence numbers are exhausted; no WAL file was created or removed".into(),
+            reason: "WAL sequence numbers are exhausted; cannot create the next WAL file".into(),
         }),
     }
 }
