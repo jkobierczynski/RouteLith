@@ -87,10 +87,8 @@ fn check_privileges(cfg: &Config, path: &Path) -> usize {
         })
     };
     let mut warnings = 0;
-    for v6 in [false, true] {
-        if needs(v6)
-            && let Err(e) = rl_probe::check_permission(v6)
-        {
+    for v6 in [false, true].into_iter().filter(|&v6| needs(v6)) {
+        if let Err(e) = rl_probe::check_permission(v6) {
             eprintln!(
                 "{}: warning: this user cannot send ICMPv{}: {e}",
                 path.display(),

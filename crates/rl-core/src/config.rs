@@ -380,9 +380,8 @@ impl Validator<'_> {
                     target_names.insert(name, position(self.src, span.start).0);
                 }
                 let settings = target.settings().over(&group_settings);
-                if let Some(t) = self.target(&target, &gname, &settings, span)
-                    && measured_here
-                {
+                let t = self.target(&target, &gname, &settings, span);
+                if let (Some(t), true) = (t, measured_here) {
                     targets.push(t);
                 }
             }
@@ -463,9 +462,7 @@ impl Validator<'_> {
         if !valid_name(name) {
             self.error(&raw.name.span(), name_rule("target name"));
         }
-        if let Some(probe) = &raw.probe
-            && probe.get_ref() != "icmp"
-        {
+        if let Some(probe) = raw.probe.as_ref().filter(|p| p.get_ref() != "icmp") {
             let p = probe.get_ref();
             let msg = if ["tcp", "udp", "dns", "http", "https"].contains(&p.as_str()) {
                 format!("probe {p:?} is not available until M1; M0 measures \"icmp\" only")
@@ -512,9 +509,13 @@ impl Validator<'_> {
             (None, None) => None,
         };
 
-        if let (Some(step), Some(spread), Some(timeout)) = (step, spread, timeout)
-            && spread + timeout > step
-        {
+        let overrun = match (step, spread, timeout) {
+            (Some(step), Some(spread), Some(timeout)) if spread + timeout > step => {
+                Some((step, spread, timeout))
+            }
+            _ => None,
+        };
+        if let Some((step, spread, timeout)) = overrun {
             let at = s.spread.as_ref().map_or(raw.name.span(), Spanned::span);
             self.error(
                 &at,
