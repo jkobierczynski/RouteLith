@@ -438,8 +438,9 @@ impl Validator<'_> {
 
     fn server(&mut self, raw: RawServer) -> Option<ServerConfig> {
         let mut ok = true;
-        let data_dir = raw.data_dir.get_ref().trim();
-        if data_dir.is_empty() {
+        // Blank is an error, but a real name keeps its spaces.
+        let data_dir = raw.data_dir.get_ref().as_str();
+        if data_dir.trim().is_empty() {
             self.error(&raw.data_dir.span(), "data_dir must not be empty");
             ok = false;
         } else if data_dir.contains('\0') {
@@ -1214,6 +1215,13 @@ name = "G"
         assert_eq!(position("ab\ncµd", 6), (2, 3));
         assert_eq!(position("ab\n", 3), (2, 1));
         assert_eq!(position("", 0), (1, 1));
+    }
+
+    #[test]
+    fn data_dir_keeps_its_spaces() {
+        let src = MINIMAL.replace("data_dir = \"/tmp/rl\"", "data_dir = \"/tmp/rl \"");
+        let cfg = parse(&src).config.unwrap();
+        assert_eq!(cfg.server.data_dir, PathBuf::from("/tmp/rl "));
     }
 
     #[test]
