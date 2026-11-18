@@ -82,7 +82,7 @@ impl Drop for PendingGuard<'_> {
 impl Engine {
     pub(super) fn open(v6: bool, payload_size: usize) -> Result<Self, ProbeError> {
         let sock = PingSocket::open(v6).map_err(|e| match e.kind() {
-            ErrorKind::PermissionDenied => ProbeError::PingSocketNotPermitted,
+            ErrorKind::PermissionDenied => ProbeError::PingSocketNotPermitted(e),
             _ => ProbeError::Io(e),
         })?;
         let shared = Arc::new(Shared {

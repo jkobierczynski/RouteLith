@@ -12,6 +12,8 @@ pub fn parse(s: &str) -> Result<Duration, String> {
         None => (s, "s"),
     };
     let num = num.trim();
+    // One leading '+' is allowed, as Rust's float parser accepts it.
+    let num = num.strip_prefix('+').unwrap_or(num);
     // Plain decimal digits only: rejects "-1", "inf", "NaN" and exponents.
     let valid = !num.is_empty()
         && num.bytes().filter(|&b| b == b'.').count() <= 1
@@ -37,8 +39,13 @@ pub fn parse(s: &str) -> Result<Duration, String> {
 }
 
 /// Short display form: whole hours, minutes or seconds where exact,
-/// otherwise milliseconds.
+/// otherwise milliseconds (with a fraction below 1 ms).
 pub fn format(d: Duration) -> String {
+    if d.subsec_nanos() % 1_000_000 != 0 {
+        let ms = d.as_secs_f64() * 1e3;
+        let s = format!("{ms:.6}");
+        return format!("{}ms", s.trim_end_matches('0').trim_end_matches('.'));
+    }
     let ms = d.as_millis();
     if ms % 1000 != 0 {
         return format!("{ms}ms");
@@ -68,12 +75,14 @@ mod tests {
         assert_eq!(parse("500us"), Ok(Duration::from_micros(500)));
         assert_eq!(parse("500µs"), Ok(Duration::from_micros(500)));
         assert_eq!(parse(" 10 s "), Ok(Duration::from_secs(10)));
+        assert_eq!(parse("+250ms"), Ok(Duration::from_millis(250)));
     }
 
     #[test]
     fn rejects_garbage() {
         for bad in [
-            "", "s", "-1s", "inf", "NaN", "1e3s", "1.2.3s", ".s", "5d", "5 min",
+            "", "s", "-1s", "++1s", "+-1s", "+", "inf", "NaN", "1e3s", "1.2.3s", ".s", "5d",
+            "5 min",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
@@ -86,5 +95,7 @@ mod tests {
         assert_eq!(format(Duration::from_secs(90)), "90s");
         assert_eq!(format(Duration::from_millis(1500)), "1500ms");
         assert_eq!(format(Duration::ZERO), "0s");
+        assert_eq!(format(Duration::from_micros(500)), "0.5ms");
+        assert_eq!(format(Duration::from_micros(1_000_250)), "1000.25ms");
     }
 }

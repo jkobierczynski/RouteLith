@@ -11,6 +11,7 @@ mod verify;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -100,7 +101,13 @@ fn run(fut: impl std::future::Future<Output = ExitCode>) -> ExitCode {
         .enable_all()
         .build()
     {
-        Ok(rt) => rt.block_on(fut),
+        Ok(rt) => {
+            let code = rt.block_on(fut);
+            // Don't wait for blocking work left behind, such as a system DNS
+            // lookup that outlived its timeout: the result is already out.
+            rt.shutdown_timeout(Duration::from_millis(100));
+            code
+        }
         Err(e) => {
             eprintln!("routelith: cannot start async runtime: {e}");
             ExitCode::from(2)

@@ -48,9 +48,16 @@ pub(crate) async fn icmp(args: IcmpArgs) -> ExitCode {
         name: args.host.clone(),
         addr,
     };
+    let Some(spread) = args.interval.checked_mul(u32::from(args.count)) else {
+        eprintln!(
+            "routelith check: interval {:?} times {} samples is too long",
+            args.interval, args.count
+        );
+        return ExitCode::from(2);
+    };
     let plan = RoundPlan {
         count: args.count,
-        spread: args.interval * u32::from(args.count),
+        spread,
         timeout: args.timeout,
         round_start: SystemTime::now(),
     };

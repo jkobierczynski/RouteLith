@@ -1,13 +1,16 @@
 //! `routelith ctl verify`: validate a configuration file without starting
 //! anything (architecture doc §13.1).
 
-use std::net::IpAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Args;
-use rl_core::config::{self, Config, Family, Severity};
+use rl_core::config::{self, Config, Family, Severity, TargetConfig};
+use tokio::sync::Semaphore;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -22,15 +25,26 @@ pub(crate) struct VerifyArgs {
 
 /// Exit codes: 0 valid (warnings allowed), 1 invalid, 2 file unreadable.
 pub(crate) async fn run(args: VerifyArgs) -> ExitCode {
-    let src = match std::fs::read_to_string(&args.config) {
-        Ok(s) => s,
+    let file = args.config.display();
+    let bytes = match std::fs::read(&args.config) {
+        Ok(b) => b,
         Err(e) => {
-            eprintln!("routelith ctl verify: {}: {e}", args.config.display());
+            eprintln!("routelith ctl verify: {file}: {e}");
             return ExitCode::from(2);
         }
     };
+    let src = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "{file}: error: not valid UTF-8 (byte {}); TOML files must be UTF-8",
+                e.utf8_error().valid_up_to()
+            );
+            eprintln!("{file}: invalid (1 error)");
+            return ExitCode::from(1);
+        }
+    };
     let parsed = config::parse(&src);
-    let file = args.config.display();
     for d in &parsed.diagnostics {
         eprintln!("{file}:{d}");
     }
@@ -48,10 +62,14 @@ pub(crate) async fn run(args: VerifyArgs) -> ExitCode {
         .iter()
         .filter(|d| d.severity == Severity::Warning)
         .count();
-    warnings += check_privileges(&cfg, &args.config);
-    if !args.no_resolve {
-        warnings += check_hosts(&cfg, &args.config).await;
-    }
+    let resolved = if args.no_resolve {
+        HashMap::new()
+    } else {
+        let (resolved, n) = check_hosts(&cfg, &args.config).await;
+        warnings += n;
+        resolved
+    };
+    warnings += check_privileges(&cfg, &resolved, &args.config);
     println!("{}", summary(&cfg, warnings));
     ExitCode::SUCCESS
 }
@@ -77,55 +95,124 @@ fn summary(cfg: &Config, warnings: usize) -> String {
     )
 }
 
+/// Address families a target will use: `(v4, v6)`.
+///
+/// `prefer-v6` uses IPv6 when its host has an IPv6 address, else IPv4, so it
+/// needs the family its addresses select; `None` when that is unknown (not
+/// resolved).
+fn families_used(t: &TargetConfig, addrs: Option<&[IpAddr]>) -> Option<(bool, bool)> {
+    match t.family {
+        Family::V4 => Some((true, false)),
+        Family::V6 => Some((false, true)),
+        Family::Both => Some((true, true)),
+        Family::PreferV6 => {
+            let literal = t.host.parse::<IpAddr>().ok();
+            let addrs = match (&literal, addrs) {
+                (Some(a), _) => std::slice::from_ref(a),
+                (None, Some(a)) => a,
+                (None, None) => return None,
+            };
+            let v6 = addrs.iter().any(IpAddr::is_ipv6);
+            let v4 = !v6 && addrs.iter().any(IpAddr::is_ipv4);
+            Some((v4, v6))
+        }
+    }
+}
+
 /// Warn when this user may not open the ICMP sockets the targets need.
-fn check_privileges(cfg: &Config, path: &Path) -> usize {
-    let needs = |v6: bool| {
-        cfg.targets.iter().any(|t| match t.family {
-            Family::V4 => !v6,
-            Family::V6 => v6,
-            Family::Both | Family::PreferV6 => true,
-        })
-    };
+fn check_privileges(cfg: &Config, resolved: &HashMap<usize, Vec<IpAddr>>, path: &Path) -> usize {
+    // For each family: needed for certain, or only by prefer-v6 targets
+    // whose addresses are unknown.
+    let (mut need, mut maybe) = ([false; 2], [false; 2]);
+    for t in &cfg.targets {
+        match families_used(t, resolved.get(&t.line).map(Vec::as_slice)) {
+            Some((v4, v6)) => {
+                need[0] |= v4;
+                need[1] |= v6;
+            }
+            None => maybe = [true; 2],
+        }
+    }
     let mut warnings = 0;
-    for v6 in [false, true].into_iter().filter(|&v6| needs(v6)) {
+    for (i, v6) in [false, true].into_iter().enumerate() {
+        if !need[i] && !maybe[i] {
+            continue;
+        }
         if let Err(e) = rl_probe::check_permission(v6) {
-            eprintln!(
-                "{}: warning: this user cannot send ICMPv{}: {e}",
-                path.display(),
-                if v6 { 6 } else { 4 }
-            );
+            let n = if v6 { 6 } else { 4 };
+            if need[i] {
+                eprintln!(
+                    "{}: warning: this user cannot send ICMPv{n}: {e}",
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "{}: warning: this user cannot send ICMPv{n}, which prefer-v6 targets \
+                     use when their host has {} address: {e}",
+                    path.display(),
+                    if v6 { "an IPv6" } else { "only an IPv4" }
+                );
+            }
             warnings += 1;
         }
     }
     warnings
 }
 
-/// Warn for every host name that does not resolve to an address of its family.
-async fn check_hosts(cfg: &Config, path: &Path) -> usize {
+/// Lookups running at once; the rest wait without using their timeout.
+const RESOLVE_PARALLEL: usize = 16;
+
+/// Resolve every host name, warning for each that does not resolve to an
+/// address of its family. Returns the addresses found, by target line.
+async fn check_hosts(cfg: &Config, path: &Path) -> (HashMap<usize, Vec<IpAddr>>, usize) {
+    let permits = Arc::new(Semaphore::new(RESOLVE_PARALLEL));
     let mut tasks = tokio::task::JoinSet::new();
     for t in &cfg.targets {
         if t.host.parse::<IpAddr>().is_ok() {
             continue;
         }
         let (host, family, line) = (t.host.clone(), t.family, t.line);
+        let permits = permits.clone();
         tasks.spawn(async move {
-            let lookup =
-                tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host.as_str(), 0)));
-            let problem = match lookup.await {
-                Err(_) => Some("lookup timed out".to_string()),
-                Ok(Err(e)) => Some(e.to_string()),
-                Ok(Ok(addrs)) => {
-                    let addrs: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-                    missing_family(family, &addrs)
+            let lookup = async {
+                // The deadline starts once the lookup may run, and a timed-out
+                // lookup keeps its permit until the system resolver returns.
+                let permit = permits.acquire_owned().await.ok();
+                let name = host.clone();
+                let blocking = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    (name.as_str(), 0).to_socket_addrs()
+                });
+                tokio::time::timeout(RESOLVE_TIMEOUT, blocking).await
+            };
+            let (addrs, problem) = match lookup.await {
+                Err(_) => (Vec::new(), Some("lookup timed out".to_string())),
+                Ok(Err(e)) => (Vec::new(), Some(format!("lookup failed: {e}"))),
+                Ok(Ok(Err(e))) => (Vec::new(), Some(e.to_string())),
+                Ok(Ok(Ok(it))) => {
+                    let addrs: Vec<IpAddr> = it.map(|a| a.ip()).collect();
+                    let problem = missing_family(family, &addrs);
+                    (addrs, problem)
                 }
             };
-            problem.map(|p| (line, host, p))
+            (line, host, addrs, problem)
         });
     }
     let mut problems: Vec<(usize, String, String)> = Vec::new();
+    let mut resolved = HashMap::new();
+    let mut failed_tasks = 0;
     while let Some(joined) = tasks.join_next().await {
-        if let Ok(Some(p)) = joined {
-            problems.push(p);
+        match joined {
+            Ok((line, host, addrs, problem)) => {
+                if let Some(p) = problem {
+                    problems.push((line, host, p));
+                }
+                resolved.insert(line, addrs);
+            }
+            Err(e) => {
+                eprintln!("{}: warning: a host lookup failed: {e}", path.display());
+                failed_tasks += 1;
+            }
         }
     }
     problems.sort();
@@ -135,7 +222,7 @@ async fn check_hosts(cfg: &Config, path: &Path) -> usize {
             path.display()
         );
     }
-    problems.len()
+    (resolved, problems.len() + failed_tasks)
 }
 
 /// What is missing from `addrs` for `family`, if anything.
@@ -145,6 +232,7 @@ fn missing_family(family: Family, addrs: &[IpAddr]) -> Option<String> {
     match family {
         Family::V4 if !v4 => Some("no IPv4 address".into()),
         Family::V6 if !v6 => Some("no IPv6 address".into()),
+        Family::Both if !v4 && !v6 => Some("no IPv4 or IPv6 address".into()),
         Family::Both if !(v4 && v6) => Some(format!(
             "family \"both\" needs IPv4 and IPv6 addresses, found only IPv{}",
             if v4 { 4 } else { 6 }
@@ -167,6 +255,23 @@ mod tests {
         assert!(missing_family(Family::Both, &[v6]).is_some());
         assert_eq!(missing_family(Family::Both, &[v4, v6]), None);
         assert_eq!(missing_family(Family::PreferV6, &[v4]), None);
+        assert_eq!(
+            missing_family(Family::Both, &[]).as_deref(),
+            Some("no IPv4 or IPv6 address")
+        );
+    }
+
+    #[test]
+    fn prefer_v6_needs_the_family_its_addresses_select() {
+        let src = "[server]\ndata_dir = \"/x\"\n[[group]]\nname = \"G\"\n\
+                   [[group.target]]\nname = \"a\"\nhost = \"h\"\nfamily = \"prefer-v6\"\n";
+        let cfg = config::parse(src).config.unwrap();
+        let t = &cfg.targets[0];
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(families_used(t, None), None);
+        assert_eq!(families_used(t, Some(&[v4])), Some((true, false)));
+        assert_eq!(families_used(t, Some(&[v4, v6])), Some((false, true)));
     }
 
     #[test]

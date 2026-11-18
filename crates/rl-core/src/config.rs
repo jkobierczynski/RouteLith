@@ -173,6 +173,7 @@ impl Parsed {
 pub fn parse(src: &str) -> Parsed {
     let mut v = Validator {
         src,
+        line_starts: line_starts(src),
         diagnostics: Vec::new(),
     };
     let config = match toml::from_str::<RawConfig>(src) {
@@ -185,6 +186,9 @@ pub fn parse(src: &str) -> Parsed {
     };
     let mut diagnostics = v.diagnostics;
     diagnostics.sort_by_key(|d| (d.line, d.column));
+    // A bad value in [defaults] or a group is reported where it is declared,
+    // and again identically for each target that inherits it: keep one.
+    diagnostics.dedup();
     let config = config.filter(|_| diagnostics.iter().all(|d| d.severity != Severity::Error));
     Parsed {
         config,
@@ -297,18 +301,29 @@ settings_struct!(RawTarget {
 
 struct Validator<'a> {
     src: &'a str,
+    /// Byte offset of each line's start.
+    line_starts: Vec<usize>,
     diagnostics: Vec<Diagnostic>,
 }
 
 impl Validator<'_> {
     fn push(&mut self, severity: Severity, span: &Range<usize>, message: String) {
-        let (line, column) = position(self.src, span.start);
+        let (line, column) = self.position(span.start);
         self.diagnostics.push(Diagnostic {
             severity,
             line,
             column,
-            message,
+            message: escape_controls(&message),
         });
+    }
+
+    /// 1-based line and column (in characters) of a byte offset.
+    fn position(&self, offset: usize) -> (usize, usize) {
+        let offset = offset.min(self.src.len());
+        let line = self.line_starts.partition_point(|&s| s <= offset);
+        let start = self.line_starts[line - 1];
+        let column = self.src.get(start..offset).map_or(0, |l| l.chars().count()) + 1;
+        (line, column)
     }
 
     fn error(&mut self, span: &Range<usize>, message: impl Into<String>) {
@@ -329,6 +344,7 @@ impl Validator<'_> {
         let vantage = server
             .as_ref()
             .map_or_else(|| DEFAULT_VANTAGE.to_string(), |s| s.vantage.clone());
+        self.check_layer(&defaults);
 
         let mut targets = Vec::new();
         let mut group_names: HashMap<String, Range<usize>> = HashMap::new();
@@ -340,7 +356,7 @@ impl Validator<'_> {
             if gname.is_empty() {
                 self.error(&group.name.span(), "group name must not be empty");
             } else if let Some(first) = group_names.get(&gname) {
-                let (line, _) = position(self.src, first.start);
+                let (line, _) = self.position(first.start);
                 self.error(
                     &group.name.span(),
                     format!("duplicate group name {gname:?} (first defined on line {line})"),
@@ -366,7 +382,9 @@ impl Validator<'_> {
                 self.warning(&group_span, format!("group {gname:?} has no targets"));
             }
 
-            let group_settings = group.settings().over(&defaults);
+            let own = group.settings();
+            self.check_layer(&own);
+            let group_settings = own.over(&defaults);
             for target in group.targets {
                 let span = target.span();
                 let target = target.into_inner();
@@ -377,7 +395,7 @@ impl Validator<'_> {
                         format!("duplicate target name {name:?} (first defined on line {line})"),
                     );
                 } else {
-                    target_names.insert(name, position(self.src, span.start).0);
+                    target_names.insert(name, self.position(span.start).0);
                 }
                 let settings = target.settings().over(&group_settings);
                 let t = self.target(&target, &gname, &settings, span);
@@ -388,11 +406,18 @@ impl Validator<'_> {
         }
 
         let server = server?;
-        let pps: f64 = targets
+        // Packets per day as integers (every step divides a day), so a
+        // budget that is exactly full is not rejected by float rounding.
+        let per_day: u64 = targets
             .iter()
-            .map(|t| t.schedule.pps() * f64::from(t.family.series()))
+            .map(|t| {
+                let rounds = DAY_SECS / t.schedule.step.as_secs().max(1);
+                u64::from(t.schedule.pings) * u64::from(t.family.series()) * rounds
+            })
             .sum();
-        if pps > f64::from(server.max_pps) {
+        if per_day > u64::from(server.max_pps) * DAY_SECS {
+            #[allow(clippy::cast_precision_loss)]
+            let pps = per_day as f64 / DAY_SECS as f64;
             self.error(
                 &server_span,
                 format!(
@@ -485,18 +510,31 @@ impl Validator<'_> {
                 self.error(&v.span(), format!("{key} does not apply to icmp targets"));
             }
         }
+        // A host problem is recorded, but the settings are still checked.
         let host = match &raw.host {
-            Some(h) if !h.get_ref().trim().is_empty() => h,
+            Some(h) if !h.get_ref().trim().is_empty() => Some(h),
             Some(h) => {
                 self.error(&h.span(), "host must not be empty");
-                return None;
+                None
             }
             None => {
                 self.error(&raw.name.span(), format!("target {name:?} needs a host"));
-                return None;
+                None
             }
         };
-        let literal: Option<IpAddr> = host.get_ref().trim().parse().ok();
+        let literal: Option<IpAddr> = host.and_then(|h| h.get_ref().trim().parse().ok());
+        if let (Some(h), None) = (host, literal) {
+            if !valid_hostname(h.get_ref().trim()) {
+                self.error(
+                    &h.span(),
+                    format!(
+                        "host {:?} is neither an IP address nor a host name \
+                         (icmp targets take a bare name such as \"example.org\", not a URL)",
+                        h.get_ref()
+                    ),
+                );
+            }
+        }
 
         let step = self.step(s.step.as_ref());
         let pings = self.pings(s.pings.as_ref());
@@ -534,7 +572,7 @@ impl Validator<'_> {
         Some(TargetConfig {
             id: name.clone(),
             group: group.to_string(),
-            host: host.get_ref().trim().to_string(),
+            host: host?.get_ref().trim().to_string(),
             family: family?,
             schedule: Schedule {
                 step: step?,
@@ -543,8 +581,22 @@ impl Validator<'_> {
                 timeout: timeout?,
             },
             payload_size: size?,
-            line: position(self.src, span.start).0,
+            line: self.position(span.start).0,
         })
+    }
+
+    /// Check the values a `[defaults]` or group table declares itself, so
+    /// a bad value is reported even when every target overrides it.
+    /// Cross-field checks need the resolved schedule and run per target.
+    fn check_layer(&mut self, s: &Settings) {
+        self.step(s.step.as_ref());
+        self.pings(s.pings.as_ref());
+        self.timeout(s.timeout.as_ref());
+        self.size(s.size.as_ref());
+        self.family(s.family.as_ref(), None, None);
+        if let Some(v) = &s.spread {
+            self.duration("spread", v);
+        }
     }
 
     fn error_count(&self) -> usize {
@@ -630,7 +682,7 @@ impl Validator<'_> {
         &mut self,
         v: Option<&Spanned<String>>,
         literal: Option<IpAddr>,
-        host: &Spanned<String>,
+        host: Option<&Spanned<String>>,
     ) -> Option<Family> {
         let lit_family = literal.map(|a| if a.is_ipv6() { Family::V6 } else { Family::V4 });
         let Some(v) = v else {
@@ -651,8 +703,8 @@ impl Validator<'_> {
                 return None;
             }
         };
-        match lit_family {
-            Some(lf) if family != lf => {
+        match (lit_family, host) {
+            (Some(lf), Some(host)) if family != lf => {
                 self.error(
                     &host.span(),
                     format!(
@@ -676,6 +728,23 @@ fn valid_name(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// A DNS name: dot-separated labels of letters, digits, '-' and '_'
+/// (1 to 63 characters, not starting or ending with '-'), at most 253
+/// characters, with an optional final dot.
+fn valid_hostname(s: &str) -> bool {
+    let s = s.strip_suffix('.').unwrap_or(s);
+    !s.is_empty()
+        && s.len() <= 253
+        && s.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
 fn name_rule(what: &str) -> String {
     format!(
         "{what} must be 1 to {MAX_NAME_LEN} characters of letters, digits, '.', '_' or '-', \
@@ -683,13 +752,24 @@ fn name_rule(what: &str) -> String {
     )
 }
 
-/// 1-based line and column (in characters) of a byte offset.
-fn position(src: &str, offset: usize) -> (usize, usize) {
-    let offset = offset.min(src.len());
-    let before = src.get(..offset).unwrap_or(src);
-    let line = before.matches('\n').count() + 1;
-    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
-    (line, column)
+fn line_starts(src: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(src.match_indices('\n').map(|(i, _)| i + 1))
+        .collect()
+}
+
+/// Control characters (from quoted keys or values) escaped, so a message
+/// cannot rewrite the terminal it is printed on. Line breaks stay.
+fn escape_controls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() && c != '\n' {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -940,8 +1020,120 @@ vantages = ["hasselt"]
     }
 
     #[test]
+    fn bad_inherited_values_are_reported_once_where_declared() {
+        let src = r#"
+[server]
+data_dir = "/tmp/rl"
+
+[defaults]
+step = "7s"
+
+[[group]]
+name = "G"
+pings = 0
+
+  [[group.target]]
+  name = "a"
+  host = "10.0.0.1"
+  step = "60s"
+  pings = 5
+
+  [[group.target]]
+  name = "b"
+  host = "10.0.0.2"
+"#;
+        let e = errors(src);
+        assert_eq!(e.len(), 2, "{e:?}");
+        assert!(
+            e[0].starts_with("6:8: error: step must be whole seconds"),
+            "{e:?}"
+        );
+        assert!(e[1].starts_with("10:9: error: pings must be"), "{e:?}");
+    }
+
+    #[test]
+    fn host_problems_do_not_hide_setting_errors() {
+        let src = r#"
+[server]
+data_dir = "/tmp/rl"
+
+[[group]]
+name = "G"
+
+  [[group.target]]
+  name = "a"
+  pings = 0
+
+  [[group.target]]
+  name = "b"
+  host = "https://example.org/health"
+"#;
+        let e = errors(src);
+        assert_eq!(e.len(), 3, "{e:?}");
+        assert!(e[0].contains("needs a host"), "{e:?}");
+        assert!(e[1].contains("pings must be"), "{e:?}");
+        assert!(e[2].contains("not a URL"), "{e:?}");
+    }
+
+    #[test]
+    fn host_names() {
+        for ok in [
+            "example.org",
+            "example.org.",
+            "a_b.example",
+            "localhost",
+            "xn--bcher-kva.ch",
+        ] {
+            assert!(valid_hostname(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "a..b",
+            "-a.org",
+            "a-.org",
+            "http://a.org",
+            "a.org/x",
+            "a b",
+        ] {
+            assert!(!valid_hostname(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_exactly_full_packet_budget_is_accepted() {
+        let mut src = String::from(
+            "[server]\ndata_dir = \"/tmp/rl\"\nmax_pps = 1\n[defaults]\nstep = \"20s\"\npings = 1\n\
+             [[group]]\nname = \"G\"\n",
+        );
+        for i in 0..20 {
+            src += &format!(
+                "[[group.target]]\nname = \"t{i}\"\nhost = \"10.0.0.{}\"\n",
+                i + 1
+            );
+        }
+        assert!(errors(&src).is_empty(), "{:?}", errors(&src));
+        src += "[[group.target]]\nname = \"t20\"\nhost = \"10.0.1.1\"\n";
+        assert!(errors(&src)[0].contains("above max_pps = 1"));
+    }
+
+    #[test]
     fn positions_count_characters() {
+        let position = |src: &str, offset| {
+            Validator {
+                src,
+                line_starts: line_starts(src),
+                diagnostics: Vec::new(),
+            }
+            .position(offset)
+        };
         assert_eq!(position("ab\ncµd", 6), (2, 3));
+        assert_eq!(position("ab\n", 3), (2, 1));
         assert_eq!(position("", 0), (1, 1));
+    }
+
+    #[test]
+    fn control_characters_are_escaped() {
+        assert_eq!(escape_controls("a\u{1b}[2Jb\tc"), "a\\u{1b}[2Jb\\tc");
     }
 }
