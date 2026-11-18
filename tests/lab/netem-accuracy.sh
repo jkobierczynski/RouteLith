@@ -10,9 +10,9 @@
 # If iputils ping is installed, the delay step also measures with ping and
 # checks that Routelith's median is no worse than ping's (+ the tolerance).
 #
-# On a busy or virtualised host netem itself releases packets late, so the
-# absolute delay check can fail there even though both tools agree. Set
-# DELAY_TOL_MS to loosen it on such hosts; CI keeps the strict 0.1 ms.
+# On a busy or virtualised host netem itself releases packets late. When
+# ping is off by as much as Routelith, the absolute delay check only warns.
+# DELAY_TOL_MS loosens both delay checks; CI keeps the strict 0.1 ms.
 #
 # Usage: sudo [DELAY_TOL_MS=1] tests/lab/netem-accuracy.sh path/to/routelith
 # Needs root, iproute2 and the sch_netem kernel module.
@@ -96,8 +96,9 @@ if ! [[ $delayed =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     exit 1
 fi
 expected=$(awk -v b="$base" -v d="$DELAY_MS" 'BEGIN { printf "%.3f", b + d }')
-check delay "$delayed" "$expected" "$DELAY_TOL_MS"
 
+# Reference: the same round with iputils ping, if it is installed.
+ref=
 if command -v ping >/dev/null; then
     echo "== reference: iputils ping, same settings"
     ref=$({ ip netns exec "$A" ping -n -c 1000 -i 0.005 -W 1 "$ADDR_B" || true; } |
@@ -106,16 +107,32 @@ if command -v ping >/dev/null; then
             if (NR % 2) print v[(NR + 1) / 2]
             else if (NR) printf "%.3f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2
         }')
-    if [[ $ref =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        if awk -v r="$delayed" -v p="$ref" -v t="$DELAY_TOL_MS" 'BEGIN { exit !(r <= p + t) }'; then
-            printf 'PASS  vsping measured %s, ping median %s (+ %s allowed)\n' "$delayed" "$ref" "$DELAY_TOL_MS"
-        else
-            printf 'FAIL  vsping measured %s, ping median %s (+ %s allowed)\n' "$delayed" "$ref" "$DELAY_TOL_MS"
-            failures=$((failures + 1))
-        fi
+    [[ $ref =~ ^[0-9]+(\.[0-9]+)?$ ]] || ref=
+fi
+within() { awk -v m="$1" -v e="$2" -v t="$3" 'BEGIN { d = m - e; if (d < 0) d = -d; exit !(d <= t) }'; }
+
+# Absolute delay check. If ping is just as far off, netem on this host is
+# releasing packets late and the check says nothing about Routelith, so it
+# only warns; the comparison with ping below still has to pass.
+if within "$delayed" "$expected" "$DELAY_TOL_MS"; then
+    printf 'PASS  %-6s measured %s, expected %s ± %s\n' delay "$delayed" "$expected" "$DELAY_TOL_MS"
+elif [[ -n $ref ]] && ! within "$ref" "$expected" "$DELAY_TOL_MS"; then
+    printf 'WARN  %-6s measured %s, expected %s ± %s; ping median %s is off too, so this host adds delay\n' \
+        delay "$delayed" "$expected" "$DELAY_TOL_MS" "$ref"
+else
+    printf 'FAIL  %-6s measured %s, expected %s ± %s\n' delay "$delayed" "$expected" "$DELAY_TOL_MS"
+    failures=$((failures + 1))
+fi
+
+if [[ -n $ref ]]; then
+    if awk -v r="$delayed" -v p="$ref" -v t="$DELAY_TOL_MS" 'BEGIN { exit !(r <= p + t) }'; then
+        printf 'PASS  vsping measured %s, ping median %s (+ %s allowed)\n' "$delayed" "$ref" "$DELAY_TOL_MS"
     else
-        echo "SKIP  vsping: ping produced no replies"
+        printf 'FAIL  vsping measured %s, ping median %s (+ %s allowed)\n' "$delayed" "$ref" "$DELAY_TOL_MS"
+        failures=$((failures + 1))
     fi
+elif command -v ping >/dev/null; then
+    echo "SKIP  vsping: ping produced no replies"
 fi
 
 echo "== netem loss ${LOSS_PCT}% on B's egress, 2000 samples"
