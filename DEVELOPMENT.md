@@ -53,6 +53,7 @@ These are the same checks CI runs (`.github/workflows/ci.yml`), with
 `RUSTFLAGS=-D warnings`:
 
 ```sh
+export RUSTFLAGS="-D warnings"   # as in CI; unset it afterwards to avoid rebuilds
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
@@ -218,10 +219,13 @@ reads late too.
    `--stats-interval` seconds. Stop it with Ctrl+C (or SIGTERM); it drains
    the rounds in flight and syncs the store before exiting.
 
-5. Render a smoke graph. Leave the server running for a few minutes, then in
-   another terminal:
+5. Render a smoke graph. Leave the server running for a few minutes, then
+   open another terminal in the same directory (the one holding `dev.toml`,
+   since `./rl-data` is relative to it) and set `PATH` again:
 
    ```sh
+   cd /path/to/routelith
+   export PATH="$PWD/target/release:$PATH"
    routelith ctl render -c dev.toml --target cloudflare --range 3h --out cloudflare.svg
    ```
 
@@ -231,8 +235,11 @@ reads late too.
    in a browser. Ranges are `3h`, `30h` and `10d`.
 
    Rendering reads the store while the server writes it, so you do not have
-   to stop the server. `no data for target "..."` (exit 1) means no round
-   has been stored for it yet.
+   to stop the server. A target that is registered but has no rounds yet
+   renders as an empty graph. `no data for target "..."` (exit 1) means the
+   store has no series by that name at all: check the spelling of
+   `--target`, and that `-c` or `--data-dir` points at the store the server
+   writes.
 
 ### Windows
 
