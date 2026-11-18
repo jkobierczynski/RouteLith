@@ -13,7 +13,7 @@ use std::pin::Pin;
 
 use rl_core::{ResolvedTarget, RoundPlan, RoundResult};
 
-pub use icmp::{IcmpConfig, IcmpProbe};
+pub use icmp::{IcmpConfig, IcmpProbe, check_permission};
 
 /// A boxed, `Send` future, so `Probe` stays object-safe.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -42,11 +42,14 @@ pub trait Probe: Send + Sync {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProbeError {
+    /// The OS refused the ICMP socket. Usually the user's group is outside
+    /// `net.ipv4.ping_group_range`, but a security policy can also deny it.
     #[error(
-        "unprivileged ICMP is not permitted: add this user's group to net.ipv4.ping_group_range \
-         (for example: sysctl -w net.ipv4.ping_group_range='0 2147483647')"
+        "cannot open an ICMP socket ({0}); the usual cause is that this user's group is outside \
+         net.ipv4.ping_group_range (for example: sysctl -w net.ipv4.ping_group_range='0 2147483647'), \
+         but a security policy such as seccomp or SELinux can also deny it"
     )]
-    PingSocketNotPermitted,
+    PingSocketNotPermitted(io::Error),
     #[error("ICMP probing is not supported on this platform yet")]
     Unsupported,
     #[error(transparent)]

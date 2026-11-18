@@ -33,7 +33,13 @@ impl RoundPlan {
         if self.count == 0 {
             return Duration::ZERO;
         }
-        self.spread * u32::from(index) / u32::from(self.count)
+        // Wide intermediate: spread × index can exceed Duration's range.
+        let nanos = self.spread.as_nanos() * u128::from(index) / u128::from(self.count);
+        let sub = (nanos % 1_000_000_000) as u32;
+        match u64::try_from(nanos / 1_000_000_000) {
+            Ok(secs) => Duration::new(secs, sub),
+            Err(_) => Duration::MAX,
+        }
     }
 }
 
@@ -92,6 +98,29 @@ pub struct RoundResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offsets_beyond_u64_nanoseconds_stay_exact() {
+        let plan = RoundPlan {
+            count: 2,
+            spread: Duration::from_secs(40_000_000_000),
+            timeout: Duration::from_secs(1),
+            round_start: std::time::UNIX_EPOCH,
+        };
+        assert_eq!(plan.sample_offset(1), Duration::from_secs(20_000_000_000));
+    }
+
+    #[test]
+    fn an_offset_of_exactly_u64_max_seconds_is_not_clamped() {
+        let plan = RoundPlan {
+            count: 1,
+            spread: Duration::from_secs(u64::MAX),
+            timeout: Duration::from_secs(1),
+            round_start: std::time::UNIX_EPOCH,
+        };
+        assert_eq!(plan.sample_offset(1), Duration::from_secs(u64::MAX));
+        assert_eq!(plan.sample_offset(2), Duration::MAX);
+    }
 
     #[test]
     fn samples_are_evenly_spread_from_zero() {
