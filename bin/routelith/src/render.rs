@@ -122,8 +122,7 @@ fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
             title: &title,
             from_ms,
             to_ms,
-            step_ms: configured_step(cfg.as_ref(), &key)
-                .filter(|&step| step >= smallest_gap(&rounds).unwrap_or(0)),
+            step_ms: bucket_step(configured_step(cfg.as_ref(), &key), smallest_gap(&rounds)),
             width: Graph::DEFAULT_WIDTH,
             height: Graph::DEFAULT_HEIGHT,
         },
@@ -177,10 +176,19 @@ fn configured_step(cfg: Option<&Config>, key: &SeriesKey) -> Option<i64> {
     i64::try_from(t.schedule.step.as_millis()).ok()
 }
 
-/// The smallest spacing of the stored rounds. A configured step longer
-/// than it is kept (a stray close pair must not shrink the columns), one
-/// shorter is not: the rounds were taken at a slower step than configured
-/// now, and columns on the new step would leave gaps between them.
+/// The column step for a series. A configured step at least as long as
+/// the smallest spacing of the stored rounds is kept (a stray close pair
+/// must not shrink the columns). One shorter is not: the rounds were taken
+/// at a slower step than configured now, and columns on the new step would
+/// leave gaps between them, so the stored spacing is used instead.
+fn bucket_step(configured: Option<i64>, smallest_gap: Option<i64>) -> Option<i64> {
+    match (configured, smallest_gap) {
+        (Some(step), Some(gap)) if step < gap => Some(gap),
+        (step, _) => step,
+    }
+}
+
+/// The smallest spacing of the stored rounds.
 fn smallest_gap(rounds: &[rl_store::StoredRound]) -> Option<i64> {
     rounds
         .windows(2)
@@ -311,6 +319,18 @@ mod tests {
         assert_eq!(configured_step(Some(&cfg), &own), Some(60_000));
         assert_eq!(configured_step(Some(&cfg), &other_vantage), None);
         assert_eq!(configured_step(None, &own), None);
+    }
+
+    #[test]
+    fn rounds_stored_at_a_slower_step_keep_their_own_spacing() {
+        // Stored every 10 min, configured every minute now: 10 min columns.
+        assert_eq!(bucket_step(Some(60_000), Some(600_000)), Some(600_000));
+        // Configured step at or above the stored spacing is kept.
+        assert_eq!(bucket_step(Some(600_000), Some(60_000)), Some(600_000));
+        assert_eq!(bucket_step(Some(60_000), Some(60_000)), Some(60_000));
+        // Nothing configured: the renderer infers the step itself.
+        assert_eq!(bucket_step(None, Some(600_000)), None);
+        assert_eq!(bucket_step(Some(60_000), None), Some(60_000));
     }
 
     #[test]
