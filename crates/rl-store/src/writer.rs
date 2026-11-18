@@ -194,7 +194,7 @@ impl Writer {
         if !(1..=MAX_BLOCK_ROUNDS).contains(&opts.block_rounds) {
             return Err(StoreError::InvalidOptions("block_rounds must be 1 to 4096"));
         }
-        // Every directory `create_dir_all` is about to make, deepest first.
+        // Every directory `create_dir_all` is about to make.
         let mut created = Vec::new();
         let mut p = dir.to_path_buf();
         while !p.as_os_str().is_empty() && !p.try_exists()? {
@@ -208,11 +208,23 @@ impl Writer {
         let lock = lock_dir(dir)?;
         std::fs::create_dir_all(layout::wal_dir(dir))?;
         std::fs::create_dir_all(dir.join("series"))?;
-        // Make the new names durable before any WAL sync is acknowledged:
-        // the entries in `dir`, then each created directory's own entry.
+        // Make the names durable before any WAL sync is acknowledged: the
+        // entries in `dir`, then the entry of `dir` and of each ancestor in
+        // its parent. Existing ancestors too, as an earlier start may have
+        // created them and stopped before syncing; only a directory created
+        // now must sync, as an ancestor above may not be readable.
         layout::sync_dir(dir)?;
-        for d in &created {
-            layout::sync_dir(&layout::parent_or_dot(d))?;
+        let mut p = dir.to_path_buf();
+        loop {
+            if let Err(e) = layout::sync_dir(&layout::parent_or_dot(&p)) {
+                if created.contains(&p) {
+                    return Err(e.into());
+                }
+            }
+            match p.parent() {
+                Some(q) if !q.as_os_str().is_empty() => p = q.to_path_buf(),
+                _ => break,
+            }
         }
         let mut rec = Recovery::default();
         let mut series: BTreeMap<u64, Series> = BTreeMap::new();
