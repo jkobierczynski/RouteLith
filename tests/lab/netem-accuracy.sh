@@ -60,8 +60,13 @@ check() {
 }
 
 echo "== baseline (no netem), 1000 samples"
-out=$(measure -c 1000 -i 5ms)
+status=0
+out=$(ip netns exec "$A" "$BIN" check icmp "$ADDR_B" -q -W 1s -c 1000 -i 5ms) || status=$?
 echo "$out"
+if [[ $status -ne 0 ]]; then
+    echo "FAIL  baseline measurement exited with status $status"
+    exit 1
+fi
 base=$(median_ms <<<"$out")
 # Without a valid baseline the delay check would compare against nothing.
 if ! [[ $base =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
