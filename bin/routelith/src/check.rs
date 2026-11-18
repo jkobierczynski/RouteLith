@@ -36,7 +36,20 @@ pub(crate) struct IcmpArgs {
     quiet: bool,
 }
 
+const MAX_INTERVAL: Duration = Duration::from_secs(3600);
+const MAX_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub(crate) async fn icmp(args: IcmpArgs) -> ExitCode {
+    // Bounds that keep every offset and deadline of the round representable
+    // (and match the configuration's limits).
+    if args.interval > MAX_INTERVAL || args.timeout.is_zero() || args.timeout > MAX_TIMEOUT {
+        eprintln!(
+            "routelith check: interval must be at most {} and timeout more than 0 and at most {}",
+            rl_core::duration::format(MAX_INTERVAL),
+            rl_core::duration::format(MAX_TIMEOUT)
+        );
+        return ExitCode::from(2);
+    }
     let addr = match resolve(&args.host, args.ipv4, args.ipv6).await {
         Ok(addr) => addr,
         Err(msg) => {
@@ -48,9 +61,10 @@ pub(crate) async fn icmp(args: IcmpArgs) -> ExitCode {
         name: args.host.clone(),
         addr,
     };
+    let spread = args.interval * u32::from(args.count);
     let plan = RoundPlan {
         count: args.count,
-        spread: args.interval * u32::from(args.count),
+        spread,
         timeout: args.timeout,
         round_start: SystemTime::now(),
     };
@@ -161,22 +175,7 @@ fn render(target: &ResolvedTarget, round: &RoundResult, quiet: bool) -> String {
 
 /// Parse `1s`, `250ms`, `500us` or a bare number of seconds.
 pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
-    let s = s.trim();
-    let (num, unit) = match s.find(|c: char| c.is_ascii_alphabetic() || c == 'µ') {
-        Some(i) => s.split_at(i),
-        None => (s, "s"),
-    };
-    let value: f64 = num
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid duration: {s}"))?;
-    let secs = match unit {
-        "s" => value,
-        "ms" => value / 1e3,
-        "us" | "µs" => value / 1e6,
-        _ => return Err(format!("unknown unit in {s} (use s, ms or us)")),
-    };
-    Duration::try_from_secs_f64(secs).map_err(|_| format!("invalid duration: {s}"))
+    rl_core::duration::parse(s)
 }
 
 #[cfg(test)]
@@ -191,7 +190,7 @@ mod tests {
         assert_eq!(parse_duration("500us"), Ok(Duration::from_micros(500)));
         assert_eq!(parse_duration("500µs"), Ok(Duration::from_micros(500)));
         assert_eq!(parse_duration("2"), Ok(Duration::from_secs(2)));
-        assert!(parse_duration("5m").is_err());
+        assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));
         assert!(parse_duration("-1s").is_err());
     }
 

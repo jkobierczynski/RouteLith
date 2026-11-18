@@ -13,6 +13,32 @@ use rl_core::{ResolvedTarget, RoundPlan, RoundResult};
 use crate::packet::DEFAULT_PAYLOAD;
 use crate::{BoxFuture, Probe, ProbeError, ProbeKind};
 
+/// Check that this process may send ICMP echo for one address family,
+/// by opening and closing the socket or handle a round would use.
+pub fn check_permission(v6: bool) -> Result<(), ProbeError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::ErrorKind;
+        rl_sys::linux::PingSocket::open(v6)
+            .map(drop)
+            .map_err(|e| match e.kind() {
+                ErrorKind::PermissionDenied => ProbeError::PingSocketNotPermitted(e),
+                _ => ProbeError::Io(e),
+            })
+    }
+    #[cfg(windows)]
+    {
+        rl_sys::windows::IcmpHandle::open(v6)
+            .map(drop)
+            .map_err(ProbeError::Io)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = v6;
+        Err(ProbeError::Unsupported)
+    }
+}
+
 /// ICMP probe options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IcmpConfig {
