@@ -62,7 +62,8 @@ fn index_err(e: impl fmt::Display) -> StoreError {
 /// Open the database, waiting up to [`LOCK_WAIT`] while another process has it.
 fn open(dir: &Path, create: bool) -> Result<Option<Database>, StoreError> {
     let path = index_path(dir);
-    if !create && !path.exists() {
+    // `try_exists`: an unreadable directory is an error, not "no index".
+    if !create && !path.try_exists()? {
         return Ok(None);
     }
     let deadline = Instant::now() + LOCK_WAIT;
@@ -90,6 +91,14 @@ fn open(dir: &Path, create: bool) -> Result<Option<Database>, StoreError> {
 
 /// Look up or assign ids for `keys`, in order.
 pub(crate) fn register(dir: &Path, keys: &[SeriesKey]) -> Result<Vec<u64>, StoreError> {
+    // The separator would make two different keys encode the same way.
+    if let Some(bad) = keys.iter().find(|k| {
+        [&k.vantage, &k.target, &k.family]
+            .iter()
+            .any(|f| f.contains(SEP))
+    }) {
+        return Err(StoreError::InvalidKey(bad.to_string()));
+    }
     let db = open(dir, true)?.ok_or_else(|| index_err("index missing"))?;
     let tx = db.begin_write().map_err(index_err)?;
     let mut ids = Vec::with_capacity(keys.len());
@@ -120,6 +129,8 @@ pub(crate) fn register(dir: &Path, keys: &[SeriesKey]) -> Result<Vec<u64>, Store
         counters.insert(NEXT_ID, next).map_err(index_err)?;
     }
     tx.commit().map_err(index_err)?;
+    // redb syncs the file; make a newly created file's name durable too.
+    crate::layout::sync_dir(dir)?;
     Ok(ids)
 }
 

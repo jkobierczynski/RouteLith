@@ -64,6 +64,38 @@ impl Reader {
         from_ms: i64,
         to_ms: i64,
     ) -> Result<Vec<StoredRound>, StoreError> {
+        // The WAL first: a checkpoint running meanwhile moves its rounds
+        // into segments before deleting it, so the segment pass below
+        // still sees any round whose WAL file disappears.
+        let mut wal_rounds: Vec<StoredRound> = Vec::new();
+        for seq in layout::list_wal(&self.dir)? {
+            let path = layout::wal_path(&self.dir, seq);
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                // Deleted by a checkpoint: its rounds are in segments now.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let corrupt = |reason: &str| StoreError::Corrupt {
+                path: path.clone(),
+                reason: reason.to_string(),
+            };
+            let records = match wal::read(&bytes) {
+                Ok((_, Tail::Corrupt)) => return Err(corrupt("bad record")),
+                // Complete records before a half-written one.
+                Ok((records, _)) => records,
+                // A file just created, its header not written yet.
+                Err(_) if bytes.len() < wal::HEADER_LEN => continue,
+                Err(e) => return Err(corrupt(e)),
+            };
+            wal_rounds.extend(
+                records
+                    .into_iter()
+                    .filter(|(id, r)| *id == series && (from_ms..=to_ms).contains(&r.ts_ms))
+                    .map(|(_, r)| r),
+            );
+        }
+
         let mut out: BTreeMap<i64, StoredRound> = BTreeMap::new();
         let (first_day, last_day) = (day_of(from_ms), day_of(to_ms));
         for seg in layout::list_segments(&self.dir, series)? {
@@ -83,7 +115,14 @@ impl Reader {
                 path: seg.path.clone(),
                 reason: reason.to_string(),
             };
+            // An open segment just created, its header not written yet.
+            if !seg.sealed && bytes.len() < segment::HEADER_LEN {
+                continue;
+            }
             let scan = segment::scan(&bytes).map_err(corrupt)?;
+            if scan.series != series || scan.day != seg.day {
+                return Err(corrupt("header names another series or day"));
+            }
             if seg.sealed && scan.tail != Tail::Clean {
                 return Err(corrupt("bad block"));
             }
@@ -91,21 +130,8 @@ impl Reader {
                 out.insert(r.ts_ms, r);
             }
         }
-        for seq in layout::list_wal(&self.dir)? {
-            let bytes = match std::fs::read(layout::wal_path(&self.dir, seq)) {
-                Ok(b) => b,
-                // Deleted by a checkpoint: its rounds are in segments now.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            let Ok((records, _)) = wal::read(&bytes) else {
-                continue;
-            };
-            for (id, r) in records {
-                if id == series && (from_ms..=to_ms).contains(&r.ts_ms) {
-                    out.entry(r.ts_ms).or_insert(r);
-                }
-            }
+        for r in wal_rounds {
+            out.entry(r.ts_ms).or_insert(r);
         }
         // WAL records carry the resolved address and timing only when they
         // change within the record (always, for single rounds), so the

@@ -125,7 +125,12 @@ pub(crate) fn create(path: &Path, series: u64, day: i64) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
-    f.write_all(&header(series, day))?;
+    if let Err(e) = f.write_all(&header(series, day)) {
+        // Created by this call: remove it so a retry can create it again.
+        drop(f);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -134,7 +139,14 @@ pub(crate) fn append_block(path: &Path, body: &[u8]) -> io::Result<()> {
     let mut frame = Vec::with_capacity(codec::FRAME_HEADER + body.len());
     codec::put_frame(&mut frame, body);
     let mut f = OpenOptions::new().append(true).open(path)?;
-    f.write_all(&frame)
+    let len = f.metadata()?.len();
+    if let Err(e) = f.write_all(&frame) {
+        // Don't leave half a frame for the next block to follow. If this
+        // fails too, the writer stops and recovery trims the tail.
+        f.set_len(len)?;
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Cut a torn or corrupt tail so the file ends on a valid block.

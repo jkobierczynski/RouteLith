@@ -33,7 +33,9 @@ impl RoundPlan {
         if self.count == 0 {
             return Duration::ZERO;
         }
-        self.spread * u32::from(index) / u32::from(self.count)
+        // Wide intermediate: spread × index can exceed Duration's range.
+        let nanos = self.spread.as_nanos() * u128::from(index) / u128::from(self.count);
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
     }
 }
 

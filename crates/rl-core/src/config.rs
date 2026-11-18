@@ -175,6 +175,7 @@ pub fn parse(src: &str) -> Parsed {
         src,
         line_starts: line_starts(src),
         diagnostics: Vec::new(),
+        errors: 0,
     };
     let config = match toml::from_str::<RawConfig>(src) {
         Ok(raw) => v.config(raw),
@@ -304,11 +305,15 @@ struct Validator<'a> {
     /// Byte offset of each line's start.
     line_starts: Vec<usize>,
     diagnostics: Vec<Diagnostic>,
+    errors: usize,
 }
 
 impl Validator<'_> {
     fn push(&mut self, severity: Severity, span: &Range<usize>, message: String) {
         let (line, column) = self.position(span.start);
+        if severity == Severity::Error {
+            self.errors += 1;
+        }
         self.diagnostics.push(Diagnostic {
             severity,
             line,
@@ -600,10 +605,7 @@ impl Validator<'_> {
     }
 
     fn error_count(&self) -> usize {
-        self.diagnostics
-            .iter()
-            .filter(|d| d.severity == Severity::Error)
-            .count()
+        self.errors
     }
 
     fn duration(&mut self, key: &str, v: &Spanned<String>) -> Option<Duration> {
@@ -1124,6 +1126,7 @@ name = "G"
                 src,
                 line_starts: line_starts(src),
                 diagnostics: Vec::new(),
+                errors: 0,
             }
             .position(offset)
         };

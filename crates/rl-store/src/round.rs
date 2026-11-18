@@ -82,7 +82,12 @@ impl StoredRound {
         }
         let ts_ms = match r.start.duration_since(UNIX_EPOCH) {
             Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
-            Err(e) => -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX),
+            // Before the epoch: round down, so -0.5 ms is -1, not 0.
+            Err(e) => {
+                let d = e.duration();
+                let ms = d.as_millis() + u128::from(d.subsec_nanos() % 1_000_000 != 0);
+                -i64::try_from(ms).unwrap_or(i64::MAX)
+            }
         };
         Self {
             ts_ms,
@@ -97,6 +102,10 @@ impl StoredRound {
 
     /// Whether this round is well-formed enough to store.
     pub(crate) fn check(&self) -> Result<(), &'static str> {
+        let day = crate::layout::day_of(self.ts_ms);
+        if !(crate::layout::MIN_DAY..=crate::layout::MAX_DAY).contains(&day) {
+            return Err("timestamp outside the years 0000 to 9999");
+        }
         if self.rtts_us.len() > usize::from(self.sent) {
             return Err("more RTTs than samples sent");
         }

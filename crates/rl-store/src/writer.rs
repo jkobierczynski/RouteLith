@@ -10,9 +10,18 @@
 //! recovery. A crash at any point leaves either the WAL or the segments (or
 //! both) holding every synced round; replay skips rounds a segment already
 //! has, because rounds of one series only move forward in time.
+//!
+//! The writer is fail-stop: after any I/O error while writing segments or
+//! rotating the WAL it refuses further work, and never deletes a WAL file
+//! it cannot prove redundant. Reopening the directory runs recovery, which
+//! repairs what the failure left behind.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+
+use rl_core::TimingBackend;
 
 use crate::index::{self, SeriesKey};
 use crate::layout::{self, day_of};
@@ -88,9 +97,54 @@ struct Series {
     last_ts: Option<i64>,
     /// Rounds not yet written to a segment, all from `block_day`.
     block: Vec<StoredRound>,
+    /// RTT samples in `block`.
+    block_samples: usize,
     block_day: Option<i64>,
     /// Newest sealed day.
     sealed_through: Option<i64>,
+    /// Last known address and timing backend, filled into rounds that
+    /// leave them unset, so every stored round carries them.
+    resolved: Option<IpAddr>,
+    timing: Option<TimingBackend>,
+}
+
+impl Series {
+    /// Fill `round`'s unset address and timing from earlier rounds, and
+    /// remember the ones it sets.
+    fn carry_forward(&mut self, round: &mut StoredRound) {
+        match round.resolved {
+            Some(a) => self.resolved = Some(a),
+            None => round.resolved = self.resolved,
+        }
+        match round.timing {
+            Some(t) => self.timing = Some(t),
+            None => round.timing = self.timing,
+        }
+    }
+}
+
+/// Blocks are written early once they hold this many RTT samples, which
+/// keeps a block's uncompressed payload far below the reader's limit.
+const BLOCK_MAX_SAMPLES: usize = 1 << 20;
+/// Largest `block_rounds` accepted.
+const MAX_BLOCK_ROUNDS: usize = 4096;
+
+/// Holds the data directory's writer lock: a redb database file, because
+/// redb already locks its files exclusively on every platform.
+struct DirLock(#[allow(dead_code)] redb::Database);
+
+impl fmt::Debug for DirLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DirLock")
+    }
+}
+
+fn lock_dir(dir: &Path) -> Result<DirLock, StoreError> {
+    match redb::Database::create(layout::lock_path(dir)) {
+        Ok(db) => Ok(DirLock(db)),
+        Err(redb::DatabaseError::DatabaseAlreadyOpen) => Err(StoreError::Locked(dir.to_path_buf())),
+        Err(e) => Err(StoreError::Index(format!("writer lock: {e}"))),
+    }
 }
 
 /// The only writer of a data directory.
@@ -102,31 +156,57 @@ pub struct Writer {
     series: BTreeMap<u64, Series>,
     /// Segment files written since the last fsync.
     dirty: BTreeSet<PathBuf>,
-    /// Directories that gained a file since the last fsync.
+    /// Directories that gained or lost a name since the last fsync.
     dirty_dirs: BTreeSet<PathBuf>,
+    /// WAL files recovery could not fully account for: never deleted.
+    keep_wal: BTreeSet<u64>,
+    /// Set by the first failed write; every later call returns it.
+    failed: Option<String>,
     stats: WriterStats,
+    _lock: DirLock,
 }
 
 impl Writer {
     /// Open (creating if needed) a data directory and recover from any crash:
     /// trim torn segment tails, replay the WAL, checkpoint, and seal days
     /// that ended before `now_ms` minus the grace period.
+    ///
+    /// Only one writer may have a directory open; a second `open` fails
+    /// with [`StoreError::Locked`] before touching anything.
     pub fn open(
         dir: &Path,
         opts: WriterOptions,
         now_ms: i64,
     ) -> Result<(Self, Recovery), StoreError> {
+        if !(1..=MAX_BLOCK_ROUNDS).contains(&opts.block_rounds) {
+            return Err(StoreError::InvalidOptions("block_rounds must be 1 to 4096"));
+        }
+        let created = !dir.try_exists()?;
+        std::fs::create_dir_all(dir)?;
+        let lock = lock_dir(dir)?;
         std::fs::create_dir_all(layout::wal_dir(dir))?;
         std::fs::create_dir_all(dir.join("series"))?;
+        // Make the new names durable before any WAL sync is acknowledged.
+        layout::sync_dir(dir)?;
+        if created {
+            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                layout::sync_dir(parent)?;
+            }
+        }
         let mut rec = Recovery::default();
         let mut series: BTreeMap<u64, Series> = BTreeMap::new();
+        let mut dirty = BTreeSet::new();
+        let mut dirty_dirs = BTreeSet::new();
+        // A sealed segment that is damaged: keep every WAL file, since it
+        // may hold the only copy of rounds after the damage.
+        let mut keep_all_wal = false;
 
         for id in layout::list_series_dirs(dir)? {
             let s = series.entry(id).or_default();
             let mut open_days = Vec::new();
             for seg in layout::list_segments(dir, id)? {
                 let bytes = std::fs::read(&seg.path)?;
-                let scan = match segment::scan(&bytes) {
+                let mut scan = match segment::scan(&bytes) {
                     Ok(scan) => scan,
                     // A crash right after creating the file, before its header was written.
                     Err(_) if !seg.sealed && bytes.len() < segment::HEADER_LEN => {
@@ -135,32 +215,68 @@ impl Writer {
                     }
                     Err(e) => {
                         rec.problems.push(format!("{}: {e}", seg.path.display()));
+                        keep_all_wal |= seg.sealed;
                         continue;
                     }
                 };
+                // Only a block that decodes may move the replay cutoff; the
+                // last one is checked (earlier ones were checked when the
+                // segment was last recovered or written).
+                let last = scan.blocks.last().map(|&(off, _)| off);
+                let mut last_round = None;
+                if let Some(off) = last {
+                    let decoded = match codec::read_frame(&bytes[off..]) {
+                        codec::Frame::Ok(body, _) => codec::decode_block(body),
+                        _ => None,
+                    };
+                    match decoded {
+                        Some(rounds) => last_round = rounds.last().cloned(),
+                        None => {
+                            scan.blocks.pop();
+                            scan.valid_len = off as u64;
+                            scan.tail = Tail::Corrupt;
+                        }
+                    }
+                }
                 if scan.tail != Tail::Clean {
                     if seg.sealed {
                         rec.problems.push(format!(
-                            "{}: sealed segment has a bad block after offset {}",
+                            "{}: sealed segment has a bad block after offset {}; \
+                             WAL files are kept",
                             seg.path.display(),
                             scan.valid_len
                         ));
+                        keep_all_wal = true;
                     } else {
                         segment::truncate(&seg.path, scan.valid_len)?;
                         rec.truncated_segments += 1;
                     }
                 }
                 s.last_ts = s.last_ts.max(scan.last_ts());
+                if let Some(r) = last_round.filter(|r| Some(r.ts_ms) == s.last_ts) {
+                    s.resolved = r.resolved.or(s.resolved);
+                    s.timing = r.timing.or(s.timing);
+                }
                 if seg.sealed {
                     s.sealed_through = s.sealed_through.max(Some(seg.day));
                 } else {
                     open_days.push(seg.day);
+                    // Its blocks may be only in the page cache after a
+                    // kill: sync them before any WAL is retired.
+                    dirty.insert(seg.path.clone());
+                    let raw = layout::raw_dir(dir, id);
+                    if let Some(series_dir) = raw.parent() {
+                        dirty_dirs.insert(series_dir.to_path_buf());
+                    }
+                    dirty_dirs.insert(raw);
+                    dirty_dirs.insert(dir.join("series"));
                 }
             }
             // Normally at most one open segment; older ones are complete.
             open_days.sort_unstable();
             s.open_day = open_days.pop();
             for day in open_days {
+                dirty.remove(&layout::segment_path(dir, id, day, false));
                 seal_file(dir, id, day)?;
                 s.sealed_through = s.sealed_through.max(Some(day));
             }
@@ -175,26 +291,42 @@ impl Writer {
             opts,
             wal,
             series,
-            dirty: BTreeSet::new(),
-            dirty_dirs: BTreeSet::new(),
+            dirty,
+            dirty_dirs,
+            keep_wal: BTreeSet::new(),
+            failed: None,
             stats: WriterStats::default(),
+            _lock: lock,
         };
 
         for seq in seqs {
             let path = layout::wal_path(dir, seq);
             let bytes = std::fs::read(&path)?;
             rec.wal_files += 1;
+            if keep_all_wal {
+                w.keep_wal.insert(seq);
+            }
             let (records, tail) = match wal::read(&bytes) {
                 Ok(r) => r,
                 // Header never fully written: the file holds no rounds.
-                Err(_) if bytes.len() < 20 => continue,
+                Err(_) if bytes.len() < wal::HEADER_LEN => continue,
                 Err(e) => {
-                    rec.problems.push(format!("{}: {e}", path.display()));
+                    rec.problems
+                        .push(format!("{}: {e}; left in place", path.display()));
+                    w.keep_wal.insert(seq);
                     continue;
                 }
             };
-            if tail != Tail::Clean {
-                rec.torn_wal += 1;
+            match tail {
+                Tail::Clean => {}
+                Tail::Torn => rec.torn_wal += 1,
+                // Records after a bad checksum cannot be read: keep the file.
+                Tail::Corrupt => {
+                    rec.torn_wal += 1;
+                    rec.problems
+                        .push(format!("{}: bad record; left in place", path.display()));
+                    w.keep_wal.insert(seq);
+                }
             }
             for (id, round) in records {
                 match w.ingest(id, round, false)? {
@@ -204,7 +336,7 @@ impl Writer {
             }
         }
         w.stats = WriterStats::default();
-        w.checkpoint()?;
+        w.guard(|w| w.checkpoint())?;
         w.maintain(now_ms)?;
         Ok((w, rec))
     }
@@ -226,18 +358,45 @@ impl Writer {
     /// Store one round. Durable after the next [`sync`](Self::sync).
     pub fn append(&mut self, series: u64, round: StoredRound) -> Result<Appended, StoreError> {
         round.check().map_err(StoreError::InvalidRound)?;
-        self.ingest(series, round, true)
+        self.guard(|w| w.ingest(series, round, true))
     }
 
     /// `fsync` the WAL. Call about once a second (§6.2); a crash loses at
     /// most the rounds appended since the last call.
     pub fn sync(&mut self) -> Result<(), StoreError> {
-        Ok(self.wal.sync()?)
+        self.guard(|w| Ok(w.wal.sync()?))
     }
 
     /// Seal days that ended before `now_ms` minus the grace period, and
     /// checkpoint when anything was sealed or the WAL is large.
     pub fn maintain(&mut self, now_ms: i64) -> Result<(), StoreError> {
+        self.guard(|w| w.maintain_inner(now_ms))
+    }
+
+    /// Checkpoint and close. Without this, the next open replays the WAL.
+    pub fn close(mut self) -> Result<(), StoreError> {
+        self.guard(|w| w.checkpoint())
+    }
+
+    /// Run `f` unless an earlier write failed; a failure (other than an
+    /// invalid round) stops the writer.
+    fn guard<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        if let Some(msg) = &self.failed {
+            return Err(StoreError::Stopped(msg.clone()));
+        }
+        let r = f(self);
+        if let Err(e) = &r {
+            if !matches!(e, StoreError::InvalidRound(_)) {
+                self.failed = Some(e.to_string());
+            }
+        }
+        r
+    }
+
+    fn maintain_inner(&mut self, now_ms: i64) -> Result<(), StoreError> {
         let cutoff = day_of(now_ms.saturating_sub(self.opts.seal_grace_ms));
         let stale: Vec<u64> = self
             .series
@@ -261,12 +420,12 @@ impl Writer {
         Ok(())
     }
 
-    /// Checkpoint and close. Without this, the next open replays the WAL.
-    pub fn close(mut self) -> Result<(), StoreError> {
-        self.checkpoint()
-    }
-
-    fn ingest(&mut self, id: u64, round: StoredRound, log: bool) -> Result<Appended, StoreError> {
+    fn ingest(
+        &mut self,
+        id: u64,
+        mut round: StoredRound,
+        log: bool,
+    ) -> Result<Appended, StoreError> {
         let day = day_of(round.ts_ms);
         let s = self.series.entry(id).or_default();
         let late = s.last_ts.is_some_and(|t| round.ts_ms <= t)
@@ -275,17 +434,21 @@ impl Writer {
             self.stats.late += 1;
             return Ok(Appended::Late);
         }
+        s.carry_forward(&mut round);
+        // Write out the previous day's block before logging this round, so
+        // a failure leaves this round neither in the WAL nor in a block.
+        if s.block_day.is_some_and(|d| d != day) {
+            self.flush_block(id)?;
+        }
         if log {
             self.wal.append(id, &round)?;
-        }
-        if self.series[&id].block_day.is_some_and(|d| d != day) {
-            self.flush_block(id)?;
         }
         let s = self.series.get_mut(&id).expect("entry created above");
         s.last_ts = Some(round.ts_ms);
         s.block_day = Some(day);
+        s.block_samples += round.rtts_us.len();
         s.block.push(round);
-        let full = s.block.len() >= self.opts.block_rounds;
+        let full = s.block.len() >= self.opts.block_rounds || s.block_samples >= BLOCK_MAX_SAMPLES;
         self.stats.appended += 1;
         if full {
             self.flush_block(id)?;
@@ -323,6 +486,7 @@ impl Writer {
         let body = codec::encode_block(&s.block, self.opts.zstd_level);
         segment::append_block(&path, &body)?;
         s.block.clear();
+        s.block_samples = 0;
         s.block_day = None;
         self.dirty.insert(path);
         self.stats.blocks += 1;
@@ -332,9 +496,10 @@ impl Writer {
     /// Make a day's open segment immutable. Its pending block must already
     /// be flushed.
     fn seal(&mut self, id: u64, day: i64) -> Result<(), StoreError> {
-        let open = layout::segment_path(&self.dir, id, day, false);
-        self.dirty.remove(&open);
         seal_file(&self.dir, id, day)?;
+        // Synced by `seal_file`; tracked until then.
+        self.dirty
+            .remove(&layout::segment_path(&self.dir, id, day, false));
         let s = self.series.get_mut(&id).expect("known series");
         s.open_day = None;
         s.sealed_through = s.sealed_through.max(Some(day));
@@ -347,18 +512,28 @@ impl Writer {
         for id in ids {
             self.flush_block(id)?;
         }
-        for path in std::mem::take(&mut self.dirty) {
+        // Each entry stays tracked until its own barrier succeeds.
+        while let Some(path) = self.dirty.first().cloned() {
             segment::sync(&path)?;
+            self.dirty.remove(&path);
         }
-        for dir in std::mem::take(&mut self.dirty_dirs).into_iter().rev() {
+        // Deepest directories first.
+        while let Some(dir) = self.dirty_dirs.last().cloned() {
             layout::sync_dir(&dir)?;
+            self.dirty_dirs.remove(&dir);
         }
-        let old_seq = self.wal.seq();
-        let next = old_seq + 1;
-        self.wal = WalWriter::create(layout::wal_path(&self.dir, next), next)?;
-        layout::sync_dir(&layout::wal_dir(&self.dir))?;
+        // The new WAL is used only once its name is durable.
+        let next = self.wal.seq() + 1;
+        let path = layout::wal_path(&self.dir, next);
+        let wal = WalWriter::create(path.clone(), next)?;
+        if let Err(e) = layout::sync_dir(&layout::wal_dir(&self.dir)) {
+            drop(wal);
+            let _ = std::fs::remove_file(&path);
+            return Err(e.into());
+        }
+        self.wal = wal;
         for seq in layout::list_wal(&self.dir)? {
-            if seq < next {
+            if seq < next && !self.keep_wal.contains(&seq) {
                 std::fs::remove_file(layout::wal_path(&self.dir, seq))?;
             }
         }

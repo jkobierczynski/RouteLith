@@ -124,8 +124,8 @@ fn check_privileges(cfg: &Config, resolved: &HashMap<usize, Vec<IpAddr>>, path: 
     // For each family: needed for certain, or only by prefer-v6 targets
     // whose addresses are unknown.
     let (mut need, mut maybe) = ([false; 2], [false; 2]);
-    for t in &cfg.targets {
-        match families_used(t, resolved.get(&t.line).map(Vec::as_slice)) {
+    for (i, t) in cfg.targets.iter().enumerate() {
+        match families_used(t, resolved.get(&i).map(Vec::as_slice)) {
             Some((v4, v6)) => {
                 need[0] |= v4;
                 need[1] |= v6;
@@ -161,59 +161,80 @@ fn check_privileges(cfg: &Config, resolved: &HashMap<usize, Vec<IpAddr>>, path: 
 
 /// Lookups running at once; the rest wait without using their timeout.
 const RESOLVE_PARALLEL: usize = 16;
+/// All lookups together; any still unfinished are reported as unchecked.
+const RESOLVE_ALL: Duration = Duration::from_secs(30);
 
 /// Resolve every host name, warning for each that does not resolve to an
-/// address of its family. Returns the addresses found, by target line.
+/// address of its family. Returns the addresses of each lookup that
+/// succeeded, by index in `cfg.targets`, and the number of warnings.
 async fn check_hosts(cfg: &Config, path: &Path) -> (HashMap<usize, Vec<IpAddr>>, usize) {
     let permits = Arc::new(Semaphore::new(RESOLVE_PARALLEL));
     let mut tasks = tokio::task::JoinSet::new();
-    for t in &cfg.targets {
+    let mut pending: HashMap<usize, (usize, String)> = HashMap::new();
+    for (i, t) in cfg.targets.iter().enumerate() {
         if t.host.parse::<IpAddr>().is_ok() {
             continue;
         }
-        let (host, family, line) = (t.host.clone(), t.family, t.line);
+        let (host, family) = (t.host.clone(), t.family);
+        pending.insert(i, (t.line, host.clone()));
         let permits = permits.clone();
         tasks.spawn(async move {
-            let lookup = async {
-                // The deadline starts once the lookup may run, and a timed-out
-                // lookup keeps its permit until the system resolver returns.
-                let permit = permits.acquire_owned().await.ok();
-                let name = host.clone();
-                let blocking = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    (name.as_str(), 0).to_socket_addrs()
-                });
-                tokio::time::timeout(RESOLVE_TIMEOUT, blocking).await
+            // The deadline starts once the lookup may run, and a timed-out
+            // lookup keeps its permit until the system resolver returns.
+            let permit = permits.acquire_owned().await.ok();
+            let blocking = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                (host.as_str(), 0).to_socket_addrs()
+            });
+            let result = match tokio::time::timeout(RESOLVE_TIMEOUT, blocking).await {
+                Err(_) => Err("lookup timed out".to_string()),
+                Ok(Err(e)) => Err(format!("lookup failed: {e}")),
+                Ok(Ok(Err(e))) => Err(e.to_string()),
+                Ok(Ok(Ok(it))) => Ok(it.map(|a| a.ip()).collect::<Vec<IpAddr>>()),
             };
-            let (addrs, problem) = match lookup.await {
-                Err(_) => (Vec::new(), Some("lookup timed out".to_string())),
-                Ok(Err(e)) => (Vec::new(), Some(format!("lookup failed: {e}"))),
-                Ok(Ok(Err(e))) => (Vec::new(), Some(e.to_string())),
-                Ok(Ok(Ok(it))) => {
-                    let addrs: Vec<IpAddr> = it.map(|a| a.ip()).collect();
-                    let problem = missing_family(family, &addrs);
-                    (addrs, problem)
-                }
-            };
-            (line, host, addrs, problem)
+            (i, family, result)
         });
     }
+
     let mut problems: Vec<(usize, String, String)> = Vec::new();
     let mut resolved = HashMap::new();
-    let mut failed_tasks = 0;
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((line, host, addrs, problem)) => {
-                if let Some(p) = problem {
+    let deadline = tokio::time::Instant::now() + RESOLVE_ALL;
+    loop {
+        let joined = match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(joined)) => joined,
+            Ok(None) | Err(_) => break,
+        };
+        // A task that panicked stays in `pending` and is reported below.
+        let Ok((i, family, result)) = joined else {
+            continue;
+        };
+        let Some((line, host)) = pending.remove(&i) else {
+            continue;
+        };
+        match result {
+            Err(e) => problems.push((line, host, e)),
+            Ok(addrs) => {
+                if let Some(p) = missing_family(family, &addrs) {
                     problems.push((line, host, p));
                 }
-                resolved.insert(line, addrs);
-            }
-            Err(e) => {
-                eprintln!("{}: warning: a host lookup failed: {e}", path.display());
-                failed_tasks += 1;
+                // Only a lookup that found addresses tells which family a
+                // prefer-v6 target will use.
+                if !addrs.is_empty() {
+                    resolved.insert(i, addrs);
+                }
             }
         }
+    }
+    tasks.abort_all();
+    for (line, host) in pending.into_values() {
+        problems.push((
+            line,
+            host,
+            format!(
+                "not checked: lookups did not finish within {}",
+                rl_core::duration::format(RESOLVE_ALL)
+            ),
+        ));
     }
     problems.sort();
     for (line, host, problem) in &problems {
@@ -222,7 +243,7 @@ async fn check_hosts(cfg: &Config, path: &Path) -> (HashMap<usize, Vec<IpAddr>>,
             path.display()
         );
     }
-    (resolved, problems.len() + failed_tasks)
+    (resolved, problems.len())
 }
 
 /// What is missing from `addrs` for `family`, if anything.
