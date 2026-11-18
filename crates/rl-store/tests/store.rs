@@ -223,7 +223,9 @@ fn crash_child() {
     let (mut w, _) = Writer::open(dir, opts, T0).unwrap();
     let ids = w.register(&keys(CHILD_SERIES)).unwrap();
     let mut rng = Rng(4);
-    for step in 0i64.. {
+    // Runs until the parent kills it.
+    let mut step = 0i64;
+    loop {
         let ts = T0 + step * STEP_MS;
         for id in &ids {
             w.append(*id, lab_round(&mut rng, ts, 20_000)).unwrap();
@@ -235,6 +237,7 @@ fn crash_child() {
             std::fs::rename(&tmp, dir.join("progress")).unwrap();
             w.maintain(ts).unwrap();
         }
+        step += 1;
     }
 }
 
