@@ -443,7 +443,10 @@ impl Validator<'_> {
             self.error(&raw.data_dir.span(), "data_dir must not be empty");
             ok = false;
         } else if data_dir.contains('\0') {
-            self.error(&raw.data_dir.span(), "data_dir must not contain a NUL character");
+            self.error(
+                &raw.data_dir.span(),
+                "data_dir must not contain a NUL character",
+            );
             ok = false;
         }
         let vantage = match &raw.vantage {
@@ -779,12 +782,13 @@ fn line_starts(src: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Control characters (from quoted keys or values) escaped, so a message
-/// cannot rewrite the terminal it is printed on. Line breaks stay.
+/// Control characters (from quoted keys or values) escaped, line breaks
+/// included, so a message stays on one line and cannot rewrite the terminal
+/// it is printed on or forge another diagnostic.
 fn escape_controls(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_control() && c != '\n' {
+        if c.is_control() {
             out.extend(c.escape_default());
         } else {
             out.push(c);
@@ -950,7 +954,10 @@ name = "G"
 "#;
         let e = errors(src);
         assert_eq!(e.len(), 1, "{e:?}");
-        assert!(e[0].contains("ends after the next round starts (step 1m)"), "{e:?}");
+        assert!(
+            e[0].contains("ends after the next round starts (step 1m)"),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -1212,5 +1219,22 @@ name = "G"
     #[test]
     fn control_characters_are_escaped() {
         assert_eq!(escape_controls("a\u{1b}[2Jb\tc"), "a\\u{1b}[2Jb\\tc");
+        assert_eq!(escape_controls("a\nb\rc"), "a\\nb\\rc");
+    }
+
+    #[test]
+    fn a_quoted_key_cannot_forge_a_diagnostic_line() {
+        let src = format!("{MINIMAL}\"x\\nconfig.toml:1:1: error: forged\" = 1\n");
+        let parsed = parse(&src);
+        assert!(parsed.config.is_none());
+        let d = parsed
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("forged"))
+            .unwrap();
+        assert!(!d.message.contains('\n'), "{:?}", d.message);
+        assert!(d.message.contains("x\\nconfig.toml"), "{:?}", d.message);
+        assert_eq!(d.line, src.lines().count());
+        assert!(!d.to_string().contains('\n'));
     }
 }
