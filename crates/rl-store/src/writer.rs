@@ -235,8 +235,23 @@ impl Writer {
                     // (that would drop its WAL copies as late): stop, and
                     // leave every file as it is for the operator.
                     Err(e) if seg.sealed => return Err(damaged_sealed(&seg.path, e)),
+                    // A damaged open segment: set it aside so the day can
+                    // start again (from the WAL rounds it may still have),
+                    // instead of failing to create a file of the same name.
                     Err(e) => {
-                        rec.problems.push(format!("{}: {e}", seg.path.display()));
+                        let name = format!(
+                            "series-{id}-{}",
+                            seg.path
+                                .file_name()
+                                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                        );
+                        let to = quarantine(dir, &seg.path, &name)?;
+                        layout::sync_dir(&layout::raw_dir(dir, id))?;
+                        rec.problems.push(format!(
+                            "{}: {e}; moved to {}, its rounds are not in the store",
+                            seg.path.display(),
+                            to.display()
+                        ));
                         continue;
                     }
                 };
@@ -593,33 +608,38 @@ impl Writer {
     /// `quarantine/`. Called right after the recovery checkpoint.
     fn quarantine_kept_wal(&mut self) -> Result<Vec<(u64, PathBuf)>, StoreError> {
         let mut moved = Vec::new();
-        if self.keep_wal.is_empty() {
-            return Ok(moved);
-        }
-        let q = layout::quarantine_dir(&self.dir);
-        if !q.try_exists()? {
-            std::fs::create_dir(&q)?;
-            layout::sync_dir(&self.dir)?;
-        }
         while let Some(seq) = self.keep_wal.first().copied() {
-            let from = layout::wal_path(&self.dir, seq);
-            let name = from.file_name().expect("WAL path has a file name");
-            let mut to = q.join(name);
-            let mut n = 1;
-            while to.try_exists()? {
-                to = q.join(format!("{}.{n}", name.to_string_lossy()));
-                n += 1;
-            }
-            std::fs::rename(&from, &to)?;
-            // The new name first: a crash in between leaves it in both
-            // directories at worst, never in neither.
-            layout::sync_dir(&q)?;
+            let to = quarantine(
+                &self.dir,
+                &layout::wal_path(&self.dir, seq),
+                &format!("{seq:08}.wal"),
+            )?;
             layout::sync_dir(&layout::wal_dir(&self.dir))?;
             self.keep_wal.remove(&seq);
             moved.push((seq, to));
         }
         Ok(moved)
     }
+}
+
+/// Move a damaged file into `quarantine/` as `name` (with a numeric suffix
+/// if taken), and make its new name durable. The caller syncs the
+/// directory it came from.
+fn quarantine(dir: &Path, from: &Path, name: &str) -> Result<PathBuf, StoreError> {
+    let q = layout::quarantine_dir(dir);
+    if !q.try_exists()? {
+        std::fs::create_dir(&q)?;
+        layout::sync_dir(dir)?;
+    }
+    let mut to = q.join(name);
+    let mut n = 1;
+    while to.try_exists()? {
+        to = q.join(format!("{name}.{n}"));
+        n += 1;
+    }
+    std::fs::rename(from, &to)?;
+    layout::sync_dir(&q)?;
+    Ok(to)
 }
 
 /// Sequence number for a new WAL file after `last`. An exhausted sequence
