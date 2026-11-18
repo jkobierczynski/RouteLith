@@ -33,10 +33,19 @@ pub(crate) fn date(day: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Inverse of [`date`].
+/// First and last day the store accepts: years 0000 to 9999, so file
+/// names are always `YYYY-MM-DD`.
+pub(crate) const MIN_DAY: i64 = -719_528;
+pub(crate) const MAX_DAY: i64 = 2_932_896;
+
+/// Inverse of [`date`] for years 0000 to 9999.
 pub(crate) fn parse_date(s: &str) -> Option<i64> {
     let mut it = s.splitn(3, '-');
-    let y: i64 = it.next()?.parse().ok()?;
+    let y = it.next()?;
+    if y.len() != 4 || !y.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let y: i64 = y.parse().ok()?;
     let m: i64 = it.next()?.parse().ok()?;
     let d: i64 = it.next()?.parse().ok()?;
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
@@ -56,6 +65,11 @@ pub(crate) fn index_path(dir: &Path) -> PathBuf {
     dir.join("meta.redb")
 }
 
+/// Held by the writer while it runs (see `writer::lock_dir`).
+pub(crate) fn lock_path(dir: &Path) -> PathBuf {
+    dir.join("writer.lock")
+}
+
 pub(crate) fn wal_dir(dir: &Path) -> PathBuf {
     dir.join("wal")
 }
@@ -64,7 +78,8 @@ pub(crate) fn wal_path(dir: &Path, seq: u64) -> PathBuf {
     wal_dir(dir).join(format!("{seq:08}.wal"))
 }
 
-pub(crate) fn raw_dir(dir: &Path, series: u64) -> PathBuf {
+/// Directory holding a series' raw segments.
+pub fn raw_dir(dir: &Path, series: u64) -> PathBuf {
     dir.join("series").join(series.to_string()).join("raw")
 }
 
@@ -131,7 +146,12 @@ pub(crate) fn list_series_dirs(dir: &Path) -> std::io::Result<Vec<u64>> {
     };
     let mut ids = Vec::new();
     for entry in entries {
-        if let Some(id) = entry?.file_name().to_str().and_then(|s| s.parse().ok()) {
+        let name = entry?.file_name();
+        // Only the spelling `raw_dir` produces ("1", not "01").
+        if let Some(id) = name
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok().filter(|id| id.to_string() == s))
+        {
             ids.push(id);
         }
     }
@@ -149,11 +169,12 @@ pub(crate) fn list_wal(dir: &Path) -> std::io::Result<Vec<u64>> {
     let mut seqs = Vec::new();
     for entry in entries {
         let name = entry?.file_name();
-        if let Some(seq) = name
-            .to_str()
-            .and_then(|n| n.strip_suffix(".wal"))
-            .and_then(|n| n.parse().ok())
-        {
+        // Only the spelling `wal_path` produces.
+        if let Some(seq) = name.to_str().and_then(|n| {
+            n.strip_suffix(".wal")
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|&seq| format!("{seq:08}.wal") == n)
+        }) {
             seqs.push(seq);
         }
     }
@@ -193,6 +214,11 @@ mod tests {
         assert_eq!(parse_date("2025-02-30"), None);
         assert_eq!(parse_date("2025-13-01"), None);
         assert_eq!(parse_date("x"), None);
+        assert_eq!(date(MIN_DAY), "0000-01-01");
+        assert_eq!(date(MAX_DAY), "9999-12-31");
+        assert_eq!(parse_date("0000-01-01"), Some(MIN_DAY));
+        assert_eq!(parse_date("99999999999999-01-01"), None);
+        assert_eq!(parse_date("-001-01-01"), None);
     }
 
     #[test]

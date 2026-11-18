@@ -105,7 +105,13 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
     };
 
     let (tx, rx) = mpsc::sync_channel::<Completed>(QUEUE);
-    let store = std::thread::spawn(move || store_loop(writer, &rx));
+    // Tells the main loop when the store thread ends early (after an error).
+    let (store_done_tx, mut store_done) = tokio::sync::oneshot::channel::<()>();
+    let store = std::thread::spawn(move || {
+        let r = store_loop(writer, &rx);
+        let _ = store_done_tx.send(());
+        r
+    });
     let sink: Sink = Arc::new(move |c| tx.try_send(c).is_ok());
 
     let limiter = Arc::new(RateLimiter::new(cfg.server.max_pps));
@@ -163,6 +169,10 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
     loop {
         tokio::select! {
             () = &mut signal => break,
+            _ = &mut store_done => {
+                eprintln!("routelith server: the store stopped after an error; shutting down");
+                break;
+            }
             _ = ticker.tick() => {
                 if !interval.is_zero() {
                     eprintln!("routelith server: {}", stats_line(&stats.snapshot(true), "last"));
@@ -292,40 +302,54 @@ fn stored(c: &Completed) -> StoredRound {
 
 /// Own the writer: append rounds as they come, fsync and maintain once a
 /// second, close when every sender is gone.
+///
+/// The writer is fail-stop, so any error other than a single invalid round
+/// ends the loop; the server then shuts down and a restart runs recovery.
 fn store_loop(mut w: Writer, rx: &mpsc::Receiver<Completed>) -> Result<(), rl_store::StoreError> {
-    let mut next_sync = Instant::now() + SYNC_EVERY;
     let mut late = 0u64;
-    let mut last_error: Option<String> = None;
-    loop {
-        let wait = next_sync.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(wait) {
-            Ok(c) => match w.append(c.series, stored(&c)) {
-                Ok(Appended::Stored) => {}
-                Ok(Appended::Late) => late += 1,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if last_error.as_deref() != Some(&msg) {
-                        eprintln!("routelith server: store: series {}: {msg}", c.series);
-                        last_error = Some(msg);
-                    }
-                }
-            },
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-        if Instant::now() >= next_sync {
-            next_sync += SYNC_EVERY;
-            if let Err(e) = w.sync().and_then(|()| w.maintain(now_ms())) {
-                eprintln!("routelith server: store: {e}");
-            }
-        }
-    }
+    let result = store_rounds(&mut w, rx, &mut late);
     if late > 0 {
         eprintln!(
             "routelith server: store: {late} round(s) were not newer than the last one and were dropped"
         );
     }
+    result?;
     w.close()
+}
+
+fn store_rounds(
+    w: &mut Writer,
+    rx: &mpsc::Receiver<Completed>,
+    late: &mut u64,
+) -> Result<(), rl_store::StoreError> {
+    let mut next_sync = Instant::now() + SYNC_EVERY;
+    let mut last_invalid: Option<String> = None;
+    loop {
+        let wait = next_sync.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(wait) {
+            Ok(c) => match w.append(c.series, stored(&c)) {
+                Ok(Appended::Stored) => {}
+                Ok(Appended::Late) => *late += 1,
+                Err(rl_store::StoreError::InvalidRound(msg)) => {
+                    if last_invalid.as_deref() != Some(msg) {
+                        eprintln!(
+                            "routelith server: store: series {}: invalid round: {msg}",
+                            c.series
+                        );
+                        last_invalid = Some(msg.to_string());
+                    }
+                }
+                Err(e) => return Err(e),
+            },
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+        if Instant::now() >= next_sync {
+            next_sync += SYNC_EVERY;
+            w.sync()?;
+            w.maintain(now_ms())?;
+        }
+    }
 }
 
 fn stats_line(s: &Snapshot, window: &str) -> String {
@@ -407,5 +431,34 @@ mod tests {
         assert_eq!((r.ts_ms, r.sent, r.loss()), (60_000, 20, 20));
         assert_eq!(r.errors.other, 20);
         assert_eq!(r.flags, rl_store::FLAG_CLOCK_STEP);
+    }
+
+    #[test]
+    fn an_invalid_round_does_not_stop_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut w, _) = Writer::open(dir.path(), WriterOptions::default(), 0).unwrap();
+        let id = w.register(&[SeriesKey::new("local", "t", "v4")]).unwrap()[0];
+        let failed = |secs: u64| Completed {
+            series: id,
+            outcome: Outcome::Failed {
+                start: UNIX_EPOCH + Duration::from_secs(secs),
+                sent: 20,
+                cause: FailCause::Probe,
+                error: "nope".into(),
+            },
+            flags: 0,
+        };
+        let (tx, rx) = mpsc::sync_channel(4);
+        // Year 11,000: outside what the store accepts.
+        tx.send(failed(284_000_000_000)).unwrap();
+        tx.send(failed(1_800_000_000)).unwrap();
+        drop(tx);
+        store_loop(w, &rx).unwrap();
+        let rounds = rl_store::Reader::open(dir.path())
+            .unwrap()
+            .read(id, 0, i64::MAX)
+            .unwrap();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].ts_ms, 1_800_000_000_000);
     }
 }

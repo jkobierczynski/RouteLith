@@ -12,7 +12,7 @@ use crate::round::StoredRound;
 use crate::segment::Tail;
 
 const MAGIC: &[u8; 8] = b"RLWAL\0\0\x01";
-const HEADER_LEN: usize = 8 + 8 + 4;
+pub(crate) const HEADER_LEN: usize = 8 + 8 + 4;
 
 /// `(series, round)` pairs in log order.
 pub(crate) type Records = Vec<(u64, StoredRound)>;
@@ -38,9 +38,16 @@ impl WalWriter {
         h.extend_from_slice(&seq.to_le_bytes());
         let crc = crc32c::crc32c(&h);
         h.extend_from_slice(&crc.to_le_bytes());
-        file.write_all(&h)?;
-        file.flush()?;
-        file.get_ref().sync_all()?;
+        let written = file
+            .write_all(&h)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.get_ref().sync_all());
+        if let Err(e) = written {
+            // Created by this call: remove it so a retry can create it again.
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
         Ok(Self {
             file,
             seq,

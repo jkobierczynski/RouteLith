@@ -258,7 +258,7 @@ fn kill_9_loses_at_most_the_last_sync() {
             .spawn()
             .unwrap();
         // Let it run long enough to write blocks, seal days and checkpoint.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let progress = dir.path().join("progress");
         let target = 200 * (attempt + 1);
         while Instant::now() < deadline {
@@ -274,13 +274,22 @@ fn kill_9_loses_at_most_the_last_sync() {
         child.kill().unwrap();
         child.wait().unwrap();
         let synced: i64 = std::fs::read_to_string(&progress).unwrap().parse().unwrap();
-        assert!(synced >= 0, "child made no progress");
+        assert!(
+            synced >= target,
+            "child reached step {synced} of {target} in 30 s, so the run proves too little"
+        );
 
         // Restart: recovery must keep every synced round.
         let (w, rec) = Writer::open(dir.path(), WriterOptions::default(), T0).unwrap();
         assert!(rec.problems.is_empty(), "{:?}", rec.problems);
         drop(w);
         let reader = Reader::open(dir.path()).unwrap();
+        let mut recovered: Vec<SeriesKey> =
+            reader.series().iter().map(|(k, _)| k.clone()).collect();
+        let mut expected = keys(CHILD_SERIES);
+        recovered.sort();
+        expected.sort();
+        assert_eq!(recovered, expected, "attempt {attempt}");
         let v = reader.verify().unwrap();
         assert!(v.problems.is_empty(), "{:?}", v.problems);
         assert_eq!(v.torn_open, 0);
@@ -298,4 +307,115 @@ fn kill_9_loses_at_most_the_last_sync() {
         std::fs::remove_dir_all(dir.path()).unwrap();
         std::fs::create_dir_all(dir.path()).unwrap();
     }
+}
+
+#[test]
+fn a_second_writer_on_the_same_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = WriterOptions::default();
+    let (w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+    match Writer::open(dir.path(), opts, T0) {
+        Err(rl_store::StoreError::Locked(_)) => {}
+        other => panic!("expected Locked, got {:?}", other.map(|_| ())),
+    }
+    w.close().unwrap();
+    // Released on close.
+    let (w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+    drop(w);
+}
+
+#[test]
+fn block_rounds_out_of_range_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    for block_rounds in [0, 4097] {
+        let opts = WriterOptions {
+            block_rounds,
+            ..WriterOptions::default()
+        };
+        match Writer::open(dir.path(), opts, T0) {
+            Err(rl_store::StoreError::InvalidOptions(_)) => {}
+            other => panic!("{block_rounds}: got {:?}", other.map(|_| ())),
+        }
+    }
+}
+
+#[test]
+fn resolved_address_and_timing_carry_across_blocks_and_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = WriterOptions {
+        block_rounds: 4,
+        ..WriterOptions::default()
+    };
+    let mut rng = Rng(7);
+    let first = lab_round(&mut rng, T0, 10_000);
+    let (mut w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+    let id = w.register(&keys(1)).unwrap()[0];
+    w.append(id, first.clone()).unwrap();
+    // Later rounds carry no address or timing: they inherit the last ones,
+    // including across block boundaries (every 4 rounds) and a restart.
+    for i in 1..10 {
+        let mut r = lab_round(&mut rng, T0 + i * STEP_MS, 10_000);
+        r.resolved = None;
+        r.timing = None;
+        w.append(id, r).unwrap();
+    }
+    w.close().unwrap();
+    let (mut w, _) = Writer::open(dir.path(), opts, T0 + 10 * STEP_MS).unwrap();
+    for i in 10..14 {
+        let mut r = lab_round(&mut rng, T0 + i * STEP_MS, 10_000);
+        r.resolved = None;
+        r.timing = None;
+        w.append(id, r).unwrap();
+    }
+    w.close().unwrap();
+    let got = Reader::open(dir.path())
+        .unwrap()
+        .read(id, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(got.len(), 14);
+    for r in &got {
+        assert_eq!(r.resolved, first.resolved, "at {}", r.ts_ms);
+        assert_eq!(r.timing, first.timing, "at {}", r.ts_ms);
+    }
+}
+
+#[test]
+fn reader_rejects_a_segment_belonging_to_another_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = WriterOptions {
+        block_rounds: 4,
+        ..WriterOptions::default()
+    };
+    let (mut w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+    let ids = w.register(&keys(2)).unwrap();
+    let mut rng = Rng(3);
+    for i in 0..8 {
+        for &id in &ids {
+            w.append(id, lab_round(&mut rng, T0 + i * STEP_MS, 10_000))
+                .unwrap();
+        }
+    }
+    w.maintain(T0 + 2 * DAY_MS).unwrap();
+    w.close().unwrap();
+    // Copy series 0's sealed day into series 1's directory.
+    let name = "2026-11-18.seg";
+    let from = layout::raw_dir(dir.path(), ids[0]).join(name);
+    let to = layout::raw_dir(dir.path(), ids[1]).join(name);
+    std::fs::copy(from, to).unwrap();
+    let reader = Reader::open(dir.path()).unwrap();
+    assert!(reader.read(ids[0], 0, i64::MAX).is_ok());
+    assert!(reader.read(ids[1], 0, i64::MAX).is_err());
+}
+
+#[test]
+fn series_keys_with_the_separator_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut w, _) = Writer::open(dir.path(), WriterOptions::default(), T0).unwrap();
+    let bad = SeriesKey::new("local", "a\u{1f}b", "v4");
+    match w.register(&[bad]) {
+        Err(rl_store::StoreError::InvalidKey(_)) => {}
+        other => panic!("expected InvalidKey, got {other:?}"),
+    }
+    // A refused key is not an I/O failure: the writer keeps working.
+    assert!(w.register(&keys(1)).is_ok());
 }
