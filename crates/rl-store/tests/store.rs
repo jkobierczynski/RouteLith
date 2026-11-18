@@ -272,7 +272,15 @@ fn kill_9_loses_at_most_the_last_sync() {
             std::thread::sleep(Duration::from_millis(5));
         }
         child.kill().unwrap();
-        child.wait().unwrap();
+        let status = child.wait().unwrap();
+        // The child must have been killed, not have stopped on its own.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(9), "child ended with {status}");
+        }
+        #[cfg(not(unix))]
+        assert!(!status.success(), "child ended with {status}");
         let synced: i64 = std::fs::read_to_string(&progress).unwrap().parse().unwrap();
         assert!(
             synced >= target,
