@@ -192,11 +192,19 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
     ticker.tick().await;
     let started = Instant::now();
     tokio::pin!(signal);
+    // The store ends on its own only after an error, or when every job has
+    // ended (a scheduler task panicked, say): either way monitoring stopped
+    // without being asked to, which is a failure.
+    let mut stopped_early = false;
     loop {
         tokio::select! {
             () = &mut signal => break,
             _ = &mut store_done => {
-                eprintln!("routelith server: the store stopped after an error; shutting down");
+                eprintln!(
+                    "routelith server: the store stopped before shutdown was requested; \
+                     shutting down"
+                );
+                stopped_early = true;
                 break;
             }
             _ = ticker.tick() => {
@@ -209,8 +217,16 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
 
     eprintln!("routelith server: stopping");
     let _ = stop_tx.send(true);
-    while jobs.join_next().await.is_some() {}
-    let ok = match store.join() {
+    let mut panicked = 0usize;
+    while let Some(r) = jobs.join_next().await {
+        if r.is_err() {
+            panicked += 1;
+        }
+    }
+    if panicked > 0 {
+        eprintln!("routelith server: {panicked} scheduler task(s) failed");
+    }
+    let store_ok = match store.join() {
         Ok(Ok(0)) => true,
         Ok(Ok(n)) => {
             eprintln!("routelith server: store: {n} invalid round(s) were rejected and not stored");
@@ -230,7 +246,7 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
         started.elapsed().as_secs(),
         stats_line(&stats.snapshot(false), "all")
     );
-    if ok {
+    if store_ok && !stopped_early && panicked == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(2)

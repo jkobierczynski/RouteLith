@@ -142,8 +142,19 @@ pub(crate) fn append_block(path: &Path, body: &[u8]) -> io::Result<()> {
     let len = f.metadata()?.len();
     if let Err(e) = f.write_all(&frame) {
         // Don't leave half a frame for the next block to follow. If this
-        // fails too, the writer stops and recovery trims the tail.
-        f.set_len(len)?;
+        // fails too, the writer stops and recovery trims the tail. A new
+        // handle: on Windows an append-only one may not truncate.
+        drop(f);
+        let undo = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_len(len));
+        if let Err(undo) = undo {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("{e}; removing the partial block also failed: {undo}"),
+            ));
+        }
         return Err(e);
     }
     Ok(())
