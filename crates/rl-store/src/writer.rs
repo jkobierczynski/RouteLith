@@ -251,7 +251,8 @@ impl Writer {
                     }
                     // A damaged sealed day must not be treated as complete
                     // (that would drop its WAL copies as late): stop, and
-                    // leave every file as it is for the operator.
+                    // leave this file as it is for the operator (segments handled
+                    // before it may already have been repaired).
                     Err(e) if seg.sealed => return Err(damaged_sealed(&seg.path, e)),
                     // A damaged open segment: set it aside so the day can
                     // start again (from the WAL rounds it may still have),
@@ -710,7 +711,7 @@ fn next_wal_seq(dir: &Path, last: Option<u64>) -> Result<u64, StoreError> {
         None => Ok(1),
         Some(s) => s.checked_add(1).ok_or_else(|| StoreError::Corrupt {
             path: layout::wal_path(dir, s),
-            reason: "WAL sequence numbers are exhausted; nothing was changed".into(),
+            reason: "WAL sequence numbers are exhausted; no WAL file was created or removed".into(),
         }),
     }
 }
