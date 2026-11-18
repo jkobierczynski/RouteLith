@@ -46,6 +46,9 @@ cargo build --release
 cargo test --workspace
 ```
 
+See [DEVELOPMENT.md](DEVELOPMENT.md) for tests, CI, ICMP permissions and
+trying Routelith by hand on Linux and Windows.
+
 Supported platforms: Linux x86_64 (glibc and static musl) and Windows x86_64.
 macOS is compiled in CI but not a primary target.
 
