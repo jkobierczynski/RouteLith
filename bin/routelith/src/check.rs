@@ -40,6 +40,16 @@ const MAX_INTERVAL: Duration = Duration::from_secs(3600);
 const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) async fn icmp(args: IcmpArgs) -> ExitCode {
+    // Bounds that keep every offset and deadline of the round representable
+    // (and match the configuration's limits).
+    if args.interval > MAX_INTERVAL || args.timeout > MAX_TIMEOUT {
+        eprintln!(
+            "routelith check: interval must be at most {} and timeout at most {}",
+            rl_core::duration::format(MAX_INTERVAL),
+            rl_core::duration::format(MAX_TIMEOUT)
+        );
+        return ExitCode::from(2);
+    }
     let addr = match resolve(&args.host, args.ipv4, args.ipv6).await {
         Ok(addr) => addr,
         Err(msg) => {
@@ -51,16 +61,6 @@ pub(crate) async fn icmp(args: IcmpArgs) -> ExitCode {
         name: args.host.clone(),
         addr,
     };
-    // Bounds that keep every offset and deadline of the round representable
-    // (and match the configuration's limits).
-    if args.interval > MAX_INTERVAL || args.timeout > MAX_TIMEOUT {
-        eprintln!(
-            "routelith check: interval must be at most {} and timeout at most {}",
-            rl_core::duration::format(MAX_INTERVAL),
-            rl_core::duration::format(MAX_TIMEOUT)
-        );
-        return ExitCode::from(2);
-    }
     let spread = args.interval * u32::from(args.count);
     let plan = RoundPlan {
         count: args.count,

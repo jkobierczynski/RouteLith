@@ -182,14 +182,26 @@ pub(crate) fn list_wal(dir: &Path) -> std::io::Result<Vec<u64>> {
     Ok(seqs)
 }
 
-/// Make a rename or new file in `dir` durable. A no-op on Windows, where
-/// directories cannot be opened for syncing.
+/// Make a rename or new file in `dir` durable.
 pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         std::fs::File::open(dir)?.sync_all()
     }
-    #[cfg(not(unix))]
+    // Windows: FlushFileBuffers on a directory handle opened for writing
+    // with FILE_FLAG_BACKUP_SEMANTICS (the only way to open a directory)
+    // flushes its metadata, including new and renamed entries.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+            .sync_all()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = dir;
         Ok(())

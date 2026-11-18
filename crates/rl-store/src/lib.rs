@@ -9,7 +9,11 @@
 //! # fn demo(dir: &std::path::Path, round: StoredRound, now_ms: i64) -> Result<(), StoreError> {
 //! let (mut w, _recovery) = Writer::open(dir, WriterOptions::default(), now_ms)?;
 //! let [id] = w.register(&[SeriesKey::new("local", "gateway", "v4")])?[..] else { unreachable!() };
-//! w.append(id, round)?;
+//! match w.append(id, round)? {
+//!     Appended::Stored => {}
+//!     // Not newer than the series' last round (a duplicate or a late one).
+//!     Appended::Late => eprintln!("round dropped as late"),
+//! }
 //! w.sync()?; // about once a second
 //! w.close()?;
 //!

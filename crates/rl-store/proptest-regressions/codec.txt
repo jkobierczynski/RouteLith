@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e129f7f8b013440e2b12cf12b7c4c07ef1aa97197c2e0303dd504c95ae0b536b # shrinks to rounds = [StoredRound { ts_ms: 0, sent: 0, rtts_us: [], errors: ErrorCounts { unreachable: 0, time_exceeded: 0, send_failed: 0, other: 1 }, resolved: None, timing: None, flags: 0 }]
+cc d0d3f8a07d83d9787447ed1e5319c6629446b9e60438c5282c9f2035826b7b80 # shrinks to rounds = [StoredRound { ts_ms: 0, sent: 0, rtts_us: [], errors: ErrorCounts { unreachable: 0, time_exceeded: 0, send_failed: 0, other: 1 }, resolved: None, timing: None, flags: 0 }]
