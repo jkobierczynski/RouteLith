@@ -104,7 +104,7 @@ if command -v ping >/dev/null; then
         sed -n 's/.*time=\([0-9.]*\).*/\1/p' | sort -n |
         awk '{ v[NR] = $1 } END {
             if (NR % 2) print v[(NR + 1) / 2]
-            else if (NR) printf "%.3f\\n", (v[NR / 2] + v[NR / 2 + 1]) / 2
+            else if (NR) printf "%.3f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2
         }')
     if [[ $ref =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         if awk -v r="$delayed" -v p="$ref" -v t="$DELAY_TOL_MS" 'BEGIN { exit !(r <= p + t) }'; then
