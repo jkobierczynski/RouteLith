@@ -114,7 +114,8 @@ impl Summary {
 /// Nonce seed for one run: the low 32 bits of the clock (nanoseconds) and
 /// the low 16 bits of a process-wide run counter fill bits 16..64, and the
 /// low 16 bits are left for the sequence number. Runs in one process with
-/// different counters (mod 65536) always get different seeds.
+/// different counters (mod 65536) always get different seeds; a collision
+/// needs 65,536 runs in flight at once.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn nonce_seed(run_id: u64, clock_ns: u64) -> u64 {
     ((run_id & 0xffff) << 48) | ((clock_ns & 0xffff_ffff) << 16)
@@ -151,9 +152,11 @@ pub fn run(
         .map(|i| (i % 256) as u8)
         .collect();
     let ident = (std::process::id() & 0xffff) as u16;
-    // Per-run seed, so two overlapping runs in one process never accept each
-    // other's replies: a process-wide run counter in the top bits, mixed with
-    // the clock so separate processes differ too. The low 16 bits carry seq.
+    // Per-run seed, so overlapping runs in one process don't accept each
+    // other's replies: a process-wide run counter in the top bits, and the
+    // clock so separate processes differ too. The low 16 bits carry seq.
+    // Seeds can repeat only when more than 65,535 runs started after this one
+    // and one of them is still running, which a calibration never does.
     static RUN: AtomicU64 = AtomicU64::new(0);
     let run_id = RUN.fetch_add(1, Ordering::Relaxed);
     let clock = std::time::SystemTime::now()
