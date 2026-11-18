@@ -77,7 +77,9 @@ pub struct Recovery {
     pub torn_wal: usize,
     /// Open segments cut back to their last valid block.
     pub truncated_segments: usize,
-    /// Files that could not be read; they are left in place.
+    /// Files that could not be fully read. A damaged WAL file is moved to
+    /// `quarantine/` once what could be read is in segments; the rounds it
+    /// still holds are not in the store.
     pub problems: Vec<String>,
 }
 
@@ -168,7 +170,8 @@ pub struct Writer {
     dirty: BTreeSet<PathBuf>,
     /// Directories that gained or lost a name since the last fsync.
     dirty_dirs: BTreeSet<PathBuf>,
-    /// WAL files recovery could not fully account for: never deleted.
+    /// WAL files recovery could not fully account for: never deleted, and
+    /// moved to `quarantine/` after the recovery checkpoint.
     keep_wal: BTreeSet<u64>,
     /// Set by the first failed write; every later call returns it.
     failed: Option<String>,
@@ -191,17 +194,25 @@ impl Writer {
         if !(1..=MAX_BLOCK_ROUNDS).contains(&opts.block_rounds) {
             return Err(StoreError::InvalidOptions("block_rounds must be 1 to 4096"));
         }
-        let created = !dir.try_exists()?;
+        // Every directory `create_dir_all` is about to make, deepest first.
+        let mut created = Vec::new();
+        let mut p = dir.to_path_buf();
+        while !p.as_os_str().is_empty() && !p.try_exists()? {
+            created.push(p.clone());
+            match p.parent() {
+                Some(parent) => p = parent.to_path_buf(),
+                None => break,
+            }
+        }
         std::fs::create_dir_all(dir)?;
         let lock = lock_dir(dir)?;
         std::fs::create_dir_all(layout::wal_dir(dir))?;
         std::fs::create_dir_all(dir.join("series"))?;
-        // Make the new names durable before any WAL sync is acknowledged.
+        // Make the new names durable before any WAL sync is acknowledged:
+        // the entries in `dir`, then each created directory's own entry.
         layout::sync_dir(dir)?;
-        if created {
-            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-                layout::sync_dir(parent)?;
-            }
+        for d in &created {
+            layout::sync_dir(&layout::parent_or_dot(d))?;
         }
         let mut rec = Recovery::default();
         let mut series: BTreeMap<u64, Series> = BTreeMap::new();
@@ -229,18 +240,36 @@ impl Writer {
                         continue;
                     }
                 };
-                // Only a block that decodes may move the replay cutoff; the
-                // last one is checked (earlier ones were checked when the
-                // segment was last recovered or written).
-                let last = scan.blocks.last().map(|&(off, _)| off);
+                // A file from another series or day must not move this
+                // series' cutoffs (its WAL rounds would be dropped as late),
+                // and readers refuse it too: stop, changing nothing.
+                if scan.series != id || scan.day != seg.day {
+                    return Err(StoreError::Corrupt {
+                        path: seg.path.clone(),
+                        reason: format!(
+                            "segment header names series {} day {}, not series {id} day {}; \
+                             nothing was changed. Move the file aside to start without it",
+                            scan.series,
+                            layout::date(scan.day),
+                            layout::date(seg.day)
+                        ),
+                    });
+                }
+                // Only a block that decodes may move the replay cutoff: drop
+                // trailing blocks until the last one decodes (earlier ones
+                // were checked when the segment was last recovered or
+                // written).
                 let mut last_round = None;
-                if let Some(off) = last {
+                while let Some(&(off, _)) = scan.blocks.last() {
                     let decoded = match codec::read_frame(&bytes[off..]) {
                         codec::Frame::Ok(body, _) => codec::decode_block(body),
                         _ => None,
                     };
                     match decoded {
-                        Some(rounds) => last_round = rounds.last().cloned(),
+                        Some(rounds) => {
+                            last_round = rounds.last().cloned();
+                            break;
+                        }
                         None => {
                             scan.blocks.pop();
                             scan.valid_len = off as u64;
@@ -264,19 +293,21 @@ impl Writer {
                     s.resolved = r.resolved.or(s.resolved);
                     s.timing = r.timing.or(s.timing);
                 }
+                // The names of this file and its directories may be only in
+                // the page cache after a kill (a seal renamed just before
+                // it, say): sync them before any WAL is retired.
+                let raw = layout::raw_dir(dir, id);
+                if let Some(series_dir) = raw.parent() {
+                    dirty_dirs.insert(series_dir.to_path_buf());
+                }
+                dirty_dirs.insert(raw);
+                dirty_dirs.insert(dir.join("series"));
                 if seg.sealed {
                     s.sealed_through = s.sealed_through.max(Some(seg.day));
                 } else {
                     open_days.push(seg.day);
-                    // Its blocks may be only in the page cache after a
-                    // kill: sync them before any WAL is retired.
+                    // Likewise its blocks.
                     dirty.insert(seg.path.clone());
-                    let raw = layout::raw_dir(dir, id);
-                    if let Some(series_dir) = raw.parent() {
-                        dirty_dirs.insert(series_dir.to_path_buf());
-                    }
-                    dirty_dirs.insert(raw);
-                    dirty_dirs.insert(dir.join("series"));
                 }
             }
             // Normally at most one open segment; older ones are complete.
@@ -315,8 +346,7 @@ impl Writer {
                 // Header never fully written: the file holds no rounds.
                 Err(_) if bytes.len() < wal::HEADER_LEN => continue,
                 Err(e) => {
-                    rec.problems
-                        .push(format!("{}: {e}; left in place", path.display()));
+                    rec.problems.push(format!("{}: {e}", path.display()));
                     w.keep_wal.insert(seq);
                     continue;
                 }
@@ -327,8 +357,10 @@ impl Writer {
                 // Records after a bad checksum cannot be read: keep the file.
                 Tail::Corrupt => {
                     rec.torn_wal += 1;
-                    rec.problems
-                        .push(format!("{}: bad record; left in place", path.display()));
+                    rec.problems.push(format!(
+                        "{}: bad record; the rounds after it were not replayed",
+                        path.display()
+                    ));
                     w.keep_wal.insert(seq);
                 }
             }
@@ -341,6 +373,15 @@ impl Writer {
         }
         w.stats = WriterStats::default();
         w.guard(|w| w.checkpoint())?;
+        // What could be read is now durable in segments: move the damaged
+        // files out of the live WAL set, so readers are not blocked by them.
+        for (seq, to) in w.guard(|w| w.quarantine_kept_wal())? {
+            rec.problems.push(format!(
+                "{}: moved to {}",
+                layout::wal_path(dir, seq).display(),
+                to.display()
+            ));
+        }
         w.maintain(now_ms)?;
         Ok((w, rec))
     }
@@ -544,6 +585,40 @@ impl Writer {
         layout::sync_dir(&layout::wal_dir(&self.dir))?;
         self.stats.checkpoints += 1;
         Ok(())
+    }
+}
+
+impl Writer {
+    /// Move the WAL files recovery could not fully read into
+    /// `quarantine/`. Called right after the recovery checkpoint.
+    fn quarantine_kept_wal(&mut self) -> Result<Vec<(u64, PathBuf)>, StoreError> {
+        let mut moved = Vec::new();
+        if self.keep_wal.is_empty() {
+            return Ok(moved);
+        }
+        let q = layout::quarantine_dir(&self.dir);
+        if !q.try_exists()? {
+            std::fs::create_dir(&q)?;
+            layout::sync_dir(&self.dir)?;
+        }
+        while let Some(seq) = self.keep_wal.first().copied() {
+            let from = layout::wal_path(&self.dir, seq);
+            let name = from.file_name().expect("WAL path has a file name");
+            let mut to = q.join(name);
+            let mut n = 1;
+            while to.try_exists()? {
+                to = q.join(format!("{}.{n}", name.to_string_lossy()));
+                n += 1;
+            }
+            std::fs::rename(&from, &to)?;
+            // The new name first: a crash in between leaves it in both
+            // directories at worst, never in neither.
+            layout::sync_dir(&q)?;
+            layout::sync_dir(&layout::wal_dir(&self.dir))?;
+            self.keep_wal.remove(&seq);
+            moved.push((seq, to));
+        }
+        Ok(moved)
     }
 }
 
