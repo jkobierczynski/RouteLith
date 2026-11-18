@@ -4,6 +4,7 @@
 //! data/
 //! ├── meta.redb                 series index
 //! ├── wal/00000001.wal          write-ahead log
+//! ├── quarantine/               damaged WAL files recovery set aside
 //! └── series/<id>/raw/
 //!     ├── 2026-11-17.seg        sealed day segment
 //!     └── 2026-11-18.open       today's open segment
@@ -72,6 +73,20 @@ pub(crate) fn lock_path(dir: &Path) -> PathBuf {
 
 pub(crate) fn wal_dir(dir: &Path) -> PathBuf {
     dir.join("wal")
+}
+
+/// Damaged WAL files, kept for the operator but out of the live WAL set.
+pub(crate) fn quarantine_dir(dir: &Path) -> PathBuf {
+    dir.join("quarantine")
+}
+
+/// The directory holding `path`'s entry: its parent, or `.` for a
+/// single-component relative path.
+pub(crate) fn parent_or_dot(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
 }
 
 pub(crate) fn wal_path(dir: &Path, seq: u64) -> PathBuf {

@@ -159,8 +159,22 @@ fn get_rle(r: &mut Reader<'_>, n: usize) -> Option<Vec<u16>> {
     Some(out)
 }
 
+/// How a payload treats a timing code this version does not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnknownTiming {
+    /// Read it as "unknown" (segments: what a reader is shown).
+    Unknown,
+    /// Reject the payload (WAL: replay would otherwise fill the round with
+    /// an earlier backend and store that in a segment).
+    Reject,
+}
+
 /// Decode `n` rounds from a payload. `None` if it is malformed.
-pub(crate) fn decode_payload(buf: &[u8], n: usize) -> Option<Vec<StoredRound>> {
+pub(crate) fn decode_payload(
+    buf: &[u8],
+    n: usize,
+    unknown_timing: UnknownTiming,
+) -> Option<Vec<StoredRound>> {
     let mut r = Reader::new(buf);
     let mut ts = Vec::with_capacity(n);
     let mut delta = 0i64;
@@ -231,7 +245,11 @@ pub(crate) fn decode_payload(buf: &[u8], n: usize) -> Option<Vec<StoredRound>> {
             TAG_TIMING => {
                 // An unknown code (from a newer version) reads as "unknown"
                 // and ends the previous backend's run.
-                timing_at.push((idx, TimingBackend::from_code(r.byte()?)));
+                let t = TimingBackend::from_code(r.byte()?);
+                if t.is_none() && unknown_timing == UnknownTiming::Reject {
+                    return None;
+                }
+                timing_at.push((idx, t));
             }
             TAG_ERRORS => {
                 round.errors = ErrorCounts {
@@ -352,7 +370,7 @@ pub(crate) fn decode_block(body: &[u8]) -> Option<Vec<StoredRound>> {
         .filter(|&n| n <= MAX_FRAME)
         .unwrap_or(MAX_FRAME);
     let payload = zstd::bulk::decompress(compressed, capacity).ok()?;
-    let rounds = decode_payload(&payload, usize::from(h.count))?;
+    let rounds = decode_payload(&payload, usize::from(h.count), UnknownTiming::Unknown)?;
     let ok = rounds.first().map(|r| r.ts_ms) == Some(h.first_ts)
         && rounds.last().map(|r| r.ts_ms) == Some(h.last_ts);
     ok.then_some(rounds)
@@ -431,7 +449,7 @@ mod tests {
         fn payload_round_trips(rounds in proptest::collection::vec(arb_round(), 0..40)) {
             let mut buf = Vec::new();
             encode_payload(&rounds, &mut buf);
-            prop_assert_eq!(decode_payload(&buf, rounds.len()), Some(filled(&rounds)));
+            prop_assert_eq!(decode_payload(&buf, rounds.len(), UnknownTiming::Unknown), Some(filled(&rounds)));
         }
 
         #[test]
@@ -442,7 +460,7 @@ mod tests {
 
         #[test]
         fn corrupt_payloads_never_panic(buf: Vec<u8>, n in 0usize..50) {
-            let _ = decode_payload(&buf, n);
+            let _ = decode_payload(&buf, n, UnknownTiming::Unknown);
         }
     }
 

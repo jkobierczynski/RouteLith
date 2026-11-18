@@ -168,6 +168,8 @@ const RESOLVE_ALL: Duration = Duration::from_secs(30);
 /// address of its family. Returns the addresses of each lookup that
 /// succeeded, by index in `cfg.targets`, and the number of warnings.
 async fn check_hosts(cfg: &Config, path: &Path) -> (HashMap<usize, Vec<IpAddr>>, usize) {
+    // The batch deadline is fixed before any lookup is submitted.
+    let deadline = tokio::time::Instant::now() + RESOLVE_ALL;
     let permits = Arc::new(Semaphore::new(RESOLVE_PARALLEL));
     let mut tasks = tokio::task::JoinSet::new();
     let mut pending: HashMap<usize, (usize, String)> = HashMap::new();
@@ -198,14 +200,24 @@ async fn check_hosts(cfg: &Config, path: &Path) -> (HashMap<usize, Vec<IpAddr>>,
         task_target.insert(handle.id(), i);
     }
 
-    let mut problems: Vec<(usize, String, String)> = Vec::new();
+    // (line, host, checked, detail): `checked` is false when no lookup
+    // result is known, which is not evidence that the host does not resolve.
+    let mut problems: Vec<(usize, String, bool, String)> = Vec::new();
     let mut resolved = HashMap::new();
-    let deadline = tokio::time::Instant::now() + RESOLVE_ALL;
     loop {
-        let joined = match tokio::time::timeout_at(deadline, tasks.join_next_with_id()).await {
-            Ok(Some(joined)) => joined,
-            Ok(None) | Err(_) => break,
+        // Expiry takes priority over a result that is ready at the same time,
+        // so nothing that finished after the deadline is counted.
+        let joined = tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => break,
+            joined = tasks.join_next_with_id() => match joined {
+                Some(joined) => joined,
+                None => break,
+            },
         };
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
         let (i, family, result) = match joined {
             Ok((_, r)) => r,
             Err(e) => {
@@ -213,11 +225,7 @@ async fn check_hosts(cfg: &Config, path: &Path) -> (HashMap<usize, Vec<IpAddr>>,
                 // could be started for it): report that, not a timeout.
                 if let Some((line, host)) = task_target.get(&e.id()).and_then(|i| pending.remove(i))
                 {
-                    problems.push((
-                        line,
-                        host,
-                        format!("not checked: the lookup task failed: {e}"),
-                    ));
+                    problems.push((line, host, false, format!("the lookup task failed: {e}")));
                 }
                 continue;
             }
@@ -226,10 +234,10 @@ async fn check_hosts(cfg: &Config, path: &Path) -> (HashMap<usize, Vec<IpAddr>>,
             continue;
         };
         match result {
-            Err(e) => problems.push((line, host, e)),
+            Err(e) => problems.push((line, host, true, e)),
             Ok(addrs) => {
                 if let Some(p) = missing_family(family, &addrs) {
-                    problems.push((line, host, p));
+                    problems.push((line, host, true, p));
                 }
                 // Only a lookup that found addresses tells which family a
                 // prefer-v6 target will use.
@@ -244,16 +252,22 @@ async fn check_hosts(cfg: &Config, path: &Path) -> (HashMap<usize, Vec<IpAddr>>,
         problems.push((
             line,
             host,
+            false,
             format!(
-                "not checked: lookups did not finish within {}",
+                "lookups did not finish within {}",
                 rl_core::duration::format(RESOLVE_ALL)
             ),
         ));
     }
     problems.sort();
-    for (line, host, problem) in &problems {
+    for (line, host, checked, problem) in &problems {
+        let what = if *checked {
+            "does not resolve"
+        } else {
+            "was not checked"
+        };
         eprintln!(
-            "{}:{line}: warning: host {host:?} does not resolve: {problem}",
+            "{}:{line}: warning: host {host:?} {what}: {problem}",
             path.display()
         );
     }

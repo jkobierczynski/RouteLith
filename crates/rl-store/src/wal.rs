@@ -110,7 +110,9 @@ pub(crate) fn read(bytes: &[u8]) -> Result<(Records, Tail), &'static str> {
                 let Some(series) = body.get(..8).and_then(|b| b.try_into().ok()) else {
                     break Tail::Corrupt;
                 };
-                let Some(mut rounds) = codec::decode_payload(&body[8..], 1) else {
+                let Some(mut rounds) =
+                    codec::decode_payload(&body[8..], 1, codec::UnknownTiming::Reject)
+                else {
                     break Tail::Corrupt;
                 };
                 out.push((u64::from_le_bytes(series), rounds.remove(0)));
