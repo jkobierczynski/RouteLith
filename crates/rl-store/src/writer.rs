@@ -216,10 +216,14 @@ impl Writer {
         let mut p = dir.to_path_buf();
         loop {
             if let Err(e) = layout::sync_dir(&layout::parent_or_dot(&p)) {
-                // Only a parent this process may not open (a system
-                // directory above the data) is passed over; any other
-                // failure, a retry's included, stops the open.
-                if created.contains(&p) || e.kind() != std::io::ErrorKind::PermissionDenied {
+                // The data directory's own entry must sync, on a retry too.
+                // Above it, only a parent this process may not open (a
+                // system directory) is passed over, unless this start
+                // created the entry.
+                if p == dir
+                    || created.contains(&p)
+                    || e.kind() != std::io::ErrorKind::PermissionDenied
+                {
                     return Err(e.into());
                 }
             }
