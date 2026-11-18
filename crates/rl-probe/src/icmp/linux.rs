@@ -7,7 +7,7 @@ use std::io::{self, ErrorKind};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, SystemTimeError};
 
 use rl_core::{Sample, SampleError, TimingBackend};
 use rl_sys::linux::PingSocket;
@@ -49,7 +49,34 @@ struct Pending {
 #[derive(Debug)]
 struct Rx {
     kernel: Option<SystemTime>,
+    /// Wall clock and monotonic clock read together when the reply was handled.
+    wall: SystemTime,
     user: Instant,
+}
+
+/// Removes a pending request when its sample ends for any reason, including
+/// cancellation of the sample task. Only an entry that still carries this
+/// request's nonce is removed, so a reused sequence number is left alone.
+struct PendingGuard<'a> {
+    shared: &'a Shared,
+    seq: u16,
+    nonce: u64,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        let mut pending = self
+            .shared
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if pending
+            .get(&self.seq)
+            .is_some_and(|p| p.nonce == self.nonce)
+        {
+            pending.remove(&self.seq);
+        }
+    }
 }
 
 impl Engine {
@@ -91,8 +118,13 @@ impl Engine {
             dest,
             reply: tx,
         }) else {
-            let err = SampleError::Other("too many requests in flight".into());
-            return (Sample::Error(err), TimingBackend::LinuxMonotonic);
+            let err = SampleError::SendFailed("too many requests in flight".into());
+            return (Sample::Error(err), self.preferred_backend());
+        };
+        let _guard = PendingGuard {
+            shared: &self.shared,
+            seq,
+            nonce,
         };
         let v6 = self.shared.sock.get_ref().is_v6();
         let packet = build_echo_request(v6, 0, seq, nonce, self.payload_size);
@@ -101,9 +133,8 @@ impl Engine {
         let (tx_wall, tx_user) = match sent {
             Ok(times) => times,
             Err(e) => {
-                self.unregister(seq);
                 return (
-                    Sample::Error(SampleError::Other(e.to_string())),
+                    Sample::Error(SampleError::SendFailed(e.to_string())),
                     self.preferred_backend(),
                 );
             }
@@ -111,20 +142,14 @@ impl Engine {
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(rx)) => {
-                let user_rtt = rx.user.saturating_duration_since(tx_user);
-                let kernel_rtt = rx
-                    .kernel
-                    .and_then(|k| k.duration_since(tx_wall).ok())
-                    .filter(|k| *k <= user_rtt + KERNEL_TS_SLACK);
-                match kernel_rtt {
-                    Some(rtt) => (ok_sample(rtt), TimingBackend::LinuxKernelTimestamp),
-                    None => (ok_sample(user_rtt), TimingBackend::LinuxMonotonic),
-                }
+                let (rtt, backend) = select_rtt(
+                    rx.kernel.map(|k| k.duration_since(tx_wall)),
+                    rx.wall.duration_since(tx_wall),
+                    rx.user.saturating_duration_since(tx_user),
+                );
+                (ok_sample(rtt), backend)
             }
-            _ => {
-                self.unregister(seq);
-                (Sample::Lost, self.preferred_backend())
-            }
+            _ => (Sample::Lost, self.preferred_backend()),
         }
     }
 
@@ -163,19 +188,31 @@ impl Engine {
         }
         None
     }
-
-    fn unregister(&self, seq: u16) {
-        self.shared
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&seq);
-    }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
         self.reader.abort();
+    }
+}
+
+/// Pick the RTT for one reply.
+///
+/// The kernel receive timestamp is measured against the wall-clock send time, so
+/// it is only trusted while the wall clock and the monotonic clock advanced
+/// alike between send and receive (no NTP step in between) and it is no later
+/// than the user-space receive time. Otherwise the monotonic RTT is used.
+fn select_rtt(
+    kernel_rtt: Option<Result<Duration, SystemTimeError>>,
+    wall_rtt: Result<Duration, SystemTimeError>,
+    user_rtt: Duration,
+) -> (Duration, TimingBackend) {
+    let clocks_agree = wall_rtt.is_ok_and(|w| w.abs_diff(user_rtt) <= KERNEL_TS_SLACK);
+    match kernel_rtt {
+        Some(Ok(k)) if clocks_agree && k <= user_rtt + KERNEL_TS_SLACK => {
+            (k, TimingBackend::LinuxKernelTimestamp)
+        }
+        _ => (user_rtt, TimingBackend::LinuxMonotonic),
     }
 }
 
@@ -189,7 +226,7 @@ async fn read_loop(shared: Arc<Shared>) {
         loop {
             match guard.try_io(|s| s.get_ref().recv(&mut buf)) {
                 Ok(Ok(received)) => {
-                    let user = Instant::now();
+                    let (wall, user) = (SystemTime::now(), Instant::now());
                     let Some(reply) = parse_echo_reply(v6, &buf[..received.len]) else {
                         continue;
                     };
@@ -204,6 +241,7 @@ async fn read_loop(shared: Arc<Shared>) {
                     if let Some(p) = matches.then(|| pending.remove(&reply.seq)).flatten() {
                         let _ = p.reply.send(Rx {
                             kernel: received.kernel_time,
+                            wall,
                             user,
                         });
                     }
@@ -213,5 +251,53 @@ async fn read_loop(shared: Arc<Shared>) {
                 Err(_would_block) => break,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    fn before(d: Duration) -> Result<Duration, SystemTimeError> {
+        // A SystemTimeError for "receive time is `d` before send time".
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        (t - d).duration_since(t)
+    }
+
+    #[test]
+    fn stable_clocks_use_the_kernel_timestamp() {
+        let (rtt, backend) = select_rtt(Some(Ok(10 * MS)), Ok(10 * MS + MS / 5), 10 * MS + MS / 5);
+        assert_eq!(
+            (rtt, backend),
+            (10 * MS, TimingBackend::LinuxKernelTimestamp)
+        );
+    }
+
+    #[test]
+    fn backward_clock_step_falls_back_to_monotonic() {
+        // 200 ms reply, wall clock stepped back 100 ms in between: the kernel
+        // value (100 ms) looks plausible on its own but must not be used.
+        let (rtt, backend) = select_rtt(Some(Ok(100 * MS)), Ok(100 * MS), 200 * MS);
+        assert_eq!((rtt, backend), (200 * MS, TimingBackend::LinuxMonotonic));
+    }
+
+    #[test]
+    fn forward_clock_step_falls_back_to_monotonic() {
+        let (rtt, backend) = select_rtt(Some(Ok(1100 * MS)), Ok(1100 * MS), 100 * MS);
+        assert_eq!((rtt, backend), (100 * MS, TimingBackend::LinuxMonotonic));
+    }
+
+    #[test]
+    fn receive_before_send_falls_back_to_monotonic() {
+        let (rtt, backend) = select_rtt(Some(before(5 * MS)), before(5 * MS), 3 * MS);
+        assert_eq!((rtt, backend), (3 * MS, TimingBackend::LinuxMonotonic));
+    }
+
+    #[test]
+    fn no_kernel_timestamp_uses_monotonic() {
+        let (rtt, backend) = select_rtt(None, Ok(7 * MS), 7 * MS);
+        assert_eq!((rtt, backend), (7 * MS, TimingBackend::LinuxMonotonic));
     }
 }

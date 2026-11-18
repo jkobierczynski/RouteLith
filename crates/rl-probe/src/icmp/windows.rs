@@ -56,7 +56,7 @@ impl Engine {
             Ok(Ok(EchoOutcome::Failed { status })) => {
                 Sample::Error(SampleError::Other(format!("IP status {status}")))
             }
-            Ok(Err(e)) => Sample::Error(SampleError::Other(e.to_string())),
+            Ok(Err(e)) => Sample::Error(SampleError::SendFailed(e.to_string())),
             Err(e) => Sample::Error(SampleError::Other(e.to_string())),
         };
         (sample, TimingBackend::WindowsIcmpApi)

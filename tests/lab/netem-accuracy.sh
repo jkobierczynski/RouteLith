@@ -63,6 +63,11 @@ echo "== baseline (no netem), 1000 samples"
 out=$(measure -c 1000 -i 5ms)
 echo "$out"
 base=$(median_ms <<<"$out")
+# Without a valid baseline the delay check would compare against nothing.
+if ! [[ $base =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "FAIL  baseline measurement produced no median (got '${base}')"
+    exit 1
+fi
 echo "timing backend: $(timing <<<"$out")"
 
 echo "== netem delay ${DELAY_MS}ms on B's egress, 1000 samples"

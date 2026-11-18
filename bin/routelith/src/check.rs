@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use clap::Args;
-use rl_core::{ResolvedTarget, RoundPlan, RoundResult, RoundStats, Sample};
+use rl_core::{ResolvedTarget, RoundPlan, RoundResult, RoundStats, Sample, SampleError};
 use rl_probe::{IcmpConfig, IcmpProbe, Probe};
 
 #[derive(Debug, Args)]
@@ -60,17 +60,28 @@ pub(crate) async fn icmp(args: IcmpArgs) -> ExitCode {
     match probe.run_round(&target, plan).await {
         Ok(round) => {
             print!("{}", render(&target, &round, args.quiet));
-            let stats = RoundStats::from_samples(&round.samples);
-            if stats.received == 0 {
-                ExitCode::from(1)
-            } else {
-                ExitCode::SUCCESS
-            }
+            exit_code(&round.samples)
         }
         Err(e) => {
             eprintln!("routelith check: {e}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// 0 if any reply arrived; 2 if nothing came back and at least one request
+/// failed locally (it never left this host); 1 for plain 100 % loss.
+fn exit_code(samples: &[Sample]) -> ExitCode {
+    let stats = RoundStats::from_samples(samples);
+    let local_failure = samples
+        .iter()
+        .any(|s| matches!(s, Sample::Error(SampleError::SendFailed(_))));
+    if stats.received > 0 {
+        ExitCode::SUCCESS
+    } else if local_failure {
+        ExitCode::from(2)
+    } else {
+        ExitCode::from(1)
     }
 }
 
@@ -181,6 +192,17 @@ mod tests {
         assert_eq!(parse_duration("2"), Ok(Duration::from_secs(2)));
         assert!(parse_duration("5m").is_err());
         assert!(parse_duration("-1s").is_err());
+    }
+
+    #[test]
+    fn exit_codes() {
+        let ok = Sample::Ok { rtt_us: 1 };
+        let local = Sample::Error(SampleError::SendFailed("ENETUNREACH".into()));
+        let remote = Sample::Error(SampleError::Unreachable { code: 1 });
+        assert_eq!(exit_code(&[ok.clone(), local.clone()]), ExitCode::SUCCESS);
+        assert_eq!(exit_code(&[Sample::Lost, local]), ExitCode::from(2));
+        assert_eq!(exit_code(&[Sample::Lost, remote]), ExitCode::from(1));
+        assert_eq!(exit_code(&[Sample::Lost]), ExitCode::from(1));
     }
 
     #[test]

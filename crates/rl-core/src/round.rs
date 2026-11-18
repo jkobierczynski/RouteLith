@@ -63,6 +63,9 @@ pub enum SampleError {
     Unreachable { code: u8 },
     #[error("TTL expired in transit")]
     TimeExceeded,
+    /// The request never left this host (socket error, resource limit).
+    #[error("send failed: {0}")]
+    SendFailed(String),
     #[error("{0}")]
     Other(String),
 }
