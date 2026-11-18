@@ -211,13 +211,15 @@ impl Writer {
         // Make the names durable before any WAL sync is acknowledged: the
         // entries in `dir`, then the entry of `dir` and of each ancestor in
         // its parent. Existing ancestors too, as an earlier start may have
-        // created them and stopped before syncing; only a directory created
-        // now must sync, as an ancestor above may not be readable.
+        // created them and stopped before syncing.
         layout::sync_dir(dir)?;
         let mut p = dir.to_path_buf();
         loop {
             if let Err(e) = layout::sync_dir(&layout::parent_or_dot(&p)) {
-                if created.contains(&p) {
+                // Only a parent this process may not open (a system
+                // directory above the data) is passed over; any other
+                // failure, a retry's included, stops the open.
+                if created.contains(&p) || e.kind() != std::io::ErrorKind::PermissionDenied {
                     return Err(e.into());
                 }
             }
