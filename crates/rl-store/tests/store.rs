@@ -478,3 +478,73 @@ fn a_bad_checksum_in_an_open_segment_is_an_error_for_readers() {
             .is_err()
     );
 }
+
+#[test]
+fn writer_refuses_a_segment_belonging_to_another_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = WriterOptions {
+        block_rounds: 4,
+        ..WriterOptions::default()
+    };
+    let (mut w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+    let ids = w.register(&keys(2)).unwrap();
+    let mut rng = Rng(7);
+    for i in 0..8 {
+        w.append(ids[0], lab_round(&mut rng, T0 + i * STEP_MS, 10_000))
+            .unwrap();
+    }
+    w.append(ids[1], lab_round(&mut rng, T0, 10_000)).unwrap();
+    w.close().unwrap();
+    // Series 0's open day, newer than anything of series 1, put in its place.
+    let name = "2026-11-18.open";
+    let to = layout::raw_dir(dir.path(), ids[1]).join(name);
+    std::fs::copy(layout::raw_dir(dir.path(), ids[0]).join(name), &to).unwrap();
+    match Writer::open(dir.path(), opts, T0) {
+        Err(rl_store::StoreError::Corrupt { path, .. }) => assert_eq!(path, to),
+        other => panic!("expected Corrupt, got {:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
+fn a_corrupt_wal_is_quarantined_and_reads_continue() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = WriterOptions {
+        block_rounds: 4,
+        ..WriterOptions::default()
+    };
+    let (mut w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+    let id = w.register(&keys(1)).unwrap()[0];
+    let mut rng = Rng(8);
+    for i in 0..6 {
+        w.append(id, lab_round(&mut rng, T0 + i * STEP_MS, 5_000))
+            .unwrap();
+    }
+    w.sync().unwrap();
+    drop(w);
+    let wal_dir = dir.path().join("wal");
+    let wals: Vec<_> = std::fs::read_dir(&wal_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(wals.len(), 1);
+    flip_byte_near_end(&wals[0]);
+
+    let (w, rec) = Writer::open(dir.path(), opts, T0).unwrap();
+    assert_eq!(rec.torn_wal, 1);
+    assert!(
+        rec.problems.iter().any(|p| p.contains("quarantine")),
+        "{:?}",
+        rec.problems
+    );
+    let name = wals[0].file_name().unwrap();
+    assert!(dir.path().join("quarantine").join(name).exists());
+    assert!(!wal_dir.join(name).exists());
+    w.close().unwrap();
+    // The live WAL set is clean again, so reads are not blocked; the four
+    // rounds already in a block and the readable WAL rounds are there.
+    let rounds = Reader::open(dir.path())
+        .unwrap()
+        .read(id, 0, i64::MAX)
+        .unwrap();
+    assert!((4..6).contains(&rounds.len()), "{}", rounds.len());
+}
