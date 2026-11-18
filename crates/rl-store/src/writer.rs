@@ -321,7 +321,7 @@ impl Writer {
         }
 
         let seqs = layout::list_wal(dir)?;
-        let next_seq = seqs.last().map_or(1, |s| s + 1);
+        let next_seq = next_wal_seq(dir, seqs.last().copied())?;
         let wal = WalWriter::create(layout::wal_path(dir, next_seq), next_seq)?;
         layout::sync_dir(&layout::wal_dir(dir))?;
         let mut w = Self {
@@ -568,7 +568,7 @@ impl Writer {
             self.dirty_dirs.remove(&dir);
         }
         // The new WAL is used only once its name is durable.
-        let next = self.wal.seq() + 1;
+        let next = next_wal_seq(&self.dir, Some(self.wal.seq()))?;
         let path = layout::wal_path(&self.dir, next);
         let wal = WalWriter::create(path.clone(), next)?;
         if let Err(e) = layout::sync_dir(&layout::wal_dir(&self.dir)) {
@@ -622,6 +622,18 @@ impl Writer {
     }
 }
 
+/// Sequence number for a new WAL file after `last`. An exhausted sequence
+/// is an error that leaves every WAL file as it is.
+fn next_wal_seq(dir: &Path, last: Option<u64>) -> Result<u64, StoreError> {
+    match last {
+        None => Ok(1),
+        Some(s) => s.checked_add(1).ok_or_else(|| StoreError::Corrupt {
+            path: layout::wal_path(dir, s),
+            reason: "WAL sequence numbers are exhausted; nothing was changed".into(),
+        }),
+    }
+}
+
 /// fsync an open segment and rename it to `.seg`.
 fn seal_file(dir: &Path, id: u64, day: i64) -> Result<(), StoreError> {
     let open = layout::segment_path(dir, id, day, false);
@@ -630,4 +642,19 @@ fn seal_file(dir: &Path, id: u64, day: i64) -> Result<(), StoreError> {
     std::fs::rename(&open, &sealed)?;
     layout::sync_dir(&layout::raw_dir(dir, id))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_exhausted_wal_sequence_is_an_error() {
+        assert_eq!(next_wal_seq(Path::new("d"), None).unwrap(), 1);
+        assert_eq!(next_wal_seq(Path::new("d"), Some(7)).unwrap(), 8);
+        assert!(matches!(
+            next_wal_seq(Path::new("d"), Some(u64::MAX)),
+            Err(StoreError::Corrupt { .. })
+        ));
+    }
 }
