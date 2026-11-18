@@ -125,4 +125,17 @@ mod tests {
         assert_eq!(Reader::new(&[0xff; 11]).u64(), None);
         assert_eq!(Reader::new(&[0x80]).u64(), None);
     }
+
+    #[test]
+    fn tenth_byte_rules() {
+        let mut max = [0xffu8; 10];
+        max[9] = 0x01;
+        assert_eq!(Reader::new(&max).u64(), Some(u64::MAX));
+        // More than the top bit in the tenth byte.
+        max[9] = 0x02;
+        assert_eq!(Reader::new(&max).u64(), None);
+        // A continuation bit on the tenth byte.
+        max[9] = 0x81;
+        assert_eq!(Reader::new(&max).u64(), None);
+    }
 }
