@@ -523,9 +523,11 @@ fn a_corrupt_wal_is_quarantined_and_reads_continue() {
     let (mut w, _) = Writer::open(dir.path(), opts, T0).unwrap();
     let id = w.register(&keys(1)).unwrap()[0];
     let mut rng = Rng(8);
-    for i in 0..6 {
-        w.append(id, lab_round(&mut rng, T0 + i * STEP_MS, 5_000))
-            .unwrap();
+    let written: Vec<StoredRound> = (0..6)
+        .map(|i| lab_round(&mut rng, T0 + i * STEP_MS, 5_000))
+        .collect();
+    for r in &written {
+        w.append(id, r.clone()).unwrap();
     }
     w.sync().unwrap();
     drop(w);
@@ -548,13 +550,14 @@ fn a_corrupt_wal_is_quarantined_and_reads_continue() {
     assert!(dir.path().join("quarantine").join(name).exists());
     assert!(!wal_dir.join(name).exists());
     w.close().unwrap();
-    // The live WAL set is clean again, so reads are not blocked; the four
-    // rounds already in a block and the readable WAL rounds are there.
+    // The live WAL set is clean again, so reads are not blocked: the four
+    // rounds already in a block and the fifth, readable in the WAL before
+    // the damaged sixth, are all there.
     let rounds = Reader::open(dir.path())
         .unwrap()
         .read(id, 0, i64::MAX)
         .unwrap();
-    assert!((4..6).contains(&rounds.len()), "{}", rounds.len());
+    assert_eq!(rounds, written[..5]);
 }
 
 #[test]

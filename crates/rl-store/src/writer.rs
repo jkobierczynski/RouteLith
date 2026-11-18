@@ -306,7 +306,9 @@ impl Writer {
                 s.last_ts = s.last_ts.max(scan.last_ts());
                 if let Some(r) = last_round.filter(|r| Some(r.ts_ms) == s.last_ts) {
                     s.resolved = r.resolved.or(s.resolved);
-                    s.timing = r.timing.or(s.timing);
+                    // The last round's own timing, unknown included: an
+                    // unknown backend must not be replaced by an older one.
+                    s.timing = r.timing;
                 }
                 // The names of this file and its directories may be only in
                 // the page cache after a kill (a seal renamed just before
