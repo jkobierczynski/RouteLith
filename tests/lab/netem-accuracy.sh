@@ -7,11 +7,12 @@
 #   - delay: median within ±0.1 ms of (baseline + 10 ms) over 1,000 samples
 #   - loss:  5 % ± 1.5 points over 2,000 samples
 #
-# If iputils ping is installed, the delay step also measures with ping and
-# checks that Routelith's median is no worse than ping's (+ the tolerance).
+# If iputils ping is installed, the delay step also runs ping concurrently
+# with Routelith and checks that Routelith's median is no later than ping's
+# (+ the tolerance).
 #
 # On a busy or virtualised host netem itself releases packets late. When
-# ping is off by as much as Routelith, the absolute delay check only warns.
+# ping reads late too, the absolute delay check only warns.
 # DELAY_TOL_MS loosens both delay checks; CI keeps the strict 0.1 ms.
 #
 # Usage: sudo [DELAY_TOL_MS=1] tests/lab/netem-accuracy.sh path/to/routelith
@@ -32,6 +33,8 @@ if ! [[ $DELAY_TOL_MS =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
 fi
 
 cleanup() {
+    if [[ -n ${ping_pid:-} ]]; then kill "$ping_pid" 2>/dev/null || true; fi
+    if [[ -n ${ping_out:-} ]]; then rm -f "$ping_out"; fi
     ip netns del "$A" 2>/dev/null || true
     ip netns del "$B" 2>/dev/null || true
 }
@@ -88,6 +91,15 @@ echo "timing backend: $(timing <<<"$out")"
 
 echo "== netem delay ${DELAY_MS}ms on B's egress, 1000 samples"
 ip netns exec "$B" tc qdisc add dev veth-b root netem delay "${DELAY_MS}ms"
+# Reference: iputils ping, if installed, runs at the same time as Routelith so
+# both see the same netem behaviour (on a busy host it varies between runs).
+ping_out=
+ping_pid=
+if command -v ping >/dev/null; then
+    ping_out=$(mktemp)
+    ip netns exec "$A" ping -n -c 1000 -i 0.005 -W 1 "$ADDR_B" >"$ping_out" 2>&1 &
+    ping_pid=$!
+fi
 out=$(measure -c 1000 -i 5ms)
 echo "$out"
 delayed=$(median_ms <<<"$out")
@@ -97,16 +109,18 @@ if ! [[ $delayed =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
 fi
 expected=$(awk -v b="$base" -v d="$DELAY_MS" 'BEGIN { printf "%.3f", b + d }')
 
-# Reference: the same round with iputils ping, if it is installed.
 ref=
-if command -v ping >/dev/null; then
-    echo "== reference: iputils ping, same settings"
-    ref=$({ ip netns exec "$A" ping -n -c 1000 -i 0.005 -W 1 "$ADDR_B" || true; } |
-        sed -n 's/.*time=\([0-9.]*\).*/\1/p' | sort -n |
+if [[ -n $ping_pid ]]; then
+    wait "$ping_pid" || true
+    ping_pid=
+    echo "== reference: iputils ping, run concurrently with the same settings"
+    ref=$(sed -n 's/.*time=\([0-9.]*\).*/\1/p' "$ping_out" | sort -n |
         awk '{ v[NR] = $1 } END {
             if (NR % 2) print v[(NR + 1) / 2]
             else if (NR) printf "%.3f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2
         }')
+    rm -f "$ping_out"
+    ping_out=
     [[ $ref =~ ^[0-9]+(\.[0-9]+)?$ ]] || ref=
 fi
 late() { awk -v m="$1" -v e="$expected" -v t="$DELAY_TOL_MS" 'BEGIN { exit !(m > e + t) }'; }
