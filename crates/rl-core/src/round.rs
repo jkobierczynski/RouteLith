@@ -35,7 +35,12 @@ impl RoundPlan {
         }
         // Wide intermediate: spread × index can exceed Duration's range.
         let nanos = self.spread.as_nanos() * u128::from(index) / u128::from(self.count);
-        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+        let secs = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
+        let sub = (nanos % 1_000_000_000) as u32;
+        if secs == u64::MAX {
+            return Duration::MAX;
+        }
+        Duration::new(secs, sub)
     }
 }
 
@@ -94,6 +99,17 @@ pub struct RoundResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offsets_beyond_u64_nanoseconds_stay_exact() {
+        let plan = RoundPlan {
+            count: 2,
+            spread: Duration::from_secs(40_000_000_000),
+            timeout: Duration::from_secs(1),
+            round_start: std::time::UNIX_EPOCH,
+        };
+        assert_eq!(plan.sample_offset(1), Duration::from_secs(20_000_000_000));
+    }
 
     #[test]
     fn samples_are_evenly_spread_from_zero() {

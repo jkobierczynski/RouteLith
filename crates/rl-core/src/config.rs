@@ -1,8 +1,9 @@
 //! TOML configuration (architecture doc §13.1), M0 subset.
 //!
 //! Settings cascade `[defaults]` → `[[group]]` → `[[group.target]]`. Every
-//! problem is reported with its line and column, and all of them are
-//! reported at once rather than stopping at the first.
+//! problem is reported with its line and column. Value problems are all
+//! reported at once; a syntax or schema error (bad TOML, an unknown key, a
+//! value of the wrong type) stops parsing before the values are checked.
 //!
 //! ```toml
 //! [server]
@@ -441,6 +442,12 @@ impl Validator<'_> {
         if data_dir.is_empty() {
             self.error(&raw.data_dir.span(), "data_dir must not be empty");
             ok = false;
+        } else if data_dir.contains('\0') {
+            self.error(
+                &raw.data_dir.span(),
+                "data_dir must not contain a NUL character",
+            );
+            ok = false;
         }
         let vantage = match &raw.vantage {
             Some(v) if !valid_name(v.get_ref()) => {
@@ -500,6 +507,8 @@ impl Validator<'_> {
                 format!("unknown probe {p:?}; M0 measures \"icmp\" only")
             };
             self.error(&probe.span(), msg);
+            // Still check the target's own schedule values.
+            self.check_layer(s);
             return None;
         }
         for (key, value) in [
@@ -552,20 +561,32 @@ impl Validator<'_> {
             (None, None) => None,
         };
 
-        let overrun = match (step, spread, timeout) {
-            (Some(step), Some(spread), Some(timeout)) if spread + timeout > step => {
-                Some((step, spread, timeout))
+        // The last sample is sent at spread × (pings − 1) / pings and must
+        // get its full timeout before the next slot.
+        let overrun = match (step, spread, timeout, pings) {
+            (Some(step), Some(spread), Some(timeout), Some(pings)) => {
+                let last = crate::round::RoundPlan {
+                    count: pings,
+                    spread,
+                    timeout,
+                    round_start: std::time::UNIX_EPOCH,
+                }
+                .sample_offset(pings.saturating_sub(1));
+                last.checked_add(timeout)
+                    .is_none_or(|end| end > step)
+                    .then_some((step, last, timeout))
             }
             _ => None,
         };
-        if let Some((step, spread, timeout)) = overrun {
+        if let Some((step, last, timeout)) = overrun {
             let at = s.spread.as_ref().map_or(raw.name.span(), Spanned::span);
             self.error(
                 &at,
                 format!(
-                    "target {name:?}: spread ({}) plus timeout ({}) exceeds step ({}), so every \
-                     round would overrun; set a shorter spread or a longer step",
-                    duration::format(spread),
+                    "target {name:?}: the last ping is sent {} into the round and its timeout ({}) \
+                     ends after the next round starts (step {}); set a shorter spread or timeout \
+                     or a longer step",
+                    duration::format(last),
                     duration::format(timeout),
                     duration::format(step)
                 ),
@@ -706,7 +727,8 @@ impl Validator<'_> {
             }
         };
         match (lit_family, host) {
-            (Some(lf), Some(host)) if family != lf => {
+            // prefer-v6 simply uses the literal's family.
+            (Some(lf), Some(host)) if family != lf && family != Family::PreferV6 => {
                 self.error(
                     &host.span(),
                     format!(
@@ -931,7 +953,65 @@ name = "G"
 "#;
         let e = errors(src);
         assert_eq!(e.len(), 1, "{e:?}");
-        assert!(e[0].contains("exceeds step (1m)"), "{e:?}");
+        assert!(
+            e[0].contains("ends after the next round starts (step 1m)"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_ping_only_needs_its_timeout_before_the_next_slot() {
+        // Default spread is 1 s, but the only ping goes out at offset 0.
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+[[group]]
+name = "G"
+  [[group.target]]
+  name = "a"
+  host = "h"
+  step = "2s"
+  pings = 1
+  timeout = "1.5s"
+"#;
+        assert!(errors(src).is_empty(), "{:?}", errors(src));
+    }
+
+    #[test]
+    fn prefer_v6_accepts_ip_literals() {
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+[[group]]
+name = "G"
+family = "prefer-v6"
+  [[group.target]]
+  name = "a"
+  host = "127.0.0.1"
+  [[group.target]]
+  name = "b"
+  host = "::1"
+"#;
+        assert!(errors(src).is_empty(), "{:?}", errors(src));
+    }
+
+    #[test]
+    fn nul_in_data_dir_is_rejected() {
+        let e = errors("[server]\ndata_dir = \"/tmp/rl\\u0000x\"\n");
+        assert!(e.iter().any(|m| m.contains("NUL")), "{e:?}");
+    }
+
+    #[test]
+    fn unsupported_probe_still_checks_its_settings() {
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+[[group]]
+name = "G"
+  [[group.target]]
+  name = "a"
+  probe = "http"
+  pings = 0
+"#;
+        let e = errors(src);
+        assert_eq!(e.len(), 2, "{e:?}");
     }
 
     #[test]

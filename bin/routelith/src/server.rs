@@ -29,13 +29,14 @@ pub(crate) struct ServerArgs {
     /// Path to the TOML configuration file.
     #[arg(short, long)]
     config: PathBuf,
-    /// Seconds between stats lines on stderr (0: only at exit).
-    #[arg(long, default_value_t = 60)]
+    /// Seconds between stats lines on stderr (0: only at exit; at most a day).
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(0..=86_400))]
     stats_interval: u64,
 }
 
 /// Exit codes: 0 after a clean shutdown, 1 invalid configuration,
-/// 2 cannot start (unreadable file, store, privileges).
+/// 2 cannot start (unreadable file, store, privileges), or the store failed
+/// or rejected rounds while running.
 pub(crate) async fn run(args: ServerArgs) -> ExitCode {
     let cfg = match load(&args.config) {
         Ok(cfg) => cfg,
@@ -47,21 +48,36 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
         return ExitCode::from(1);
     }
     // A v4 or v6 series needs its family; prefer-v6 can use either.
+    let prefer = plans.iter().any(|p| p.family == Family::PreferV6);
+    let mut usable = [true; 2];
     for v6 in [false, true] {
         let own = if v6 { Family::V6 } else { Family::V4 };
         let required = plans.iter().any(|p| p.family == own);
-        let optional = plans.iter().any(|p| p.family == Family::PreferV6);
-        if !required && !optional {
+        if !required && !prefer {
             continue;
         }
         if let Err(e) = rl_probe::check_permission(v6) {
+            usable[usize::from(v6)] = false;
             let msg = format!("cannot send ICMPv{}: {e}", if v6 { 6 } else { 4 });
             if required {
                 eprintln!("routelith server: {msg}");
                 return ExitCode::from(2);
             }
-            eprintln!("routelith server: warning: {msg}");
+            eprintln!(
+                "routelith server: warning: {msg}; prefer-v6 targets {}",
+                if v6 {
+                    "will use IPv4"
+                } else {
+                    "need an IPv6 address"
+                }
+            );
         }
+    }
+    if prefer && usable == [false, false] {
+        eprintln!(
+            "routelith server: prefer-v6 targets cannot be measured: neither ICMPv4 nor ICMPv6 is permitted"
+        );
+        return ExitCode::from(2);
     }
 
     let (mut writer, recovery) =
@@ -104,6 +120,16 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
         }
     };
 
+    // Install the signal handlers before any work starts, so a SIGTERM
+    // right after start-up still shuts down cleanly.
+    let signal = match shutdown_signal() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("routelith server: cannot listen for shutdown signals: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     let (tx, rx) = mpsc::sync_channel::<Completed>(QUEUE);
     // Tells the main loop when the store thread ends early (after an error).
     let (store_done_tx, mut store_done) = tokio::sync::oneshot::channel::<()>();
@@ -132,6 +158,7 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
             })
             .clone();
         let job = Job {
+            v6_usable: usable[1],
             series,
             vantage: cfg.server.vantage.clone(),
             target: plan.target,
@@ -164,7 +191,6 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
     });
     ticker.tick().await;
     let started = Instant::now();
-    let signal = shutdown_signal();
     tokio::pin!(signal);
     loop {
         tokio::select! {
@@ -185,7 +211,11 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
     let _ = stop_tx.send(true);
     while jobs.join_next().await.is_some() {}
     let ok = match store.join() {
-        Ok(Ok(())) => true,
+        Ok(Ok(0)) => true,
+        Ok(Ok(n)) => {
+            eprintln!("routelith server: store: {n} invalid round(s) were rejected and not stored");
+            false
+        }
         Ok(Err(e)) => {
             eprintln!("routelith server: store: {e}");
             false
@@ -208,9 +238,14 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
 }
 
 fn load(path: &Path) -> Result<Config, ExitCode> {
-    let src = std::fs::read_to_string(path).map_err(|e| {
+    let bytes = std::fs::read(path).map_err(|e| {
         eprintln!("routelith server: {}: {e}", path.display());
         ExitCode::from(2)
+    })?;
+    // Readable but not UTF-8: an invalid configuration, like `ctl verify` says.
+    let src = String::from_utf8(bytes).map_err(|e| {
+        eprintln!("routelith server: {}: not valid UTF-8: {e}", path.display());
+        ExitCode::from(1)
     })?;
     let parsed = config::parse(&src);
     for d in &parsed.diagnostics {
@@ -271,7 +306,7 @@ fn to_ms(t: SystemTime) -> i64 {
 
 /// The stored form of a finished round. A round that could not run counts
 /// every sample as an error of its cause.
-fn stored(c: &Completed) -> StoredRound {
+fn stored(c: &Completed) -> Result<StoredRound, rl_store::StoreError> {
     let flags = if c.flags & rl_sched::FLAG_CLOCK_STEP != 0 {
         rl_store::FLAG_CLOCK_STEP
     } else {
@@ -287,7 +322,7 @@ fn stored(c: &Completed) -> StoredRound {
                 FailCause::Resolve => errors.other = *sent,
                 FailCause::Probe => errors.send_failed = *sent,
             }
-            StoredRound {
+            Ok(StoredRound {
                 ts_ms: to_ms(*start),
                 sent: *sent,
                 rtts_us: Vec::new(),
@@ -295,7 +330,7 @@ fn stored(c: &Completed) -> StoredRound {
                 resolved: None,
                 timing: None,
                 flags,
-            }
+            })
         }
     }
 }
@@ -305,32 +340,36 @@ fn stored(c: &Completed) -> StoredRound {
 ///
 /// The writer is fail-stop, so any error other than a single invalid round
 /// ends the loop; the server then shuts down and a restart runs recovery.
-fn store_loop(mut w: Writer, rx: &mpsc::Receiver<Completed>) -> Result<(), rl_store::StoreError> {
-    let mut late = 0u64;
-    let result = store_rounds(&mut w, rx, &mut late);
+/// Returns how many rounds were rejected as invalid (and so not stored).
+fn store_loop(mut w: Writer, rx: &mpsc::Receiver<Completed>) -> Result<u64, rl_store::StoreError> {
+    let (mut late, mut rejected) = (0u64, 0u64);
+    let result = store_rounds(&mut w, rx, &mut late, &mut rejected);
     if late > 0 {
         eprintln!(
             "routelith server: store: {late} round(s) were not newer than the last one and were dropped"
         );
     }
     result?;
-    w.close()
+    w.close()?;
+    Ok(rejected)
 }
 
 fn store_rounds(
     w: &mut Writer,
     rx: &mpsc::Receiver<Completed>,
     late: &mut u64,
+    rejected: &mut u64,
 ) -> Result<(), rl_store::StoreError> {
     let mut next_sync = Instant::now() + SYNC_EVERY;
     let mut last_invalid: Option<String> = None;
     loop {
         let wait = next_sync.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
-            Ok(c) => match w.append(c.series, stored(&c)) {
+            Ok(c) => match stored(&c).and_then(|r| w.append(c.series, r)) {
                 Ok(Appended::Stored) => {}
                 Ok(Appended::Late) => *late += 1,
                 Err(rl_store::StoreError::InvalidRound(msg)) => {
+                    *rejected += 1;
                     if last_invalid.as_deref() != Some(msg) {
                         eprintln!(
                             "routelith server: store: series {}: invalid round: {msg}",
@@ -369,25 +408,31 @@ fn stats_line(s: &Snapshot, window: &str) -> String {
 }
 
 /// Ctrl-C everywhere, SIGTERM on Unix.
-async fn shutdown_signal() {
+/// Install the Ctrl-C and SIGTERM handlers now; the returned future
+/// completes on the first signal.
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
+        let mut term = signal(SignalKind::terminate())?;
+        let mut int = signal(SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! {
+                _ = int.recv() => {}
+                _ = term.recv() => {}
             }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
+        })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        let mut c = tokio::signal::windows::ctrl_c()?;
+        let mut brk = tokio::signal::windows::ctrl_break()?;
+        Ok(async move {
+            tokio::select! {
+                _ = c.recv() => {}
+                _ = brk.recv() => {}
+            }
+        })
     }
 }
 
@@ -427,7 +472,7 @@ mod tests {
             },
             flags: rl_sched::FLAG_CLOCK_STEP,
         };
-        let r = stored(&c);
+        let r = stored(&c).unwrap();
         assert_eq!((r.ts_ms, r.sent, r.loss()), (60_000, 20, 20));
         assert_eq!(r.errors.other, 20);
         assert_eq!(r.flags, rl_store::FLAG_CLOCK_STEP);
@@ -453,7 +498,7 @@ mod tests {
         tx.send(failed(284_000_000_000)).unwrap();
         tx.send(failed(1_800_000_000)).unwrap();
         drop(tx);
-        store_loop(w, &rx).unwrap();
+        assert_eq!(store_loop(w, &rx).unwrap(), 1);
         let rounds = rl_store::Reader::open(dir.path())
             .unwrap()
             .read(id, 0, i64::MAX)

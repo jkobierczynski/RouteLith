@@ -35,6 +35,9 @@ pub(crate) struct CalibrateArgs {
     max_p99_ns: i64,
 }
 
+const MAX_INTERVAL: Duration = Duration::from_secs(3600);
+const MAX_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// A non-negative decimal number of milliseconds, as whole nanoseconds.
 /// Digits past the sixth decimal are dropped, so the limit never rounds up
 /// past what was asked for.
@@ -63,6 +66,16 @@ fn parse_limit_ms(s: &str) -> Result<i64, String> {
 pub(crate) fn run(args: &CalibrateArgs) -> ExitCode {
     if args.timeout.is_zero() {
         eprintln!("routelith ctl calibrate: the timeout must be greater than zero");
+        return ExitCode::from(2);
+    }
+    // The runner adds the interval to an Instant after every pair; keep the
+    // whole schedule well inside what an Instant can hold.
+    if args.interval > MAX_INTERVAL || args.timeout > MAX_TIMEOUT {
+        eprintln!(
+            "routelith ctl calibrate: interval must be at most {} and timeout at most {}",
+            rl_core::duration::format(MAX_INTERVAL),
+            rl_core::duration::format(MAX_TIMEOUT)
+        );
         return ExitCode::from(2);
     }
     #[cfg(windows)]

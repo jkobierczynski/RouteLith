@@ -123,6 +123,16 @@ impl Series {
     }
 }
 
+fn damaged_sealed(path: &Path, reason: impl std::fmt::Display) -> StoreError {
+    StoreError::Corrupt {
+        path: path.to_path_buf(),
+        reason: format!(
+            "sealed segment is damaged ({reason}); the WAL may still hold its later rounds, \
+             so nothing was changed. Move the file aside to start without it"
+        ),
+    }
+}
+
 /// Blocks are written early once they hold this many RTT samples, which
 /// keeps a block's uncompressed payload far below the reader's limit.
 const BLOCK_MAX_SAMPLES: usize = 1 << 20;
@@ -197,9 +207,6 @@ impl Writer {
         let mut series: BTreeMap<u64, Series> = BTreeMap::new();
         let mut dirty = BTreeSet::new();
         let mut dirty_dirs = BTreeSet::new();
-        // A sealed segment that is damaged: keep every WAL file, since it
-        // may hold the only copy of rounds after the damage.
-        let mut keep_all_wal = false;
 
         for id in layout::list_series_dirs(dir)? {
             let s = series.entry(id).or_default();
@@ -213,9 +220,12 @@ impl Writer {
                         std::fs::remove_file(&seg.path)?;
                         continue;
                     }
+                    // A damaged sealed day must not be treated as complete
+                    // (that would drop its WAL copies as late): stop, and
+                    // leave every file as it is for the operator.
+                    Err(e) if seg.sealed => return Err(damaged_sealed(&seg.path, e)),
                     Err(e) => {
                         rec.problems.push(format!("{}: {e}", seg.path.display()));
-                        keep_all_wal |= seg.sealed;
                         continue;
                     }
                 };
@@ -240,13 +250,10 @@ impl Writer {
                 }
                 if scan.tail != Tail::Clean {
                     if seg.sealed {
-                        rec.problems.push(format!(
-                            "{}: sealed segment has a bad block after offset {}; \
-                             WAL files are kept",
-                            seg.path.display(),
-                            scan.valid_len
+                        return Err(damaged_sealed(
+                            &seg.path,
+                            format!("bad block after offset {}", scan.valid_len),
                         ));
-                        keep_all_wal = true;
                     } else {
                         segment::truncate(&seg.path, scan.valid_len)?;
                         rec.truncated_segments += 1;
@@ -303,9 +310,6 @@ impl Writer {
             let path = layout::wal_path(dir, seq);
             let bytes = std::fs::read(&path)?;
             rec.wal_files += 1;
-            if keep_all_wal {
-                w.keep_wal.insert(seq);
-            }
             let (records, tail) = match wal::read(&bytes) {
                 Ok(r) => r,
                 // Header never fully written: the file holds no rounds.

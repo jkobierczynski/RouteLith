@@ -102,28 +102,22 @@ impl Reader {
             if seg.day < first_day || seg.day > last_day {
                 continue;
             }
-            let bytes = match std::fs::read(&seg.path) {
-                Ok(b) => b,
-                // Sealed between listing and reading: read the new name.
-                Err(e) if e.kind() == io::ErrorKind::NotFound && !seg.sealed => {
-                    let sealed = layout::segment_path(&self.dir, series, seg.day, true);
-                    std::fs::read(sealed)?
-                }
-                Err(e) => return Err(e.into()),
-            };
+            let (bytes, sealed) = self.read_segment(series, &seg)?;
             let corrupt = |reason: &str| StoreError::Corrupt {
                 path: seg.path.clone(),
                 reason: reason.to_string(),
             };
             // An open segment just created, its header not written yet.
-            if !seg.sealed && bytes.len() < segment::HEADER_LEN {
+            if !sealed && bytes.len() < segment::HEADER_LEN {
                 continue;
             }
             let scan = segment::scan(&bytes).map_err(corrupt)?;
             if scan.series != series || scan.day != seg.day {
                 return Err(corrupt("header names another series or day"));
             }
-            if seg.sealed && scan.tail != Tail::Clean {
+            // An open segment may end in a half-written block; a complete
+            // block with a bad checksum is damage in either kind of file.
+            if scan.tail == Tail::Corrupt || (sealed && scan.tail != Tail::Clean) {
                 return Err(corrupt("bad block"));
             }
             for r in segment::read_range(&bytes, &scan, from_ms, to_ms).map_err(corrupt)? {
@@ -146,7 +140,7 @@ impl Reader {
             for seg in layout::list_segments(&self.dir, id)? {
                 rep.segments += 1;
                 let path = seg.path.display();
-                let bytes = std::fs::read(&seg.path)?;
+                let (bytes, sealed) = self.read_segment(id, &seg)?;
                 let scan = match segment::scan(&bytes) {
                     Ok(s) => s,
                     Err(e) => {
@@ -160,7 +154,7 @@ impl Reader {
                         scan.series, scan.day
                     ));
                 }
-                match (scan.tail, seg.sealed) {
+                match (scan.tail, sealed) {
                     (Tail::Clean, _) => {}
                     (Tail::Torn, false) => rep.torn_open += 1,
                     _ => rep
@@ -198,12 +192,35 @@ impl Reader {
         Ok(rep)
     }
 
+    /// A listed segment's bytes, following a seal that renamed it after it
+    /// was listed. Returns whether the file read is sealed.
+    fn read_segment(
+        &self,
+        series: u64,
+        seg: &layout::SegmentFile,
+    ) -> Result<(Vec<u8>, bool), StoreError> {
+        match std::fs::read(&seg.path) {
+            Ok(b) => Ok((b, seg.sealed)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !seg.sealed => {
+                let path = layout::segment_path(&self.dir, series, seg.day, true);
+                Ok((std::fs::read(path)?, true))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Total bytes of segment files (apparent size, not disk blocks).
     pub fn segment_bytes(&self) -> Result<u64, StoreError> {
         let mut total = 0;
         for id in layout::list_series_dirs(&self.dir)? {
             for seg in layout::list_segments(&self.dir, id)? {
-                total += std::fs::metadata(&seg.path)?.len();
+                total += match std::fs::metadata(&seg.path) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound && !seg.sealed => {
+                        std::fs::metadata(layout::segment_path(&self.dir, id, seg.day, true))?
+                    }
+                    m => m?,
+                }
+                .len();
             }
         }
         Ok(total)

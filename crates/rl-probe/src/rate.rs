@@ -27,16 +27,25 @@ impl RateLimiter {
     }
 
     /// Wait until one more packet may be sent.
+    ///
+    /// Capacity is taken only when the caller may go ahead, checked again
+    /// after every wait: a task that wakes late (a stalled worker) cannot
+    /// use a permit computed for an earlier time.
     pub async fn acquire(&self) {
-        let wait = {
-            let now = Instant::now();
-            let mut tat = self.tat.lock().unwrap_or_else(PoisonError::into_inner);
-            let t = tat.map_or(now, |t| t.max(now));
-            *tat = Some(t + self.interval);
-            // Permits up to `burst` ahead of the even pace go out at once.
-            (t.saturating_duration_since(now)).checked_sub(self.burst)
-        };
-        if let Some(wait) = wait.filter(|w| !w.is_zero()) {
+        loop {
+            let wait = {
+                let now = Instant::now();
+                let mut tat = self.tat.lock().unwrap_or_else(PoisonError::into_inner);
+                let next = tat.map_or(now, |t| t.max(now)) + self.interval;
+                // This permit included, at most `burst` ahead of the even pace.
+                match next.checked_duration_since(now + self.burst) {
+                    None | Some(Duration::ZERO) => {
+                        *tat = Some(next);
+                        return;
+                    }
+                    Some(wait) => wait,
+                }
+            };
             tokio::time::sleep(wait).await;
         }
     }
@@ -50,19 +59,55 @@ mod tests {
     async fn bursts_one_second_then_paces() {
         let rl = RateLimiter::new(10);
         let start = Instant::now();
-        // 1 s of burst (10 permits) plus the one at t=0 go out immediately.
-        for _ in 0..11 {
-            rl.acquire().await;
-        }
-        assert_eq!(start.elapsed(), Duration::ZERO);
-        // The next 10 take one more second.
+        // Exactly one second's worth (10 permits) goes out at once.
         for _ in 0..10 {
             rl.acquire().await;
         }
-        let e = start.elapsed();
-        assert!(
-            e >= Duration::from_millis(990) && e <= Duration::from_millis(1010),
-            "{e:?}"
-        );
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        rl.acquire().await;
+        assert_eq!(start.elapsed(), Duration::from_millis(100));
+        // The next 9 take until t = 1 s.
+        for _ in 0..9 {
+            rl.acquire().await;
+        }
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_pps_allows_one_immediate_permit() {
+        let rl = RateLimiter::new(1);
+        let start = Instant::now();
+        rl.acquire().await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        rl.acquire().await;
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiters_woken_together_still_respect_the_rate() {
+        let rl = std::sync::Arc::new(RateLimiter::new(10));
+        for _ in 0..10 {
+            rl.acquire().await;
+        }
+        // 20 waiters; then the runtime "stalls" past all their deadlines.
+        let start = Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let rl = rl.clone();
+            tasks.spawn(async move {
+                rl.acquire().await;
+                Instant::now()
+            });
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let mut times = Vec::new();
+        while let Some(t) = tasks.join_next().await {
+            times.push(t.unwrap().duration_since(start));
+        }
+        times.sort();
+        // At most one second's worth may go at the moment of the stall.
+        let at_once = times.iter().filter(|&&t| t == times[0]).count();
+        assert!(at_once <= 10, "{at_once} permits at {:?}", times[0]);
     }
 }
