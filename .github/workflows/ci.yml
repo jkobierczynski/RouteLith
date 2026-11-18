@@ -64,7 +64,7 @@ jobs:
   # Risk R1: timing error of the Windows ICMP API against a raw-socket
   # reference on loopback (runners are Administrator). Results go to the job
   # summary. Exit 1 (target missed) is reported, not failed, until the R1
-  # threshold is confirmed; exit 2 (could not measure) fails.
+  # threshold is confirmed; any other non-zero exit fails.
   calibrate-windows:
     name: R1 calibration (${{ matrix.os }})
     strategy:
@@ -82,10 +82,16 @@ jobs:
         run: |
           set +e
           target/release/routelith ctl calibrate --target 127.0.0.1 -c 2000 -i 5ms | tee calibration.txt
-          status=${PIPESTATUS[0]}
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          status=${statuses[0]}
+          [ "${statuses[1]}" -eq 0 ] || { echo "::error::could not save the report"; exit 1; }
           { echo '### R1 calibration (${{ matrix.os }})'; echo '```'; cat calibration.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$status" -eq 1 ]; then echo "::warning::R1 target missed on ${{ matrix.os }}"; fi
-          [ "$status" -ne 2 ]
+          case "$status" in
+            0) ;;
+            1) echo "::warning::R1 target missed on ${{ matrix.os }}" ;;
+            *) echo "::error::calibration could not measure (exit $status)"; exit 1 ;;
+          esac
 
   # macOS is best effort (architecture doc D4): compile only.
   check-macos:

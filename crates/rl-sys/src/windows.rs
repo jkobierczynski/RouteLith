@@ -275,7 +275,8 @@ impl RawIcmpSocket {
     }
 
     /// Receive one datagram (IPv4 header included), waiting at most `timeout`.
-    pub fn recv(&self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+    /// Takes `&mut self` because it sets the socket-wide receive timeout first.
+    pub fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
         use std::io::Read as _;
         self.socket
             .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;

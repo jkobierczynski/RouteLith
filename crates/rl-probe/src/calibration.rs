@@ -7,7 +7,7 @@
 //! `api - raw` is the error the helper API adds to an RTT.
 //!
 //! The analysis is portable so it can be unit tested anywhere; only
-//! [`run`] needs Windows.
+//! `run` needs Windows.
 
 use std::time::Duration;
 
@@ -125,16 +125,28 @@ pub fn run(
 
     use crate::packet::{MIN_PAYLOAD, build_echo_request, parse_echo_reply};
 
+    if timeout.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "timeout must be greater than zero",
+        ));
+    }
     let api = IcmpHandle::open(false)?;
-    let raw = RawIcmpSocket::open()?;
+    let mut raw = RawIcmpSocket::open()?;
     let payload: Vec<u8> = (0..payload_size.max(MIN_PAYLOAD))
         .map(|i| (i % 256) as u8)
         .collect();
     let ident = (std::process::id() & 0xffff) as u16;
+    // Per-run seed, so two overlapping runs in one process never accept each
+    // other's replies.
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+        << 16;
     let mut buf = vec![0u8; 65536];
 
-    let raw_echo = |seq: u16, buf: &mut [u8]| -> std::io::Result<Option<Duration>> {
-        let nonce = u64::from(seq) << 32 | u64::from(std::process::id());
+    let mut raw_echo = |seq: u16, buf: &mut [u8]| -> std::io::Result<Option<Duration>> {
+        let nonce = seed ^ u64::from(seq);
         let packet = build_echo_request(false, ident, seq, nonce, payload.len());
         let start = Instant::now();
         raw.send_to(&packet, dest)?;
@@ -156,6 +168,9 @@ pub fn run(
                 Err(e) => return Err(e),
             };
             let elapsed = start.elapsed();
+            if elapsed > timeout {
+                return Ok(None);
+            }
             // Skip the IPv4 header (IHL is in 32-bit words).
             let ihl = usize::from(buf[0] & 0x0f) * 4;
             let Some(icmp) = buf.get(ihl..n) else {
@@ -195,6 +210,9 @@ pub fn run(
             api_rtt_ms: api_res.1,
             raw: raw_res,
         });
+        if seq + 1 == count {
+            break;
+        }
         next += interval;
         if let Some(wait) = next.checked_duration_since(Instant::now()) {
             std::thread::sleep(wait);

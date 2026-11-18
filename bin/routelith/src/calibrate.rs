@@ -26,8 +26,8 @@ pub(crate) struct CalibrateArgs {
     /// Per-echo timeout.
     #[arg(short = 'W', long, default_value = "1s", value_parser = parse_duration)]
     timeout: Duration,
-    /// ICMP payload size in bytes.
-    #[arg(short = 's', long, default_value_t = 56)]
+    /// ICMP payload size in bytes (minimum 8, which holds the nonce).
+    #[arg(short = 's', long, default_value_t = 56, value_parser = clap::value_parser!(u16).range(8..))]
     size: u16,
     /// Pass if the p99 of |api - raw| is at most this many milliseconds.
     #[arg(long, default_value_t = 0.5)]
@@ -35,6 +35,10 @@ pub(crate) struct CalibrateArgs {
 }
 
 pub(crate) fn run(args: &CalibrateArgs) -> ExitCode {
+    if args.timeout.is_zero() {
+        eprintln!("routelith ctl calibrate: the timeout must be greater than zero");
+        return ExitCode::from(2);
+    }
     #[cfg(windows)]
     {
         let pairs = match rl_probe::calibration::run(
@@ -128,9 +132,9 @@ fn render(args: &CalibrateArgs, s: &Summary) -> (String, Option<bool>) {
         let _ = writeln!(out, "FAIL  no pair had replies on both sides");
         return (out, None);
     };
-    #[allow(clippy::cast_possible_truncation)]
-    let limit_us = (args.max_p99_ms * 1000.0).round() as i64;
-    let pass = err.p99 <= limit_us;
+    // Compare in the same unit without rounding the limit.
+    #[allow(clippy::cast_precision_loss)]
+    let pass = err.p99 as f64 <= args.max_p99_ms * 1000.0;
     let _ = writeln!(
         out,
         "{}  R1: p99 |api - raw| = {} ms, target <= {} ms",
