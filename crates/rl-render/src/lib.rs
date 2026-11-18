@@ -52,12 +52,16 @@ impl Graph<'_> {
     pub const DEFAULT_WIDTH: u32 = 800;
     pub const DEFAULT_HEIGHT: u32 = 300;
     /// Smallest size that leaves room for the plot inside the margins.
-    pub const MIN_WIDTH: u32 = 240;
+    pub const MIN_WIDTH: u32 = 480;
     pub const MIN_HEIGHT: u32 = 160;
 }
 
 // Plot area margins.
 const LEFT: f64 = 64.0;
+/// Room the footer summary needs (about 60 characters at 11 px).
+const SUMMARY_WIDTH: f64 = 380.0;
+/// Width of the loss legend: label, five swatches and the 100 % swatch.
+const LEGEND_WIDTH: f64 = 300.0;
 const RIGHT: f64 = 16.0;
 const TOP: f64 = 30.0;
 const BOTTOM: f64 = 56.0;
@@ -363,7 +367,14 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     };
     let ly = h - 12.0;
     s.text(LEFT, ly, "start", "", &summary);
-    let mut lx = LEFT + pw - 300.0;
+    // The legend (LEGEND_WIDTH wide, right-aligned) shares the summary's
+    // line when the plot has room for both, else it goes on the line above.
+    let ly = if pw >= SUMMARY_WIDTH + LEGEND_WIDTH {
+        ly
+    } else {
+        ly - 14.0
+    };
+    let mut lx = LEFT + pw - LEGEND_WIDTH;
     s.text(lx, ly, "start", "", "loss %:");
     lx += 46.0;
     for (_, colour, name) in LOSS_COLOURS {
@@ -583,8 +594,15 @@ mod tests {
         };
         let svg = render(&rounds, &g);
         assert!(svg.contains(&format!("width=\"{}\"", Graph::MIN_WIDTH)));
-        for (_, _, w, h) in rects(&svg) {
+        let width = f64::from(Graph::MIN_WIDTH);
+        for (x, _, w, h) in rects(&svg) {
             assert!(w > 0.0 && h > 0.0, "{w} x {h}");
+            assert!(x >= 0.0 && x + w <= width, "rect at {x}, {w} wide");
         }
+        // The legend moved above the summary, whose line it would overlap.
+        let summary_y = format!("y=\"{:.1}\"", f64::from(Graph::MIN_HEIGHT) - 12.0);
+        let legend = svg.find("loss %:").unwrap();
+        let line = &svg[svg[..legend].rfind('<').unwrap()..legend];
+        assert!(!line.contains(&summary_y), "{line}");
     }
 }

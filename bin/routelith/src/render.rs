@@ -122,7 +122,8 @@ fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
             title: &title,
             from_ms,
             to_ms,
-            step_ms: configured_step(cfg.as_ref(), &key),
+            step_ms: configured_step(cfg.as_ref(), &key)
+                .filter(|&step| step >= smallest_gap(&rounds).unwrap_or(0)),
             width: Graph::DEFAULT_WIDTH,
             height: Graph::DEFAULT_HEIGHT,
         },
@@ -174,6 +175,18 @@ fn configured_step(cfg: Option<&Config>, key: &SeriesKey) -> Option<i64> {
     let cfg = cfg.filter(|c| c.server.vantage == key.vantage)?;
     let t = cfg.targets.iter().find(|t| t.id == key.target)?;
     i64::try_from(t.schedule.step.as_millis()).ok()
+}
+
+/// The smallest spacing of the stored rounds. A configured step longer
+/// than it is kept (a stray close pair must not shrink the columns), one
+/// shorter is not: the rounds were taken at a slower step than configured
+/// now, and columns on the new step would leave gaps between them.
+fn smallest_gap(rounds: &[rl_store::StoredRound]) -> Option<i64> {
+    rounds
+        .windows(2)
+        .map(|w| w[1].ts_ms - w[0].ts_ms)
+        .filter(|&d| d > 0)
+        .min()
 }
 
 /// The one series of `target` matching the filters.
@@ -298,6 +311,23 @@ mod tests {
         assert_eq!(configured_step(Some(&cfg), &own), Some(60_000));
         assert_eq!(configured_step(Some(&cfg), &other_vantage), None);
         assert_eq!(configured_step(None, &own), None);
+    }
+
+    #[test]
+    fn the_smallest_gap_between_stored_rounds() {
+        let at = |ts_ms| rl_store::StoredRound {
+            ts_ms,
+            sent: 1,
+            rtts_us: vec![1000],
+            errors: rl_store::ErrorCounts::default(),
+            resolved: None,
+            timing: None,
+            flags: 0,
+        };
+        let rounds = [at(0), at(300_000), at(600_000), at(600_500)];
+        assert_eq!(smallest_gap(&rounds), Some(500));
+        assert_eq!(smallest_gap(&rounds[..3]), Some(300_000));
+        assert_eq!(smallest_gap(&rounds[..1]), None);
     }
 
     #[test]
