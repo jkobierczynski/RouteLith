@@ -193,12 +193,26 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
     let started = Instant::now();
     tokio::pin!(signal);
     // The store ends on its own only after an error, or when every job has
-    // ended (a scheduler task panicked, say): either way monitoring stopped
-    // without being asked to, which is a failure.
+    // ended; a job ends on its own only by panicking. Either way monitoring
+    // stopped without being asked to, which is a failure.
     let mut stopped_early = false;
+    let mut panicked = 0usize;
     loop {
         tokio::select! {
             () = &mut signal => break,
+            // A job ends only when asked to stop: one ending now (a panic)
+            // leaves its series unmeasured, so shut down with a failure.
+            Some(r) = jobs.join_next(), if !jobs.is_empty() => {
+                if r.is_err() {
+                    panicked += 1;
+                }
+                eprintln!(
+                    "routelith server: a scheduler task ended before shutdown was requested; \
+                     shutting down"
+                );
+                stopped_early = true;
+                break;
+            }
             _ = &mut store_done => {
                 eprintln!(
                     "routelith server: the store stopped before shutdown was requested; \
@@ -217,7 +231,6 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
 
     eprintln!("routelith server: stopping");
     let _ = stop_tx.send(true);
-    let mut panicked = 0usize;
     while let Some(r) = jobs.join_next().await {
         if r.is_err() {
             panicked += 1;
