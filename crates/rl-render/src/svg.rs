@@ -67,7 +67,8 @@ fn escape(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            c if c.is_control() => {}
+            // Not allowed in XML 1.0 (surrogates cannot occur in a `str`).
+            c if c.is_control() || c == '\u{fffe}' || c == '\u{ffff}' => {}
             c => out.push(c),
         }
     }
@@ -83,5 +84,8 @@ mod tests {
         let mut d = Doc::new(10, 10);
         d.text(1.0, 2.0, "start", "", "a<b & \"c\"\u{1b}");
         assert!(d.finish().contains(">a&lt;b &amp; &quot;c&quot;</text>"));
+        let mut d = Doc::new(10, 10);
+        d.text(1.0, 2.0, "start", "", "x\u{fffe}y\u{ffff}z");
+        assert!(d.finish().contains(">xyz</text>"));
     }
 }

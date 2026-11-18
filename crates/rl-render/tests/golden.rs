@@ -94,7 +94,7 @@ fn check(name: &str, range_ms: i64) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden")
         .join(format!("{name}.svg"));
-    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+    if std::env::var("UPDATE_GOLDEN").as_deref() == Ok("1") {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &svg).unwrap();
         return;

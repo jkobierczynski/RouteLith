@@ -42,7 +42,8 @@ pub struct Graph<'a> {
     pub to_ms: i64,
     /// Round interval of the series; `None` to infer it from the rounds.
     pub step_ms: Option<i64>,
-    /// Image size in pixels.
+    /// Image size in pixels; at least [`MIN_WIDTH`](Self::MIN_WIDTH) by
+    /// [`MIN_HEIGHT`](Self::MIN_HEIGHT) is drawn (smaller is enlarged).
     pub width: u32,
     pub height: u32,
 }
@@ -50,6 +51,9 @@ pub struct Graph<'a> {
 impl Graph<'_> {
     pub const DEFAULT_WIDTH: u32 = 800;
     pub const DEFAULT_HEIGHT: u32 = 300;
+    /// Smallest size that leaves room for the plot inside the margins.
+    pub const MIN_WIDTH: u32 = 240;
+    pub const MIN_HEIGHT: u32 = 160;
 }
 
 // Plot area margins.
@@ -79,8 +83,11 @@ struct Bucket {
     sent: u32,
     /// Replies in the bucket.
     received: u32,
-    /// Sorted, at most [`QUANTILES`] values, in ms.
+    /// Sorted, at most [`QUANTILES`] values, in ms: the smoke bands.
     samples: Vec<f64>,
+    /// Median and 90th percentile of all replies (not of `samples`), ms.
+    median: Option<f64>,
+    p90: Option<f64>,
 }
 
 impl Bucket {
@@ -129,7 +136,9 @@ struct BucketAcc {
     rtts_us: Vec<u32>,
 }
 
-/// The smallest gap between consecutive rounds, or 5 minutes.
+/// The smallest gap between consecutive rounds, at most 5 minutes: a
+/// series with missing rounds may show only long gaps, which must not
+/// widen the columns over the rounds that are missing.
 fn infer_step(rounds: &[Round<'_>]) -> i64 {
     rounds
         .windows(2)
@@ -137,6 +146,7 @@ fn infer_step(rounds: &[Round<'_>]) -> i64 {
         .filter(|&d| d > 0)
         .min()
         .unwrap_or(300_000)
+        .min(300_000)
 }
 
 /// `samples` (sorted) reduced to `n` evenly spaced quantiles, nearest rank.
@@ -154,13 +164,21 @@ fn quantiles(samples: &[u32], n: usize) -> Vec<u32> {
         .collect()
 }
 
-fn median(sorted: &[f64]) -> Option<f64> {
+/// Median of sorted microsecond values, in ms (mean of the middle two for
+/// an even count).
+fn median_ms(sorted: &[u32]) -> Option<f64> {
     let n = sorted.len();
     match n {
         0 => None,
-        _ if n % 2 == 1 => Some(sorted[n / 2]),
-        _ => Some((sorted[n / 2 - 1] + sorted[n / 2]) / 2.0),
+        _ if n % 2 == 1 => Some(f64::from(sorted[n / 2]) / 1e3),
+        _ => Some((f64::from(sorted[n / 2 - 1]) + f64::from(sorted[n / 2])) / 2e3),
     }
+}
+
+/// 90th percentile of sorted microsecond values (nearest rank), in ms.
+fn p90_ms(sorted: &[u32]) -> Option<f64> {
+    let n = sorted.len();
+    (n > 0).then(|| f64::from(sorted[(n * 9).div_ceil(10) - 1]) / 1e3)
 }
 
 fn loss_colour(loss: f64) -> &'static str {
@@ -204,7 +222,11 @@ fn nice_step(max: f64, ticks: f64) -> f64 {
 
 /// Draw the smoke graph of `rounds` (sorted by time) as an SVG document.
 pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
-    let (w, h) = (f64::from(g.width), f64::from(g.height));
+    let (width, height) = (
+        g.width.max(Graph::MIN_WIDTH),
+        g.height.max(Graph::MIN_HEIGHT),
+    );
+    let (w, h) = (f64::from(width), f64::from(height));
     let (pw, ph) = (w - LEFT - RIGHT, h - TOP - BOTTOM);
     let range = (g.to_ms - g.from_ms).max(1) as f64;
     let (accs, bucket_ms) = buckets(rounds, g, pw);
@@ -221,6 +243,8 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
                     .map(|us| f64::from(us) / 1e3)
                     .collect(),
                 received: u32::try_from(all.len()).unwrap_or(u32::MAX),
+                median: median_ms(&all),
+                p90: p90_ms(&all),
             }
         })
         .collect();
@@ -229,10 +253,7 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     // outliers don't flatten the graph (they are clipped at the top).
     let top = buckets
         .iter()
-        .filter_map(|b| {
-            let n = b.samples.len();
-            (n > 0).then(|| b.samples[(n * 9 / 10).min(n - 1)])
-        })
+        .filter_map(|b| b.p90)
         .fold(0.0, f64::max)
         .max(0.1);
     let tick = nice_step(top * 1.1, 4.0);
@@ -241,7 +262,7 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     let x = |ms: i64| LEFT + ((ms - g.from_ms) as f64 / range) * pw;
     let y = |v: f64| TOP + ph - (v.min(y_max) / y_max) * ph;
 
-    let mut s = svg::Doc::new(g.width, g.height);
+    let mut s = svg::Doc::new(width, height);
     s.rect(0.0, 0.0, w, h, "fill=\"#ffffff\"");
     s.text(
         LEFT,
@@ -282,7 +303,10 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     for b in &buckets {
         let x0 = x(b.start_ms.max(g.from_ms));
         let x1 = x((b.start_ms + bucket_ms).min(g.to_ms));
-        let bw = (x1 - x0).max(0.5);
+        let bw = (x1 - x0).max(0.5).min(pw);
+        // A round exactly at `to_ms` starts a bucket on the right border:
+        // draw it just inside the plot.
+        let x0 = x0.min(LEFT + pw - bw);
         let loss = b.loss_ratio();
         if b.samples.is_empty() {
             if b.sent > 0 {
@@ -307,7 +331,7 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
                 );
             }
         }
-        if let Some(m) = median(&b.samples) {
+        if let Some(m) = b.median {
             let ym = y(m);
             let _ = writeln!(
                 medians,
@@ -325,7 +349,7 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     // Summary and legend.
     let sent: u64 = buckets.iter().map(|b| u64::from(b.sent)).sum();
     let received: u64 = buckets.iter().map(|b| u64::from(b.received)).sum();
-    let meds: Vec<f64> = buckets.iter().filter_map(|b| median(&b.samples)).collect();
+    let meds: Vec<f64> = buckets.iter().filter_map(|b| b.median).collect();
     let summary = if sent == 0 {
         "no data in this range".to_string()
     } else {
@@ -479,5 +503,88 @@ mod tests {
             ..g
         };
         assert_eq!(buckets(&rounds, &long, 720.0).1, 1_200_000);
+    }
+
+    #[test]
+    fn median_and_p90_use_every_reply() {
+        // 51 at 1 ms and 49 at 100 ms: the median is 1 ms, although the
+        // two middle smoke samples are 1 ms and 100 ms.
+        let mut all = vec![1_000u32; 51];
+        all.extend([100_000; 49]);
+        assert_eq!(median_ms(&all), Some(1.0));
+        // 90 at 1 ms and 10 at 100 ms: p90 is 1 ms.
+        let mut all = vec![1_000u32; 90];
+        all.extend([100_000; 10]);
+        assert_eq!(p90_ms(&all), Some(1.0));
+        assert_eq!(p90_ms(&[5_000]), Some(5.0));
+        assert_eq!(median_ms(&[1_000, 2_000]), Some(1.5));
+        assert_eq!(p90_ms(&[]), None);
+    }
+
+    fn rects(svg: &str) -> Vec<(f64, f64, f64, f64)> {
+        let attr = |t: &str, name: &str| -> f64 {
+            let i = t.find(&format!(" {name}=\"")).unwrap() + name.len() + 3;
+            t[i..i + t[i..].find('"').unwrap()].parse().unwrap()
+        };
+        svg.split("<rect")
+            .skip(1)
+            .map(|t| {
+                (
+                    attr(t, "x"),
+                    attr(t, "y"),
+                    attr(t, "width"),
+                    attr(t, "height"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_round_at_the_end_is_drawn_inside_the_plot() {
+        let rtts = [1_000u32, 2_000, 3_000];
+        let rounds = [Round {
+            ts_ms: 3_600_000,
+            sent: 3,
+            rtts_us: &rtts,
+        }];
+        let g = Graph {
+            title: "t",
+            from_ms: 0,
+            to_ms: 3_600_000,
+            step_ms: Some(300_000),
+            width: 800,
+            height: 300,
+        };
+        let right = 800.0 - RIGHT;
+        let svg = render(&rounds, &g);
+        // The smoke bands (the background and frame are full size).
+        let bands: Vec<_> = rects(&svg).into_iter().filter(|r| r.2 < 100.0).collect();
+        assert!(!bands.is_empty());
+        for (x, _, w, _) in bands {
+            assert!(x >= LEFT && x + w <= right + 0.05, "{x} + {w}");
+        }
+    }
+
+    #[test]
+    fn tiny_images_are_enlarged_to_fit_the_plot() {
+        let rtts = [1_000u32];
+        let rounds = [Round {
+            ts_ms: 60_000,
+            sent: 1,
+            rtts_us: &rtts,
+        }];
+        let g = Graph {
+            title: "t",
+            from_ms: 0,
+            to_ms: 3_600_000,
+            step_ms: Some(300_000),
+            width: 80,
+            height: 80,
+        };
+        let svg = render(&rounds, &g);
+        assert!(svg.contains(&format!("width=\"{}\"", Graph::MIN_WIDTH)));
+        for (_, _, w, h) in rects(&svg) {
+            assert!(w > 0.0 && h > 0.0, "{w} x {h}");
+        }
     }
 }

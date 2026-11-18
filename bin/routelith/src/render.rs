@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, ValueEnum};
-use rl_core::config;
+use rl_core::config::{self, Config};
 use rl_render::{Graph, Round};
 use rl_store::{Reader, SeriesKey};
 
@@ -81,7 +81,8 @@ pub(crate) fn run(args: &RenderArgs) -> ExitCode {
 }
 
 fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
-    let (data_dir, cfg_vantage) = source(args)?;
+    let (data_dir, cfg) = source(args)?;
+    let cfg_vantage = cfg.as_ref().map(|c| c.server.vantage.clone());
     let reader =
         Reader::open(&data_dir).map_err(|e| (2, format!("{}: {e}", data_dir.display())))?;
     let key = pick_series(
@@ -94,7 +95,12 @@ fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
     let (key, id) = key;
 
     let to_ms = match args.end {
-        Some(s) => s.saturating_mul(1000),
+        Some(s) => end_ms(s).ok_or_else(|| {
+            (
+                2,
+                format!("--end {s} is outside the years 0000 to 9999 the store covers"),
+            )
+        })?,
         None => now_ms(),
     };
     let from_ms = to_ms - args.range.ms();
@@ -116,7 +122,7 @@ fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
             title: &title,
             from_ms,
             to_ms,
-            step_ms: None,
+            step_ms: configured_step(cfg.as_ref(), &key),
             width: Graph::DEFAULT_WIDTH,
             height: Graph::DEFAULT_HEIGHT,
         },
@@ -132,7 +138,7 @@ fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
 }
 
 /// Data directory and vantage from --config or --data-dir.
-fn source(args: &RenderArgs) -> Result<(PathBuf, Option<String>), (u8, String)> {
+fn source(args: &RenderArgs) -> Result<(PathBuf, Option<Config>), (u8, String)> {
     if let Some(dir) = &args.data_dir {
         return Ok((dir.clone(), None));
     }
@@ -151,7 +157,23 @@ fn source(args: &RenderArgs) -> Result<(PathBuf, Option<String>), (u8, String)> 
             ),
         )
     })?;
-    Ok((cfg.server.data_dir, Some(cfg.server.vantage)))
+    Ok((cfg.server.data_dir.clone(), Some(cfg)))
+}
+
+/// `--end` in Unix milliseconds, if it falls in the years 0000 to 9999.
+fn end_ms(secs: i64) -> Option<i64> {
+    // 0000-01-01T00:00:00Z and 9999-12-31T23:59:59Z.
+    const MIN_S: i64 = -62_167_219_200;
+    const MAX_S: i64 = 253_402_300_799;
+    (MIN_S..=MAX_S).contains(&secs).then(|| secs * 1000)
+}
+
+/// The step the configuration gives the series, when the configuration
+/// describes it (same vantage, a target with that id).
+fn configured_step(cfg: Option<&Config>, key: &SeriesKey) -> Option<i64> {
+    let cfg = cfg.filter(|c| c.server.vantage == key.vantage)?;
+    let t = cfg.targets.iter().find(|t| t.id == key.target)?;
+    i64::try_from(t.schedule.step.as_millis()).ok()
 }
 
 /// The one series of `target` matching the filters.
@@ -183,8 +205,12 @@ fn pick_series(
     }
     match family {
         Some(f) => cands.retain(|(k, _)| k.family == f),
-        // A `both` target: draw IPv4 unless asked otherwise.
-        None if cands.len() > 1 && cands.iter().any(|(k, _)| k.family == "v4") => {
+        // A `both` target: draw IPv4 unless asked otherwise. Several
+        // vantages are a choice for the user, not a default.
+        None if cands.len() > 1
+            && cands.iter().all(|(k, _)| k.vantage == cands[0].0.vantage)
+            && cands.iter().any(|(k, _)| k.family == "v4") =>
+        {
             cands.retain(|(k, _)| k.family == "v4");
         }
         None => {}
@@ -233,6 +259,13 @@ mod tests {
                 .unwrap_err()
                 .contains("several")
         );
+        // Two vantages, no family: listed, not settled by the IPv4 default.
+        let d = SeriesKey::new("remote", "gw", "v6");
+        assert!(
+            pick_series(vec![(&a, 1), (&d, 4)], "gw", None, None)
+                .unwrap_err()
+                .contains("several")
+        );
         assert!(
             pick_series(found(), "gw", Some("x"), None)
                 .unwrap_err()
@@ -243,6 +276,28 @@ mod tests {
                 .unwrap_err()
                 .contains("no data")
         );
+    }
+
+    #[test]
+    fn end_times_outside_the_store_years_are_refused() {
+        assert_eq!(end_ms(0), Some(0));
+        assert_eq!(end_ms(1_763_424_000), Some(1_763_424_000_000));
+        assert_eq!(end_ms(i64::MIN), None);
+        assert_eq!(end_ms(i64::MAX), None);
+        assert_eq!(end_ms(253_402_300_800), None);
+    }
+
+    #[test]
+    fn the_configured_step_applies_to_its_own_series() {
+        let src = "[server]\ndata_dir = \"/x\"\n[defaults]\nstep = \"60s\"\n[[group]]\n\
+                   name = \"G\"\n[[group.target]]\nname = \"gw\"\nhost = \"192.0.2.1\"\n";
+        let cfg = config::parse(src).config.unwrap();
+        let id = cfg.targets[0].id.clone();
+        let own = SeriesKey::new("local", &id, "v4");
+        let other_vantage = SeriesKey::new("remote", &id, "v4");
+        assert_eq!(configured_step(Some(&cfg), &own), Some(60_000));
+        assert_eq!(configured_step(Some(&cfg), &other_vantage), None);
+        assert_eq!(configured_step(None, &own), None);
     }
 
     #[test]
