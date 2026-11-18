@@ -636,8 +636,10 @@ fn quarantine(dir: &Path, from: &Path, name: &str) -> Result<PathBuf, StoreError
     let q = layout::quarantine_dir(dir);
     if !q.try_exists()? {
         std::fs::create_dir(&q)?;
-        layout::sync_dir(dir)?;
     }
+    // Every call: an earlier one may have created `quarantine/` and stopped
+    // before making its entry durable.
+    layout::sync_dir(dir)?;
     let mut to = q.join(name);
     let mut n = 1;
     while to.try_exists()? {
