@@ -12,7 +12,12 @@ publish.workspace = true
 clap.workspace = true
 rl-core.workspace = true
 rl-probe.workspace = true
-tokio.workspace = true
+rl-sched.workspace = true
+rl-store.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

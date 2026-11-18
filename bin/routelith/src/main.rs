@@ -1,11 +1,12 @@
 //! The `routelith` binary: one executable, several modes (architecture doc §3).
 //!
-//! Only the M0 subcommands exist so far; `check icmp`, `ctl calibrate` and
-//! `ctl verify` work, the rest are stubs.
+//! Only the M0 subcommands exist so far; `server`, `check icmp`,
+//! `ctl calibrate` and `ctl verify` work, `ctl render` is a stub.
 #![forbid(unsafe_code)]
 
 mod calibrate;
 mod check;
+mod server;
 mod verify;
 
 use std::path::PathBuf;
@@ -24,11 +25,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the scheduler and store in the foreground (M0: no UI or API yet).
-    Server {
-        /// Path to the TOML configuration file.
-        #[arg(short, long)]
-        config: PathBuf,
-    },
+    Server(server::ServerArgs),
     /// One-shot measurement for debugging and scripting.
     Check {
         #[command(subcommand)]
@@ -90,7 +87,7 @@ fn main() -> ExitCode {
         Command::Ctl {
             action: CtlAction::Verify(args),
         } => return run(verify::run(args)),
-        Command::Server { .. } => "server",
+        Command::Server(args) => return run(server::run(args)),
         Command::Ctl {
             action: CtlAction::Render { .. },
         } => "ctl render",

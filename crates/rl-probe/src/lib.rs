@@ -6,6 +6,7 @@
 pub mod calibration;
 pub mod icmp;
 pub mod packet;
+pub mod rate;
 
 use std::future::Future;
 use std::io;
@@ -14,6 +15,7 @@ use std::pin::Pin;
 use rl_core::{ResolvedTarget, RoundPlan, RoundResult};
 
 pub use icmp::{IcmpConfig, IcmpProbe, check_permission};
+pub use rate::RateLimiter;
 
 /// A boxed, `Send` future, so `Probe` stays object-safe.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
