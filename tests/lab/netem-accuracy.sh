@@ -109,15 +109,17 @@ if command -v ping >/dev/null; then
         }')
     [[ $ref =~ ^[0-9]+(\.[0-9]+)?$ ]] || ref=
 fi
+late() { awk -v m="$1" -v e="$expected" -v t="$DELAY_TOL_MS" 'BEGIN { exit !(m > e + t) }'; }
 within() { awk -v m="$1" -v e="$2" -v t="$3" 'BEGIN { d = m - e; if (d < 0) d = -d; exit !(d <= t) }'; }
 
-# Absolute delay check. If ping is just as far off, netem on this host is
-# releasing packets late and the check says nothing about Routelith, so it
-# only warns; the comparison with ping below still has to pass.
+# Absolute delay check. If ping is late too, netem on this host is releasing
+# packets late and the check says nothing about Routelith, so it only warns.
+# Routelith reading low is never waived, and the comparison with ping below
+# (Routelith no later than ping) still has to pass.
 if within "$delayed" "$expected" "$DELAY_TOL_MS"; then
     printf 'PASS  %-6s measured %s, expected %s ± %s\n' delay "$delayed" "$expected" "$DELAY_TOL_MS"
-elif [[ -n $ref ]] && ! within "$ref" "$expected" "$DELAY_TOL_MS"; then
-    printf 'WARN  %-6s measured %s, expected %s ± %s; ping median %s is off too, so this host adds delay\n' \
+elif [[ -n $ref ]] && late "$delayed" && late "$ref"; then
+    printf 'WARN  %-6s measured %s, expected %s ± %s; ping median %s is late too, so this host adds delay\n' \
         delay "$delayed" "$expected" "$DELAY_TOL_MS" "$ref"
 else
     printf 'FAIL  %-6s measured %s, expected %s ± %s\n' delay "$delayed" "$expected" "$DELAY_TOL_MS"
@@ -132,7 +134,8 @@ if [[ -n $ref ]]; then
         failures=$((failures + 1))
     fi
 elif command -v ping >/dev/null; then
-    echo "SKIP  vsping: ping produced no replies"
+    echo "FAIL  vsping: ping produced no replies"
+    failures=$((failures + 1))
 fi
 
 echo "== netem loss ${LOSS_PCT}% on B's egress, 2000 samples"
