@@ -5,9 +5,22 @@ SmokePing-style latency distributions ("smoke" graphs) with PingPlotter-style
 hop-by-hop path tracing, measured from federated agents on Linux and Windows,
 shipped as one self-contained binary.
 
-**Status:** pre-alpha. The workspace skeleton is in place; milestone M0
-(ICMP probing, scheduler, raw-tier storage, SVG smoke graphs,
-`routelith check`) is in progress. Nothing measures anything yet.
+**Status:** pre-alpha, milestone M0 in progress. `routelith check icmp`
+works on Linux and Windows; the scheduler, storage and smoke graphs are next.
+
+```console
+$ routelith check icmp example.net -c 5 -i 200ms
+ICMP example.net (192.0.2.10): 5 samples, 56-byte payload
+  #1    8.412 ms
+  ...
+--- 5 sent, 5 received, 0.0% loss
+rtt min/median/p90/max = 8.305/8.398/8.512/8.512 ms
+timing: kernel timestamps (ping socket), precision ±0.05 ms
+```
+
+On Linux, ICMP runs without root through ping sockets; the user's group must
+be inside `net.ipv4.ping_group_range` (most distributions allow every group by
+default). On Windows it uses the ICMP helper API and needs no privileges.
 
 ## Layout
 
