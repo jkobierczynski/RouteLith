@@ -234,8 +234,17 @@ pub async fn run_job(
     // Flags for the next round the sink accepts: a clock step seen on a
     // skipped slot or a refused round still marks the next stored round.
     let mut flags = 0;
+    // A host lookup that outlived its round's timeout. The next round waits
+    // for it instead of starting another, so each job has at most one
+    // lookup in flight however slow the resolver is.
+    let mut lookup: Option<Lookup> = None;
     loop {
-        // Sleep until the slot, re-reading the wall clock at least once a minute.
+        // Sleep until the slot, re-reading the wall clock at least once a
+        // minute. A backward wall-clock step keeps the job waiting for the
+        // slot it already chose: the store keeps each series' rounds in
+        // strictly increasing time order, so a round stamped before the last
+        // stored one would be dropped as late anyway. Rounds resume once the
+        // wall clock reaches that slot again, and the step is flagged then.
         loop {
             if *shutdown.borrow() {
                 return;
@@ -284,7 +293,7 @@ pub async fn run_job(
 
         let start = system_time(slot);
         let outcome = tokio::select! {
-            o = measure(&job, probe.as_ref(), start) => o,
+            o = measure(&job, probe.as_ref(), start, &mut lookup) => o,
             _ = shutdown.wait_for(|&stop| stop) => return,
         };
         if let Outcome::Failed { error, .. } = &outcome {
@@ -325,7 +334,14 @@ pub async fn run_job(
     }
 }
 
-async fn measure(job: &Job, probe: &dyn Probe, start: SystemTime) -> Outcome {
+type Lookup = tokio::task::JoinHandle<Result<IpAddr, String>>;
+
+async fn measure(
+    job: &Job,
+    probe: &dyn Probe,
+    start: SystemTime,
+    lookup: &mut Option<Lookup>,
+) -> Outcome {
     let s = job.schedule;
     let failed = |cause, error: String| Outcome::Failed {
         start,
@@ -340,14 +356,26 @@ async fn measure(job: &Job, probe: &dyn Probe, start: SystemTime) -> Outcome {
     } else {
         job.family
     };
-    let resolved = tokio::time::timeout(limit, resolve(&job.host, family))
-        .await
-        .unwrap_or_else(|_| {
-            Err(format!(
-                "lookup did not finish within {}",
-                rl_core::duration::format(limit)
-            ))
+    let resolved = if let Ok(addr) = job.host.parse::<IpAddr>() {
+        resolve(&addr.to_string(), family).await
+    } else {
+        // Reuse a lookup still running from an earlier round, else start one.
+        let mut handle = lookup.take().unwrap_or_else(|| {
+            let host = job.host.clone();
+            tokio::spawn(async move { resolve(&host, family).await })
         });
+        match tokio::time::timeout(limit, &mut handle).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => Err(format!("lookup task failed: {e}")),
+            Err(_) => {
+                *lookup = Some(handle);
+                Err(format!(
+                    "lookup did not finish within {}",
+                    rl_core::duration::format(limit)
+                ))
+            }
+        }
+    };
     let addr = match resolved {
         Ok(a) => a,
         Err(e) => {
