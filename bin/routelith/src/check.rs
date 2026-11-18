@@ -42,9 +42,9 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) async fn icmp(args: IcmpArgs) -> ExitCode {
     // Bounds that keep every offset and deadline of the round representable
     // (and match the configuration's limits).
-    if args.interval > MAX_INTERVAL || args.timeout > MAX_TIMEOUT {
+    if args.interval > MAX_INTERVAL || args.timeout.is_zero() || args.timeout > MAX_TIMEOUT {
         eprintln!(
-            "routelith check: interval must be at most {} and timeout at most {}",
+            "routelith check: interval must be at most {} and timeout more than 0 and at most {}",
             rl_core::duration::format(MAX_INTERVAL),
             rl_core::duration::format(MAX_TIMEOUT)
         );
