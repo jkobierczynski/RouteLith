@@ -22,7 +22,7 @@ pub fn check_permission(v6: bool) -> Result<(), ProbeError> {
         rl_sys::linux::PingSocket::open(v6)
             .map(drop)
             .map_err(|e| match e.kind() {
-                ErrorKind::PermissionDenied => ProbeError::PingSocketNotPermitted,
+                ErrorKind::PermissionDenied => ProbeError::PingSocketNotPermitted(e),
                 _ => ProbeError::Io(e),
             })
     }
