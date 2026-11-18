@@ -13,7 +13,7 @@ use std::pin::Pin;
 
 use rl_core::{ResolvedTarget, RoundPlan, RoundResult};
 
-pub use icmp::{IcmpConfig, IcmpProbe};
+pub use icmp::{IcmpConfig, IcmpProbe, check_permission};
 
 /// A boxed, `Send` future, so `Probe` stays object-safe.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

@@ -1,11 +1,12 @@
 //! The `routelith` binary: one executable, several modes (architecture doc §3).
 //!
-//! Only the M0 subcommands exist so far; `check icmp` and `ctl calibrate` work,
-//! the rest are stubs.
+//! Only the M0 subcommands exist so far; `check icmp`, `ctl calibrate` and
+//! `ctl verify` work, the rest are stubs.
 #![forbid(unsafe_code)]
 
 mod calibrate;
 mod check;
+mod verify;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -48,10 +49,7 @@ enum CheckProbe {
 #[derive(Debug, Subcommand)]
 enum CtlAction {
     /// Validate a configuration file without starting anything.
-    Verify {
-        /// Path to the TOML configuration file.
-        config: PathBuf,
-    },
+    Verify(verify::VerifyArgs),
     /// Measure the Windows ICMP API timing error against a raw-socket
     /// reference (Windows only, needs Administrator).
     Calibrate(calibrate::CalibrateArgs),
@@ -88,10 +86,10 @@ fn main() -> ExitCode {
         Command::Ctl {
             action: CtlAction::Calibrate(args),
         } => return calibrate::run(&args),
-        Command::Server { .. } => "server",
         Command::Ctl {
-            action: CtlAction::Verify { .. },
-        } => "ctl verify",
+            action: CtlAction::Verify(args),
+        } => return run(verify::run(args)),
+        Command::Server { .. } => "server",
         Command::Ctl {
             action: CtlAction::Render { .. },
         } => "ctl render",

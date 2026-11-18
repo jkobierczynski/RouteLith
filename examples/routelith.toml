@@ -1,0 +1,37 @@
+# Example Routelith configuration (M0: ICMP only).
+# Check it with: routelith ctl verify examples/routelith.toml
+
+[server]
+data_dir = "/var/lib/routelith"
+# vantage = "local"   # name of this measuring point
+# max_pps = 1000      # packets-per-second ceiling for all targets together
+
+# Settings here apply to every target unless a group or target overrides them.
+[defaults]
+step    = "300s"   # one round per step, aligned to the wall clock; must divide a day
+pings   = 20       # samples per round
+# spread  = "20s"  # window the samples are spread over (default: pings x 1s)
+# timeout = "2s"   # per-sample timeout
+# size    = 56     # ICMP payload bytes
+# family  = "v4"   # v4, v6, both (two series) or prefer-v6
+
+[[group]]
+name = "Core"
+
+  [[group.target]]
+  name = "gateway"
+  host = "192.168.1.1"
+
+  [[group.target]]
+  name = "dns-quad9"
+  host = "dns.quad9.net"
+  family = "both"
+
+[[group]]
+name = "Internet"
+step = "60s"
+pings = 10
+
+  [[group.target]]
+  name = "cloudflare"
+  host = "1.1.1.1"
