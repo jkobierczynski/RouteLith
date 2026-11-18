@@ -33,20 +33,21 @@ impl RateLimiter {
     /// use a permit computed for an earlier time.
     pub async fn acquire(&self) {
         loop {
-            let wait = {
-                let now = Instant::now();
+            // An absolute deadline, so time lost between this check and the
+            // sleep (a preempted thread) is not waited out again.
+            let eligible = {
                 let mut tat = self.tat.lock().unwrap_or_else(PoisonError::into_inner);
+                // Read after the lock, so time spent waiting for it counts.
+                let now = Instant::now();
                 let next = tat.map_or(now, |t| t.max(now)) + self.interval;
                 // This permit included, at most `burst` ahead of the even pace.
-                match next.checked_duration_since(now + self.burst) {
-                    None | Some(Duration::ZERO) => {
-                        *tat = Some(next);
-                        return;
-                    }
-                    Some(wait) => wait,
+                if next <= now + self.burst {
+                    *tat = Some(next);
+                    return;
                 }
+                next - self.burst
             };
-            tokio::time::sleep(wait).await;
+            tokio::time::sleep_until(eligible).await;
         }
     }
 }

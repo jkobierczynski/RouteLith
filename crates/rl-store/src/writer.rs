@@ -130,7 +130,7 @@ fn damaged_sealed(path: &Path, reason: impl std::fmt::Display) -> StoreError {
         path: path.to_path_buf(),
         reason: format!(
             "sealed segment is damaged ({reason}); the WAL may still hold its later rounds, \
-             so nothing was changed. Move the file aside to start without it"
+             so the file was left as it is. Move it aside to start without it"
         ),
     }
 }
@@ -269,38 +269,36 @@ impl Writer {
                 };
                 // A file from another series or day must not move this
                 // series' cutoffs (its WAL rounds would be dropped as late),
-                // and readers refuse it too: stop, changing nothing.
+                // and readers refuse it too: stop, leaving the file as it is.
                 if scan.series != id || scan.day != seg.day {
                     return Err(StoreError::Corrupt {
                         path: seg.path.clone(),
                         reason: format!(
                             "segment header names series {} day {}, not series {id} day {}; \
-                             nothing was changed. Move the file aside to start without it",
+                             the file was left as it is. Move it aside to start without it",
                             scan.series,
                             layout::date(scan.day),
                             layout::date(seg.day)
                         ),
                     });
                 }
-                // Only a block that decodes may move the replay cutoff: drop
-                // trailing blocks until the last one decodes (earlier ones
-                // were checked when the segment was last recovered or
-                // written).
+                // Only blocks that decode may move the replay cutoff: keep
+                // the blocks before the first one that does not (a sealed
+                // file with such a block is refused below).
                 let mut last_round = None;
-                while let Some(&(off, _)) = scan.blocks.last() {
+                for i in 0..scan.blocks.len() {
+                    let off = scan.blocks[i].0;
                     let decoded = match codec::read_frame(&bytes[off..]) {
                         codec::Frame::Ok(body, _) => codec::decode_block(body),
                         _ => None,
                     };
                     match decoded {
-                        Some(rounds) => {
-                            last_round = rounds.last().cloned();
-                            break;
-                        }
+                        Some(rounds) => last_round = rounds.last().cloned().or(last_round),
                         None => {
-                            scan.blocks.pop();
+                            scan.blocks.truncate(i);
                             scan.valid_len = off as u64;
                             scan.tail = Tail::Corrupt;
+                            break;
                         }
                     }
                 }
@@ -688,6 +686,60 @@ fn seal_file(dir: &Path, id: u64, day: i64) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_undecodable_block_before_a_good_one_does_not_move_the_cutoff() {
+        use crate::{ErrorCounts, Reader, SeriesKey};
+        let dir = tempfile::tempdir().unwrap();
+        let day_ms = 86_400_000;
+        let base = 20_000 * day_ms;
+        let opts = WriterOptions {
+            block_rounds: 2,
+            ..WriterOptions::default()
+        };
+        let round = |i: i64| StoredRound {
+            ts_ms: base + i * 60_000,
+            sent: 3,
+            rtts_us: vec![1000, 1100],
+            errors: ErrorCounts::default(),
+            resolved: None,
+            timing: None,
+            flags: 0,
+        };
+        let (mut w, _) = Writer::open(dir.path(), opts, base).unwrap();
+        let id = w.register(&[SeriesKey::new("v", "t", "v4")]).unwrap()[0];
+        for i in 0..6 {
+            w.append(id, round(i)).unwrap();
+        }
+        w.sync().unwrap();
+        // A crash: the WAL still holds every round, the open segment has
+        // three blocks.
+        drop(w);
+        let path = layout::segment_path(dir.path(), id, base / day_ms, false);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let scan = segment::scan(&bytes).unwrap();
+        assert_eq!(scan.blocks.len(), 3);
+        // Damage the first block's payload behind a valid checksum.
+        let off = scan.blocks[0].0;
+        let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        let body = off + 8;
+        for b in &mut bytes[body + 18..body + len] {
+            *b = 0xA5;
+        }
+        let crc = crc32c::crc32c(&bytes[body..body + len]);
+        bytes[off + 4..off + 8].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (w, rec) = Writer::open(dir.path(), opts, base).unwrap();
+        assert_eq!(rec.truncated_segments, 1);
+        w.close().unwrap();
+        let got = Reader::open(dir.path())
+            .unwrap()
+            .read(id, base, base + day_ms)
+            .unwrap();
+        let want: Vec<StoredRound> = (0..6).map(round).collect();
+        assert_eq!(got, want);
+    }
 
     #[test]
     fn an_exhausted_wal_sequence_is_an_error() {
