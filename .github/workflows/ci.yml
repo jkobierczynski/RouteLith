@@ -36,8 +36,30 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Allow unprivileged ICMP (ping sockets)
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
       - run: cargo clippy --workspace --all-targets --locked
       - run: cargo test --workspace --locked
+
+  # Known delay and loss injected with tc netem between two network namespaces;
+  # checks the M0 accuracy criteria (architecture doc §21.2).
+  lab-linux:
+    name: accuracy lab (netns + netem)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Load sch_netem
+        run: |
+          sudo modprobe sch_netem || {
+            sudo apt-get update
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe sch_netem
+          }
+      - run: cargo build --release --locked
+      - run: sudo tests/lab/netem-accuracy.sh target/release/routelith
 
   # macOS is best effort (architecture doc D4): compile only.
   check-macos:

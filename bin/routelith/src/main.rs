@@ -1,12 +1,14 @@
 //! The `routelith` binary: one executable, several modes (architecture doc §3).
 //!
-//! Only the M0 subcommands exist so far, and none of them is implemented yet.
+//! Only the M0 subcommands exist so far; `check icmp` works, the rest are stubs.
 #![forbid(unsafe_code)]
+
+mod check;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "routelith", version, about, propagate_version = true)]
@@ -37,17 +39,8 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum CheckProbe {
-    /// ICMP echo round.
-    Icmp(IcmpArgs),
-}
-
-#[derive(Debug, Args)]
-struct IcmpArgs {
-    /// Host name or IP address to measure.
-    host: String,
-    /// Number of samples in the round.
-    #[arg(short = 'c', long, default_value_t = 20)]
-    count: u16,
+    /// ICMP echo round (unprivileged: Linux ping socket, Windows ICMP API).
+    Icmp(check::IcmpArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -84,8 +77,10 @@ enum Range {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let name = match cli.command {
+        Command::Check {
+            probe: CheckProbe::Icmp(args),
+        } => return run(check::icmp(args)),
         Command::Server { .. } => "server",
-        Command::Check { .. } => "check",
         Command::Ctl {
             action: CtlAction::Verify { .. },
         } => "ctl verify",
@@ -95,6 +90,19 @@ fn main() -> ExitCode {
     };
     eprintln!("routelith {name}: not implemented yet (planned for M0)");
     ExitCode::from(2)
+}
+
+fn run(fut: impl std::future::Future<Output = ExitCode>) -> ExitCode {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt.block_on(fut),
+        Err(e) => {
+            eprintln!("routelith: cannot start async runtime: {e}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 #[cfg(test)]
