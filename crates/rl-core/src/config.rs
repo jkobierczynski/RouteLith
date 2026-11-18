@@ -443,7 +443,10 @@ impl Validator<'_> {
             self.error(&raw.data_dir.span(), "data_dir must not be empty");
             ok = false;
         } else if data_dir.contains('\0') {
-            self.error(&raw.data_dir.span(), "data_dir must not contain a NUL character");
+            self.error(
+                &raw.data_dir.span(),
+                "data_dir must not contain a NUL character",
+            );
             ok = false;
         }
         let vantage = match &raw.vantage {
@@ -950,7 +953,10 @@ name = "G"
 "#;
         let e = errors(src);
         assert_eq!(e.len(), 1, "{e:?}");
-        assert!(e[0].contains("ends after the next round starts (step 1m)"), "{e:?}");
+        assert!(
+            e[0].contains("ends after the next round starts (step 1m)"),
+            "{e:?}"
+        );
     }
 
     #[test]

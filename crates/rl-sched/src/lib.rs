@@ -35,6 +35,8 @@ pub use hist::Histogram;
 const CLOCK_STEP_US: i64 = 1_000_000;
 /// Longest single sleep before re-reading the wall clock.
 const MAX_SLEEP: Duration = Duration::from_secs(60);
+/// Longest a round waits for its host name (and never longer than a step).
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Flag on a round: the wall clock stepped since the previous one.
 pub const FLAG_CLOCK_STEP: u8 = 0x01;
@@ -49,6 +51,9 @@ pub struct Job {
     pub host: String,
     /// `V4`, `V6` or `PreferV6` (a `Both` target becomes two jobs).
     pub family: Family,
+    /// For `PreferV6`: whether IPv6 may be used (false when this host
+    /// cannot send ICMPv6, so the job measures over IPv4).
+    pub v6_usable: bool,
     pub schedule: Schedule,
 }
 
@@ -226,9 +231,15 @@ pub async fn run_job(
     let mut slot = next_slot(wall_us(), step, offset);
     let mut anchor: Option<(i64, Instant)> = None;
     let mut last_error: Option<String> = None;
+    // Flags for the next round the sink accepts: a clock step seen on a
+    // skipped slot or a refused round still marks the next stored round.
+    let mut flags = 0;
     loop {
         // Sleep until the slot, re-reading the wall clock at least once a minute.
         loop {
+            if *shutdown.borrow() {
+                return;
+            }
             let left = slot - wall_us();
             if left <= 0 {
                 break;
@@ -236,14 +247,11 @@ pub async fn run_job(
             let nap = Duration::from_micros(left.unsigned_abs()).min(MAX_SLEEP);
             tokio::select! {
                 () = tokio::time::sleep(nap) => {}
-                _ = shutdown.changed() => return,
-            }
-            if *shutdown.borrow() {
-                return;
+                // Resolves at once if shutdown is already true, and when the sender is gone.
+                _ = shutdown.wait_for(|&stop| stop) => return,
             }
         }
         let (woke_wall, woke_mono) = (wall_us(), Instant::now());
-        let mut flags = 0;
         if let Some((wall, mono)) = anchor {
             let mono_us =
                 i64::try_from(woke_mono.duration_since(mono).as_micros()).unwrap_or(i64::MAX);
@@ -263,8 +271,13 @@ pub async fn run_job(
         // A wake far past the slot (sleep/resume, clock step): realign
         // instead of firing a stale round.
         if late > step_us {
-            stats.overruns.fetch_add(1, Ordering::Relaxed);
-            slot = next_slot(woke_wall, step, offset);
+            let new = next_slot(woke_wall, step, offset);
+            // Every slot from the missed one up to (not including) the new one.
+            let skipped = (new - slot) / step_us;
+            stats
+                .overruns
+                .fetch_add(skipped.unsigned_abs(), Ordering::Relaxed);
+            slot = new;
             continue;
         }
         stats.record_lateness(late.unsigned_abs());
@@ -272,7 +285,7 @@ pub async fn run_job(
         let start = system_time(slot);
         let outcome = tokio::select! {
             o = measure(&job, probe.as_ref(), start) => o,
-            _ = shutdown.changed() => return,
+            _ = shutdown.wait_for(|&stop| stop) => return,
         };
         if let Outcome::Failed { error, .. } = &outcome {
             stats.failed.fetch_add(1, Ordering::Relaxed);
@@ -290,18 +303,22 @@ pub async fn run_job(
             outcome,
             flags,
         });
-        if !accepted {
+        if accepted {
+            flags = 0;
+        } else {
             stats.dropped.fetch_add(1, Ordering::Relaxed);
         }
 
         let next = slot + step_us;
         let now = wall_us();
         if now > next {
-            let skipped = (now - next) / step_us + 1;
+            // The slot the scheduler runs next is not skipped; the ones before it are.
+            let new = next_slot(now, step, offset);
+            let skipped = (new - next) / step_us;
             stats
                 .overruns
                 .fetch_add(skipped.unsigned_abs(), Ordering::Relaxed);
-            slot = next_slot(now, step, offset);
+            slot = new;
         } else {
             slot = next;
         }
@@ -316,7 +333,22 @@ async fn measure(job: &Job, probe: &dyn Probe, start: SystemTime) -> Outcome {
         cause,
         error,
     };
-    let addr = match resolve(&job.host, job.family).await {
+    // A stalled resolver must not hold the job past its slot.
+    let limit = RESOLVE_TIMEOUT.min(s.step);
+    let family = if job.family == Family::PreferV6 && !job.v6_usable {
+        Family::V4
+    } else {
+        job.family
+    };
+    let resolved = tokio::time::timeout(limit, resolve(&job.host, family))
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "lookup did not finish within {}",
+                rl_core::duration::format(limit)
+            ))
+        });
+    let addr = match resolved {
         Ok(a) => a,
         Err(e) => {
             return failed(

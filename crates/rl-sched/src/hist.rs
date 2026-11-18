@@ -67,17 +67,23 @@ impl Histogram {
         if self.count == 0 {
             return None;
         }
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let rank = ((p / 100.0 * self.count as f64).ceil() as u64).clamp(1, self.count);
+        // Nearest rank, computed exactly in thousandths of a percent so
+        // that, say, p7 of 100 values is rank 7 and not 8.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let milli = (p.clamp(0.0, 100.0) * 1000.0).round() as u128;
+        let rank = (milli * u128::from(self.count)).div_ceil(100_000);
+        let rank = u64::try_from(rank).unwrap_or(u64::MAX).clamp(1, self.count);
+        let last = self.counts.len() - 1;
         let mut seen = 0;
         for (i, &c) in self.counts.iter().enumerate() {
             seen += c;
             if seen >= rank {
-                return Some(upper(i).min(self.max));
+                // The last bucket has no upper bound: report what was seen.
+                return Some(if i == last {
+                    self.max
+                } else {
+                    upper(i).min(self.max)
+                });
             }
         }
         Some(self.max)
@@ -87,6 +93,26 @@ impl Histogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflow_bucket_reports_the_maximum() {
+        let mut h = Histogram::default();
+        h.record(120_000_000);
+        assert_eq!(h.percentile(99.0), Some(120_000_000));
+    }
+
+    #[test]
+    fn integral_percentiles_use_the_exact_rank() {
+        let mut h = Histogram::default();
+        for _ in 0..7 {
+            h.record(1_000);
+        }
+        for _ in 0..93 {
+            h.record(10_000);
+        }
+        assert_eq!(h.percentile(7.0), Some(2_000));
+        assert_eq!(h.percentile(8.0), Some(10_000));
+    }
 
     #[test]
     fn buckets_are_contiguous() {

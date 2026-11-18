@@ -108,7 +108,13 @@ impl Engine {
         }
     }
 
-    pub(super) async fn sample(&self, dest: IpAddr, timeout: Duration) -> (Sample, TimingBackend) {
+    /// One echo. `sent` is called once the request has left (or failed to).
+    pub(super) async fn sample(
+        &self,
+        dest: IpAddr,
+        timeout: Duration,
+        sent: impl FnOnce(),
+    ) -> (Sample, TimingBackend) {
         let nonce = self
             .nonce_seed
             .hash_one(self.nonce_counter.fetch_add(1, Ordering::Relaxed));
@@ -129,8 +135,9 @@ impl Engine {
         let v6 = self.shared.sock.get_ref().is_v6();
         let packet = build_echo_request(v6, 0, seq, nonce, self.payload_size);
 
-        let sent = self.send(&packet, dest).await;
-        let (tx_wall, tx_user) = match sent {
+        let result = self.send(&packet, dest).await;
+        sent();
+        let (tx_wall, tx_user) = match result {
             Ok(times) => times,
             Err(e) => {
                 return (

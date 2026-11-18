@@ -2,7 +2,9 @@
 # Scheduler bench for `routelith server` (architecture doc §21.2, M0 "schedule").
 #
 # Runs 1,000 ICMP targets on loopback addresses (127.0.x.y) at 20 samples
-# every 300 s for one full step plus a margin, then checks:
+# every 300 s for one full step plus the last ping's offset, its timeout and
+# a margin (counted from when the server reports it is measuring), then checks:
+#   - every target has at least one stored round
 #   - p99 lateness of round starts against their slots <= 50 ms
 #   - zero round overruns, zero dropped rounds
 #   - average CPU of the server process < 5 % of one core
@@ -15,7 +17,7 @@
 set -euo pipefail
 
 BIN=$(realpath "${1:?usage: $0 path/to/routelith [seconds]}")
-SECONDS_TO_RUN=${2:-320}
+SECONDS_TO_RUN=${2:-330}
 TARGETS=1000
 MAX_P99_MS=50
 MAX_CPU_PCT=5
@@ -41,14 +43,22 @@ trap cleanup EXIT
 "$BIN" server -c "$work/bench.toml" --stats-interval 60 2> "$work/server.log" &
 pid=$!
 start=$(date +%s.%N)
+# Count the run from when the scheduler is up, not from process start.
+for _ in $(seq 1 600); do
+    grep -q 'routelith server: measuring' "$work/server.log" && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+done
 sleep "$SECONDS_TO_RUN"
 if ! kill -0 "$pid" 2>/dev/null; then
     cat "$work/server.log" >&2
     echo "FAIL: server exited early" >&2
     exit 1
 fi
-# utime + stime of the process (fields 14 and 15), in clock ticks.
-read -r utime stime < <(awk '{print $14, $15}' "/proc/$pid/stat")
+# utime + stime of the process (fields 14 and 15), in clock ticks. The
+# process name (field 2) is in parentheses and may contain spaces, so
+# count fields after its closing parenthesis (field 3 becomes $1).
+read -r utime stime < <(sed 's/.*) //' "/proc/$pid/stat" | awk '{print $12, $13}')
 end=$(date +%s.%N)
 kill -TERM "$pid"
 status=0
@@ -59,6 +69,11 @@ if [[ $status -ne 0 ]]; then
     echo "FAIL: server exited with status $status" >&2
     exit 1
 fi
+
+# Series with at least one stored round: after a clean stop every round
+# is in a segment file under series/<id>/raw/.
+measured=$(find "$work/data/series" -path '*/raw/*' \( -name '*.open' -o -name '*.seg' \) -size +0 \
+    -printf '%h\n' | sort -u | wc -l)
 
 line=$(grep '^stats: ' "$work/server.log" | tail -n 1)
 field() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<< "$line"; }
@@ -73,7 +88,7 @@ cpu=$(awk -v u="$utime" -v s="$stime" -v t="$ticks" -v a="$start" -v b="$end" \
     'BEGIN { printf "%.2f", 100 * (u + s) / t / (b - a) }')
 
 echo
-echo "rounds=$rounds overruns=$overruns dropped=$dropped failed=$failed"
+echo "series measured=$measured of $TARGETS, rounds=$rounds overruns=$overruns dropped=$dropped failed=$failed"
 echo "lateness p99=${p99} ms max=${max} ms, cpu=${cpu} % of one core over ${SECONDS_TO_RUN} s"
 
 fail=0
@@ -85,7 +100,7 @@ check() {
         fail=1
     fi
 }
-check "every target measured at least once ($rounds >= $TARGETS rounds)" "$rounds >= $TARGETS"
+check "every target measured at least once ($measured of $TARGETS series have stored rounds)" "$measured == $TARGETS"
 check "p99 lateness $p99 ms <= $MAX_P99_MS ms" "$p99 <= $MAX_P99_MS"
 check "no overruns ($overruns)" "$overruns == 0"
 check "no dropped rounds ($dropped)" "$dropped == 0"

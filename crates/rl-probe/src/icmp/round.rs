@@ -6,7 +6,7 @@ use std::time::Duration;
 use rl_core::{
     ProbeMeta, ResolvedTarget, RoundPlan, RoundResult, Sample, TimingBackend, TimingSource,
 };
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
@@ -43,17 +43,33 @@ pub(super) async fn run(
 
     let t0 = Instant::now();
     let mut tasks = JoinSet::new();
+    // Sample `i` is sent only after sample `i - 1`, even when tasks wake
+    // out of order; replies are still awaited concurrently.
+    let turn = Arc::new(watch::Sender::new(0u16));
     for i in 0..plan.count {
         let engine = Arc::clone(&engine);
         let at = t0 + plan.sample_offset(i);
         let timeout = plan.timeout;
         let limiter = limiter.cloned();
+        let turn = Arc::clone(&turn);
         tasks.spawn(async move {
             sleep_until(at).await;
+            let _ = turn.subscribe().wait_for(|&t| t == i).await;
             if let Some(l) = limiter {
                 l.acquire().await;
             }
-            (i, engine.sample(dest, timeout).await)
+            let pass = || {
+                turn.send_if_modified(|t| {
+                    let mine = *t == i;
+                    if mine {
+                        *t = i + 1;
+                    }
+                    mine
+                });
+            };
+            let result = engine.sample(dest, timeout, pass).await;
+            pass();
+            (i, result)
         });
     }
 

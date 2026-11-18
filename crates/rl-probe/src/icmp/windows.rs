@@ -36,11 +36,18 @@ impl Engine {
         TimingBackend::WindowsIcmpApi
     }
 
-    pub(super) async fn sample(&self, dest: IpAddr, timeout: Duration) -> (Sample, TimingBackend) {
+    /// One echo. `sent` is called once the request is handed to the API.
+    pub(super) async fn sample(
+        &self,
+        dest: IpAddr,
+        timeout: Duration,
+        sent: impl FnOnce(),
+    ) -> (Sample, TimingBackend) {
         let handle = Arc::clone(&self.handle);
         let payload = Arc::clone(&self.payload);
-        let outcome =
-            tokio::task::spawn_blocking(move || handle.echo(dest, &payload, TTL, timeout)).await;
+        let echo = tokio::task::spawn_blocking(move || handle.echo(dest, &payload, TTL, timeout));
+        sent();
+        let outcome = echo.await;
         let sample = match outcome {
             Ok(Ok(EchoOutcome::Reply { elapsed, .. })) => ok_sample(elapsed),
             Ok(Ok(EchoOutcome::TimedOut)) => Sample::Lost,
