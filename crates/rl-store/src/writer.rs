@@ -329,8 +329,12 @@ impl Writer {
                         // the whole file for the operator first.
                         if scan.tail == Tail::Corrupt {
                             let copy = seg.path.with_extension("damaged");
-                            std::fs::write(&copy, &bytes)?;
-                            std::fs::File::open(&copy)?.sync_all()?;
+                            // Written and synced through one handle: Windows
+                            // cannot flush a file opened only for reading.
+                            let mut f = std::fs::File::create(&copy)?;
+                            std::io::Write::write_all(&mut f, &bytes)?;
+                            f.sync_all()?;
+                            drop(f);
                             let name = format!(
                                 "series-{id}-{}",
                                 seg.path
