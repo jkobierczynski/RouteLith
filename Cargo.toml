@@ -17,11 +17,16 @@ rl-probe = { path = "crates/rl-probe" }
 rl-sched = { path = "crates/rl-sched" }
 rl-store = { path = "crates/rl-store" }
 rl-render = { path = "crates/rl-render" }
+crc32c = "0.6"
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
+proptest = "1.11"
+redb = "2.6"
 socket2 = { version = "0.6", features = ["all"] }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+zstd = "0.13"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_IO"] }
 
 # Shared lints. `unsafe_code` is not set here because `rl-sys` needs unsafe;

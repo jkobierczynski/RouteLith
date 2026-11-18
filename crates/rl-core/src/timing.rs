@@ -17,6 +17,25 @@ pub enum TimingBackend {
 }
 
 impl TimingBackend {
+    /// Stable one-byte code for storage. Never reuse a retired code.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::LinuxKernelTimestamp => 1,
+            Self::LinuxMonotonic => 2,
+            Self::WindowsIcmpApi => 3,
+        }
+    }
+
+    /// Inverse of [`code`](Self::code); `None` for unknown codes.
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::LinuxKernelTimestamp),
+            2 => Some(Self::LinuxMonotonic),
+            3 => Some(Self::WindowsIcmpApi),
+            _ => None,
+        }
+    }
+
     /// Short human-readable name, used in CLI output and the UI badge.
     pub fn describe(self) -> &'static str {
         match self {
