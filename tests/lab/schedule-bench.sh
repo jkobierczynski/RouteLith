@@ -24,9 +24,21 @@ MAX_CPU_PCT=5
 
 work=$(mktemp -d)
 cleanup() {
-    if [[ -n ${pid:-} ]]; then kill "$pid" 2>/dev/null || true; fi
+    # Stop and reap the server before deleting its store: it may still be
+    # draining rounds. After 30 s, kill it.
+    if [[ -n ${pid:-} ]]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for _ in $(seq 1 300); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
     rm -rf "$work"
 }
+# Seconds since boot: a monotonic clock, unaffected by wall-clock steps.
+uptime_s() { cut -d' ' -f1 /proc/uptime; }
 trap cleanup EXIT
 
 {
@@ -42,7 +54,7 @@ trap cleanup EXIT
 
 "$BIN" server -c "$work/bench.toml" --stats-interval 60 2> "$work/server.log" &
 pid=$!
-start=$(date +%s.%N)
+start=$(uptime_s)
 # Count the run from when the scheduler is up, not from process start.
 for _ in $(seq 1 600); do
     grep -q 'routelith server: measuring' "$work/server.log" && break
@@ -59,7 +71,7 @@ fi
 # process name (field 2) is in parentheses and may contain spaces, so
 # count fields after its closing parenthesis (field 3 becomes $1).
 read -r utime stime < <(sed 's/.*) //' "/proc/$pid/stat" | awk '{print $12, $13}')
-end=$(date +%s.%N)
+end=$(uptime_s)
 kill -TERM "$pid"
 status=0
 wait "$pid" || status=$?
@@ -84,12 +96,14 @@ failed=$(field failed)
 p99=$(field lateness_all_p99_ms)
 max=$(field lateness_all_max_ms)
 ticks=$(getconf CLK_TCK)
+# Unrounded for the check, rounded only for display.
 cpu=$(awk -v u="$utime" -v s="$stime" -v t="$ticks" -v a="$start" -v b="$end" \
-    'BEGIN { printf "%.2f", 100 * (u + s) / t / (b - a) }')
+    'BEGIN { printf "%.17g", 100 * (u + s) / t / (b - a) }')
+cpu_shown=$(awk -v c="$cpu" 'BEGIN { printf "%.2f", c }')
 
 echo
 echo "series measured=$measured of $TARGETS, rounds=$rounds overruns=$overruns dropped=$dropped failed=$failed"
-echo "lateness p99=${p99} ms max=${max} ms, cpu=${cpu} % of one core over ${SECONDS_TO_RUN} s"
+echo "lateness p99=${p99} ms max=${max} ms, cpu=${cpu_shown} % of one core over ${SECONDS_TO_RUN} s"
 
 fail=0
 check() {
@@ -105,5 +119,5 @@ check "p99 lateness $p99 ms <= $MAX_P99_MS ms" "$p99 <= $MAX_P99_MS"
 check "no overruns ($overruns)" "$overruns == 0"
 check "no dropped rounds ($dropped)" "$dropped == 0"
 check "no failed rounds ($failed)" "$failed == 0"
-check "cpu $cpu % < $MAX_CPU_PCT %" "$cpu < $MAX_CPU_PCT"
+check "cpu $cpu_shown % < $MAX_CPU_PCT %" "$cpu < $MAX_CPU_PCT"
 exit $fail
