@@ -88,7 +88,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      # The toolchain goes in `with:`, not the action ref, so Dependabot does
+      # not "upgrade" the MSRV (it opened a bump from @1.85 to @1.120).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
       - uses: Swatinem/rust-cache@v2
       - run: cargo +1.85 check --workspace --all-targets --locked
 
