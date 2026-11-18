@@ -109,7 +109,9 @@ impl Reader {
             if seg.day < first_day || seg.day > last_day {
                 continue;
             }
-            let (bytes, sealed) = self.read_segment(series, &seg)?;
+            let Some((bytes, sealed)) = self.read_segment(series, &seg)? else {
+                continue;
+            };
             let corrupt = |reason: &str| StoreError::Corrupt {
                 path: seg.path.clone(),
                 reason: reason.to_string(),
@@ -164,7 +166,9 @@ impl Reader {
             for seg in layout::list_segments(&self.dir, id)? {
                 rep.segments += 1;
                 let path = seg.path.display();
-                let (bytes, sealed) = self.read_segment(id, &seg)?;
+                let Some((bytes, sealed)) = self.read_segment(id, &seg)? else {
+                    continue;
+                };
                 let scan = match segment::scan(&bytes) {
                     Ok(s) => s,
                     Err(e) => {
@@ -222,12 +226,24 @@ impl Reader {
         &self,
         series: u64,
         seg: &layout::SegmentFile,
-    ) -> Result<(Vec<u8>, bool), StoreError> {
+    ) -> Result<Option<(Vec<u8>, bool)>, StoreError> {
+        let missing = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
         match std::fs::read(&seg.path) {
-            Ok(b) => Ok((b, seg.sealed)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound && !seg.sealed => {
-                let path = layout::segment_path(&self.dir, series, seg.day, true);
-                Ok((std::fs::read(path)?, true))
+            Ok(b) => Ok(Some((b, seg.sealed))),
+            Err(e) if missing(&e) && !seg.sealed => {
+                let sealed = layout::segment_path(&self.dir, series, seg.day, true);
+                match std::fs::read(&sealed) {
+                    Ok(b) => Ok(Some((b, true))),
+                    // Neither name: the open file was removed after its
+                    // header write failed (it held no rounds), or set aside
+                    // by recovery. Look once more in case it was re-created.
+                    Err(e) if missing(&e) => match std::fs::read(&seg.path) {
+                        Ok(b) => Ok(Some((b, false))),
+                        Err(e) if missing(&e) => Ok(None),
+                        Err(e) => Err(e.into()),
+                    },
+                    Err(e) => Err(e.into()),
+                }
             }
             Err(e) => Err(e.into()),
         }
@@ -240,7 +256,12 @@ impl Reader {
             for seg in layout::list_segments(&self.dir, id)? {
                 total += match std::fs::metadata(&seg.path) {
                     Err(e) if e.kind() == io::ErrorKind::NotFound && !seg.sealed => {
-                        std::fs::metadata(layout::segment_path(&self.dir, id, seg.day, true))?
+                        match std::fs::metadata(layout::segment_path(&self.dir, id, seg.day, true))
+                        {
+                            // Gone under both names (see `read_segment`).
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                            m => m?,
+                        }
                     }
                     m => m?,
                 }

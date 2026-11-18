@@ -61,6 +61,11 @@ for _ in $(seq 1 600); do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
 done
+if ! grep -q 'routelith server: measuring' "$work/server.log"; then
+    cat "$work/server.log" >&2
+    echo "FAIL: the server did not start measuring within 60 s" >&2
+    exit 1
+fi
 sleep "$SECONDS_TO_RUN"
 if ! kill -0 "$pid" 2>/dev/null; then
     cat "$work/server.log" >&2

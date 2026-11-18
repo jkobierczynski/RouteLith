@@ -402,7 +402,12 @@ impl Writer {
     }
 
     /// Look up or assign series ids in `meta.redb`.
+    /// Refused once the writer has stopped, like every other write; a
+    /// refused key does not stop it.
     pub fn register(&mut self, keys: &[SeriesKey]) -> Result<Vec<u64>, StoreError> {
+        if let Some(msg) = &self.failed {
+            return Err(StoreError::Stopped(msg.clone()));
+        }
         index::register(&self.dir, keys)
     }
 
