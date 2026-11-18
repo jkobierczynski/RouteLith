@@ -143,7 +143,8 @@ impl Reader {
     }
 
     /// Check every WAL file, and every block of every segment: checksum,
-    /// decoding, order.
+    /// decoding, order. Files in `quarantine/` are reported too, as their
+    /// rounds may be missing from [`Reader::read`].
     pub fn verify(&self) -> Result<VerifyReport, StoreError> {
         let mut rep = VerifyReport::default();
         for seq in layout::list_wal(&self.dir)? {
@@ -161,6 +162,21 @@ impl Reader {
                 Err(_) if bytes.len() < wal::HEADER_LEN => {}
                 Err(e) => rep.problems.push(format!("{}: {e}", path.display())),
             }
+        }
+        // Files the writer set aside after damage: their rounds may be
+        // missing from reads until someone has looked and removed them.
+        match std::fs::read_dir(layout::quarantine_dir(&self.dir)) {
+            Ok(entries) => {
+                for e in entries {
+                    rep.problems.push(format!(
+                        "{}: set aside after damage; rounds it held may be missing \
+                         (remove it once acknowledged)",
+                        e?.path().display()
+                    ));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
         for id in layout::list_series_dirs(&self.dir)? {
             for seg in layout::list_segments(&self.dir, id)? {
