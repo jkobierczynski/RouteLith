@@ -288,17 +288,26 @@ impl Writer {
                         ),
                     });
                 }
-                // Only blocks that decode may move the replay cutoff: keep
-                // the blocks before the first one that does not (a sealed
-                // file with such a block is refused below).
-                let mut last_round = None;
+                // Only blocks that decode, in order and inside the file's
+                // day, may move the replay cutoff: keep the blocks before
+                // the first one that does not (a sealed file with such a
+                // block is refused below).
+                let mut last_round: Option<StoredRound> = None;
                 for i in 0..scan.blocks.len() {
                     let off = scan.blocks[i].0;
                     let decoded = match codec::read_frame(&bytes[off..]) {
                         codec::Frame::Ok(body, _) => codec::decode_block(body),
                         _ => None,
                     };
-                    match decoded {
+                    let mut prev = last_round.as_ref().map_or(i64::MIN, |r| r.ts_ms);
+                    let valid = decoded.filter(|rounds| {
+                        rounds.iter().all(|r| {
+                            let ok = r.ts_ms > prev && day_of(r.ts_ms) == seg.day;
+                            prev = r.ts_ms;
+                            ok
+                        })
+                    });
+                    match valid {
                         Some(rounds) => last_round = rounds.last().cloned().or(last_round),
                         None => {
                             scan.blocks.truncate(i);
@@ -315,6 +324,29 @@ impl Writer {
                             format!("bad block after offset {}", scan.valid_len),
                         ));
                     } else {
+                        // Damage, not a torn write: the cut may drop intact
+                        // blocks whose WAL is already gone, so keep a copy of
+                        // the whole file for the operator first.
+                        if scan.tail == Tail::Corrupt {
+                            let copy = seg.path.with_extension("damaged");
+                            std::fs::write(&copy, &bytes)?;
+                            std::fs::File::open(&copy)?.sync_all()?;
+                            let name = format!(
+                                "series-{id}-{}",
+                                seg.path
+                                    .file_name()
+                                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                            );
+                            let to = quarantine(dir, &copy, &name)?;
+                            rec.problems.push(format!(
+                                "{}: bad block after offset {}; cut there, and the whole file \
+                                 was copied to {} (rounds after the cut that the WAL no \
+                                 longer holds are only in that copy)",
+                                seg.path.display(),
+                                scan.valid_len,
+                                to.display()
+                            ));
+                        }
                         segment::truncate(&seg.path, scan.valid_len)?;
                         rec.truncated_segments += 1;
                     }
@@ -738,6 +770,19 @@ mod tests {
 
         let (w, rec) = Writer::open(dir.path(), opts, base).unwrap();
         assert_eq!(rec.truncated_segments, 1);
+        assert!(
+            rec.problems.iter().any(|p| p.contains("copied")),
+            "{:?}",
+            rec.problems
+        );
+        // The intact later blocks are kept in the copy.
+        let copy = std::fs::read_dir(layout::quarantine_dir(dir.path()))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(copy).unwrap(), bytes);
         w.close().unwrap();
         let got = Reader::open(dir.path())
             .unwrap()
