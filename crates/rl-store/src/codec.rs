@@ -215,7 +215,7 @@ pub(crate) fn decode_payload(buf: &[u8], n: usize) -> Option<Vec<StoredRound>> {
     let mut idx = 0usize;
     // Changes recorded per round, then filled forward.
     let mut resolved_at: Vec<(usize, IpAddr)> = Vec::new();
-    let mut timing_at: Vec<(usize, TimingBackend)> = Vec::new();
+    let mut timing_at: Vec<(usize, Option<TimingBackend>)> = Vec::new();
     for _ in 0..entries {
         idx = idx.checked_add(usize::try_from(r.u64()?).ok()?)?;
         let round = rounds.get_mut(idx)?;
@@ -229,10 +229,9 @@ pub(crate) fn decode_payload(buf: &[u8], n: usize) -> Option<Vec<StoredRound>> {
                 resolved_at.push((idx, IpAddr::V6(Ipv6Addr::from(o))));
             }
             TAG_TIMING => {
-                // Unknown codes (from a newer version) read as "unknown".
-                if let Some(t) = TimingBackend::from_code(r.byte()?) {
-                    timing_at.push((idx, t));
-                }
+                // An unknown code (from a newer version) reads as "unknown"
+                // and ends the previous backend's run.
+                timing_at.push((idx, TimingBackend::from_code(r.byte()?)));
             }
             TAG_ERRORS => {
                 round.errors = ErrorCounts {
@@ -250,7 +249,7 @@ pub(crate) fn decode_payload(buf: &[u8], n: usize) -> Option<Vec<StoredRound>> {
         return None;
     }
     fill_forward(&mut rounds, &resolved_at, |r, v| r.resolved = Some(v));
-    fill_forward(&mut rounds, &timing_at, |r, v| r.timing = Some(v));
+    fill_forward(&mut rounds, &timing_at, |r, v| r.timing = v);
     Some(rounds)
 }
 
@@ -339,7 +338,15 @@ pub(crate) fn decode_block(body: &[u8]) -> Option<Vec<StoredRound>> {
     let h = block_header(body)?;
     // Each round needs at least a few payload bytes; bound the output so a
     // corrupt header cannot ask for an absurd allocation.
-    let payload = zstd::bulk::decompress(&body[BLOCK_HEADER..], MAX_FRAME).ok()?;
+    let compressed = &body[BLOCK_HEADER..];
+    // Size the buffer from the frame's declared size when it has one.
+    let capacity = zstd::zstd_safe::get_frame_content_size(compressed)
+        .ok()
+        .flatten()
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n <= MAX_FRAME)
+        .unwrap_or(MAX_FRAME);
+    let payload = zstd::bulk::decompress(compressed, capacity).ok()?;
     let rounds = decode_payload(&payload, usize::from(h.count))?;
     let ok = rounds.first().map(|r| r.ts_ms) == Some(h.first_ts)
         && rounds.last().map(|r| r.ts_ms) == Some(h.last_ts);

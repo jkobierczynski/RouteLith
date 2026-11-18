@@ -47,4 +47,11 @@ pub enum StoreError {
     Corrupt { path: PathBuf, reason: String },
     #[error("invalid round: {0}")]
     InvalidRound(&'static str),
+    #[error("invalid writer options: {0}")]
+    InvalidOptions(&'static str),
+    #[error("{} is already open by another writer", .0.display())]
+    Locked(PathBuf),
+    /// An earlier write failed; reopen the directory to recover.
+    #[error("store stopped after an earlier error ({0}); restart to recover")]
+    Stopped(String),
 }

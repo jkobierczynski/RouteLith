@@ -62,7 +62,8 @@ fn index_err(e: impl fmt::Display) -> StoreError {
 /// Open the database, waiting up to [`LOCK_WAIT`] while another process has it.
 fn open(dir: &Path, create: bool) -> Result<Option<Database>, StoreError> {
     let path = index_path(dir);
-    if !create && !path.exists() {
+    // `try_exists`: an unreadable directory is an error, not "no index".
+    if !create && !path.try_exists()? {
         return Ok(None);
     }
     let deadline = Instant::now() + LOCK_WAIT;
@@ -120,6 +121,8 @@ pub(crate) fn register(dir: &Path, keys: &[SeriesKey]) -> Result<Vec<u64>, Store
         counters.insert(NEXT_ID, next).map_err(index_err)?;
     }
     tx.commit().map_err(index_err)?;
+    // redb syncs the file; make a newly created file's name durable too.
+    crate::layout::sync_dir(dir)?;
     Ok(ids)
 }
 
