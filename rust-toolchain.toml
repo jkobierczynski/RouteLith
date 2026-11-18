@@ -1,0 +1,6 @@
+# Day-to-day development uses current stable. The minimum supported version
+# (1.85, the first with edition 2024) is declared as `rust-version` in
+# Cargo.toml and checked by the `msrv` CI job.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
