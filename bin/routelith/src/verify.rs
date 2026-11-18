@@ -171,6 +171,7 @@ async fn check_hosts(cfg: &Config, path: &Path) -> (HashMap<usize, Vec<IpAddr>>,
     let permits = Arc::new(Semaphore::new(RESOLVE_PARALLEL));
     let mut tasks = tokio::task::JoinSet::new();
     let mut pending: HashMap<usize, (usize, String)> = HashMap::new();
+    let mut task_target: HashMap<tokio::task::Id, usize> = HashMap::new();
     for (i, t) in cfg.targets.iter().enumerate() {
         if t.host.parse::<IpAddr>().is_ok() {
             continue;
@@ -178,7 +179,7 @@ async fn check_hosts(cfg: &Config, path: &Path) -> (HashMap<usize, Vec<IpAddr>>,
         let (host, family) = (t.host.clone(), t.family);
         pending.insert(i, (t.line, host.clone()));
         let permits = permits.clone();
-        tasks.spawn(async move {
+        let handle = tasks.spawn(async move {
             // The deadline starts once the lookup may run, and a timed-out
             // lookup keeps its permit until the system resolver returns.
             let permit = permits.acquire_owned().await.ok();
@@ -194,19 +195,32 @@ async fn check_hosts(cfg: &Config, path: &Path) -> (HashMap<usize, Vec<IpAddr>>,
             };
             (i, family, result)
         });
+        task_target.insert(handle.id(), i);
     }
 
     let mut problems: Vec<(usize, String, String)> = Vec::new();
     let mut resolved = HashMap::new();
     let deadline = tokio::time::Instant::now() + RESOLVE_ALL;
     loop {
-        let joined = match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+        let joined = match tokio::time::timeout_at(deadline, tasks.join_next_with_id()).await {
             Ok(Some(joined)) => joined,
             Ok(None) | Err(_) => break,
         };
-        // A task that panicked stays in `pending` and is reported below.
-        let Ok((i, family, result)) = joined else {
-            continue;
+        let (i, family, result) = match joined {
+            Ok((_, r)) => r,
+            Err(e) => {
+                // The lookup task itself failed (for example, no thread
+                // could be started for it): report that, not a timeout.
+                if let Some((line, host)) = task_target.get(&e.id()).and_then(|i| pending.remove(i))
+                {
+                    problems.push((
+                        line,
+                        host,
+                        format!("not checked: the lookup task failed: {e}"),
+                    ));
+                }
+                continue;
+            }
         };
         let Some((line, host)) = pending.remove(&i) else {
             continue;
