@@ -7,7 +7,14 @@
 #   - delay: median within ±0.1 ms of (baseline + 10 ms) over 1,000 samples
 #   - loss:  5 % ± 1.5 points over 2,000 samples
 #
-# Usage: sudo tests/lab/netem-accuracy.sh path/to/routelith
+# If iputils ping is installed, the delay step also measures with ping and
+# checks that Routelith's median is no worse than ping's (+ the tolerance).
+#
+# On a busy or virtualised host netem itself releases packets late, so the
+# absolute delay check can fail there even though both tools agree. Set
+# DELAY_TOL_MS to loosen it on such hosts; CI keeps the strict 0.1 ms.
+#
+# Usage: sudo [DELAY_TOL_MS=1] tests/lab/netem-accuracy.sh path/to/routelith
 # Needs root, iproute2 and the sch_netem kernel module.
 set -euo pipefail
 
@@ -16,7 +23,7 @@ A=rl-lab-a
 B=rl-lab-b
 ADDR_B=10.250.0.2
 DELAY_MS=10
-DELAY_TOL_MS=0.1
+DELAY_TOL_MS=${DELAY_TOL_MS:-0.1}
 LOSS_PCT=5
 LOSS_TOL_PCT=1.5
 
@@ -82,6 +89,23 @@ echo "$out"
 delayed=$(median_ms <<<"$out")
 expected=$(awk -v b="$base" -v d="$DELAY_MS" 'BEGIN { printf "%.3f", b + d }')
 check delay "$delayed" "$expected" "$DELAY_TOL_MS"
+
+if command -v ping >/dev/null; then
+    echo "== reference: iputils ping, same settings"
+    ref=$({ ip netns exec "$A" ping -n -c 1000 -i 0.005 -W 1 "$ADDR_B" || true; } |
+        sed -n 's/.*time=\([0-9.]*\).*/\1/p' | sort -n |
+        awk '{ v[NR] = $1 } END { if (NR) print v[int((NR + 1) / 2)] }')
+    if [[ $ref =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        if awk -v r="$delayed" -v p="$ref" -v t="$DELAY_TOL_MS" 'BEGIN { exit !(r <= p + t) }'; then
+            printf 'PASS  vsping measured %s, ping median %s (+ %s allowed)\n' "$delayed" "$ref" "$DELAY_TOL_MS"
+        else
+            printf 'FAIL  vsping measured %s, ping median %s (+ %s allowed)\n' "$delayed" "$ref" "$DELAY_TOL_MS"
+            failures=$((failures + 1))
+        fi
+    else
+        echo "SKIP  vsping: ping produced no replies"
+    fi
+fi
 
 echo "== netem loss ${LOSS_PCT}% on B's egress, 2000 samples"
 ip netns exec "$B" tc qdisc replace dev veth-b root netem loss "${LOSS_PCT}%"
