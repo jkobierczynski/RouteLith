@@ -61,6 +61,32 @@ jobs:
       - run: cargo build --release --locked
       - run: sudo tests/lab/netem-accuracy.sh target/release/routelith
 
+  # Risk R1: timing error of the Windows ICMP API against a raw-socket
+  # reference on loopback (runners are Administrator). Results go to the job
+  # summary. Exit 1 (target missed) is reported, not failed, until the R1
+  # threshold is confirmed; exit 2 (could not measure) fails.
+  calibrate-windows:
+    name: R1 calibration (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Calibrate on loopback
+        shell: bash
+        run: |
+          set +e
+          target/release/routelith ctl calibrate --target 127.0.0.1 -c 2000 -i 5ms | tee calibration.txt
+          status=${PIPESTATUS[0]}
+          { echo '### R1 calibration (${{ matrix.os }})'; echo '```'; cat calibration.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -eq 1 ]; then echo "::warning::R1 target missed on ${{ matrix.os }}"; fi
+          [ "$status" -ne 2 ]
+
   # macOS is best effort (architecture doc D4): compile only.
   check-macos:
     name: check (macos-latest)

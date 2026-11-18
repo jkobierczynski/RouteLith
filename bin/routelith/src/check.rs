@@ -160,7 +160,7 @@ fn render(target: &ResolvedTarget, round: &RoundResult, quiet: bool) -> String {
 }
 
 /// Parse `1s`, `250ms`, `500us` or a bare number of seconds.
-fn parse_duration(s: &str) -> Result<Duration, String> {
+pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     let (num, unit) = match s.find(|c: char| c.is_ascii_alphabetic()) {
         Some(i) => s.split_at(i),

@@ -3,6 +3,9 @@
 //! Needs no privileges. `ICMP_ECHO_REPLY.RoundTripTime` only has millisecond
 //! resolution, so the RTT is taken with `Instant` (QPC) around the synchronous
 //! call instead. The call blocks, so callers run it on a blocking thread pool.
+//!
+//! [`RawIcmpSocket`] is a raw ICMPv4 socket (needs Administrator). It is only
+//! used as a timing reference to calibrate the helper API (design risk R1).
 
 use std::ffi::c_void;
 use std::io;
@@ -19,6 +22,10 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     Icmp6SendEcho2, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho2Ex,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET6, IN6_ADDR, IN6_ADDR_0, SOCKADDR_IN6};
+
+/// `IP_STATUS_BASE`: statuses at or above it are `IP_*` codes; anything below
+/// is a Win32 error, i.e. the request failed on this host.
+const IP_STATUS_BASE: u32 = 11000;
 
 /// An open ICMP (v4) or ICMPv6 handle.
 #[derive(Debug)]
@@ -123,7 +130,7 @@ impl IcmpHandle {
                 };
                 let elapsed = start.elapsed();
                 if n == 0 {
-                    return Ok(from_status(last_error(), None, elapsed, 0));
+                    return no_reply(elapsed);
                 }
                 // SAFETY: n > 0 means the buffer starts with an ICMP_ECHO_REPLY; the
                 // u64-backed buffer is suitably aligned for it.
@@ -154,7 +161,7 @@ impl IcmpHandle {
                 };
                 let elapsed = start.elapsed();
                 if n == 0 {
-                    return Ok(from_status(last_error(), None, elapsed, 0));
+                    return no_reply(elapsed);
                 }
                 // SAFETY: the buffer holds the reply written by Icmp6SendEcho2.
                 let parsed =
@@ -188,6 +195,17 @@ impl Drop for IcmpHandle {
             IcmpCloseHandle(self.handle);
         }
     }
+}
+
+/// The call returned no reply: an `IP_*` status (time-out, unreachable, ...)
+/// or a local Win32 error, which becomes `Err` so callers count it as a send failure.
+fn no_reply(elapsed: Duration) -> io::Result<EchoOutcome> {
+    let status = last_error();
+    if status < IP_STATUS_BASE {
+        #[allow(clippy::cast_possible_wrap)] // Win32 error codes fit in i32
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(from_status(status, None, elapsed, 0))
 }
 
 fn last_error() -> u32 {
@@ -230,5 +248,37 @@ fn sockaddr_in6(addr: Ipv6Addr) -> SOCKADDR_IN6 {
             },
         },
         ..Default::default()
+    }
+}
+
+/// Raw ICMPv4 socket used as the timing reference for calibration. Needs
+/// Administrator. Received datagrams include the IPv4 header.
+#[derive(Debug)]
+pub struct RawIcmpSocket {
+    socket: socket2::Socket,
+}
+
+impl RawIcmpSocket {
+    /// Open and bind the socket. Fails with `PermissionDenied` without Administrator.
+    pub fn open() -> io::Result<Self> {
+        use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+        let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
+        let any = std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+        socket.bind(&SockAddr::from(any))?;
+        Ok(Self { socket })
+    }
+
+    /// Send one ICMP message (header and payload; the kernel adds the IP header).
+    pub fn send_to(&self, packet: &[u8], dest: Ipv4Addr) -> io::Result<usize> {
+        let dest = std::net::SocketAddr::from((dest, 0));
+        self.socket.send_to(packet, &dest.into())
+    }
+
+    /// Receive one datagram (IPv4 header included), waiting at most `timeout`.
+    pub fn recv(&self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+        use std::io::Read as _;
+        self.socket
+            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
+        (&self.socket).read(buf)
     }
 }
