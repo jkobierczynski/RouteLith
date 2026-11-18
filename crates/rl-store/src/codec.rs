@@ -250,6 +250,11 @@ pub(crate) fn decode_payload(buf: &[u8], n: usize) -> Option<Vec<StoredRound>> {
     }
     fill_forward(&mut rounds, &resolved_at, |r, v| r.resolved = Some(v));
     fill_forward(&mut rounds, &timing_at, |r, v| r.timing = v);
+    // The same rules the writer enforces on append (WAL replay and reads
+    // bypass `append`).
+    if rounds.iter().any(|r| r.check().is_err()) {
+        return None;
+    }
     Some(rounds)
 }
 
@@ -375,7 +380,7 @@ mod tests {
             any::<i32>(),
             0u16..=40,
             proptest::collection::vec(any::<u32>(), 0..=40),
-            any::<[u16; 4]>(),
+            any::<[u8; 4]>(),
             proptest::option::of(any::<std::net::IpAddr>()),
             proptest::option::of(1u8..=3),
             any::<u8>(),
@@ -383,16 +388,24 @@ mod tests {
             .prop_map(|(ts, extra_loss, mut rtts, e, resolved, timing, flags)| {
                 rtts.sort_unstable();
                 let sent = u16::try_from(rtts.len()).unwrap() + extra_loss;
+                // Errors never exceed the loss (`StoredRound::check`).
+                let mut left = extra_loss;
+                let mut take = |want: u8| {
+                    let n = u16::from(want).min(left);
+                    left -= n;
+                    n
+                };
+                let errors = ErrorCounts {
+                    unreachable: take(e[0]),
+                    time_exceeded: take(e[1]),
+                    send_failed: take(e[2]),
+                    other: take(e[3]),
+                };
                 StoredRound {
                     ts_ms: i64::from(ts),
                     sent,
                     rtts_us: rtts,
-                    errors: ErrorCounts {
-                        unreachable: e[0],
-                        time_exceeded: e[1],
-                        send_failed: e[2],
-                        other: e[3],
-                    },
+                    errors,
                     resolved,
                     timing: timing.and_then(TimingBackend::from_code),
                     flags,

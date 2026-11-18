@@ -419,3 +419,62 @@ fn series_keys_with_the_separator_are_refused() {
     // A refused key is not an I/O failure: the writer keeps working.
     assert!(w.register(&keys(1)).is_ok());
 }
+
+fn flip_byte_near_end(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let i = bytes.len() - 10;
+    bytes[i] ^= 0xff;
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn a_damaged_sealed_segment_stops_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = WriterOptions {
+        block_rounds: 4,
+        ..WriterOptions::default()
+    };
+    let (mut w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+    let id = w.register(&keys(1)).unwrap()[0];
+    let mut rng = Rng(5);
+    for i in 0..8 {
+        w.append(id, lab_round(&mut rng, T0 + i * STEP_MS, 5_000))
+            .unwrap();
+    }
+    w.maintain(T0 + 2 * DAY_MS).unwrap();
+    w.close().unwrap();
+    let seg = dir.path().join(format!("series/{id}/raw/2026-11-18.seg"));
+    flip_byte_near_end(&seg);
+    let before = std::fs::read(&seg).unwrap();
+    match Writer::open(dir.path(), opts, T0 + 2 * DAY_MS) {
+        Err(rl_store::StoreError::Corrupt { path, .. }) => assert_eq!(path, seg),
+        other => panic!("expected Corrupt, got {:?}", other.map(|_| ())),
+    }
+    // Nothing was changed.
+    assert_eq!(std::fs::read(&seg).unwrap(), before);
+}
+
+#[test]
+fn a_bad_checksum_in_an_open_segment_is_an_error_for_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = WriterOptions {
+        block_rounds: 4,
+        ..WriterOptions::default()
+    };
+    let (mut w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+    let id = w.register(&keys(1)).unwrap()[0];
+    let mut rng = Rng(6);
+    for i in 0..8 {
+        w.append(id, lab_round(&mut rng, T0 + i * STEP_MS, 5_000))
+            .unwrap();
+    }
+    w.sync().unwrap();
+    drop(w);
+    flip_byte_near_end(&dir.path().join(format!("series/{id}/raw/2026-11-18.open")));
+    assert!(
+        Reader::open(dir.path())
+            .unwrap()
+            .read(id, 0, i64::MAX)
+            .is_err()
+    );
+}

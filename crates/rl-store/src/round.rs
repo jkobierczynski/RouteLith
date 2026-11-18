@@ -65,7 +65,12 @@ impl StoredRound {
     }
 
     /// Convert a probe's round. RTTs are sorted; sample order is not kept.
-    pub fn from_result(r: &RoundResult, flags: u8) -> Self {
+    ///
+    /// Fails if the round has more samples than a stored round can count
+    /// (65,535).
+    pub fn from_result(r: &RoundResult, flags: u8) -> Result<Self, crate::StoreError> {
+        let sent = u16::try_from(r.samples.len())
+            .map_err(|_| crate::StoreError::InvalidRound("more than 65,535 samples"))?;
         let mut rtts_us: Vec<u32> = r.samples.iter().filter_map(Sample::rtt_us).collect();
         rtts_us.sort_unstable();
         let mut errors = ErrorCounts::default();
@@ -89,15 +94,15 @@ impl StoredRound {
                 -i64::try_from(ms).unwrap_or(i64::MAX)
             }
         };
-        Self {
+        Ok(Self {
             ts_ms,
-            sent: u16::try_from(r.samples.len()).unwrap_or(u16::MAX),
+            sent,
             rtts_us,
             errors,
             resolved: Some(r.meta.resolved),
             timing: Some(r.meta.timing.backend),
             flags,
-        }
+        })
     }
 
     /// Whether this round is well-formed enough to store.
@@ -141,7 +146,7 @@ mod tests {
                 payload_size: 56,
             },
         };
-        let s = StoredRound::from_result(&r, 0);
+        let s = StoredRound::from_result(&r, 0).unwrap();
         assert_eq!(s.ts_ms, 300_000);
         assert_eq!(s.sent, 4);
         assert_eq!(s.rtts_us, [10, 30]);
