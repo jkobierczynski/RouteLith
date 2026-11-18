@@ -27,21 +27,37 @@ pub(crate) struct CalibrateArgs {
     #[arg(short = 'W', long, default_value = "1s", value_parser = parse_duration)]
     timeout: Duration,
     /// ICMP payload size in bytes (minimum 8, which holds the nonce).
-    #[arg(short = 's', long, default_value_t = 56, value_parser = clap::value_parser!(u16).range(8..))]
+    #[arg(short = 's', long, default_value_t = 56, value_parser = clap::value_parser!(u16).range(8..=65507))]
     size: u16,
     /// Pass if the p99 of |api - raw| is at most this many milliseconds.
-    #[arg(long, default_value_t = 0.5, value_parser = parse_limit_ms)]
-    max_p99_ms: f64,
+    /// Parsed exactly, to whole nanoseconds.
+    #[arg(long = "max-p99-ms", default_value = "0.5", value_parser = parse_limit_ms)]
+    max_p99_ns: i64,
 }
 
-/// A finite, non-negative millisecond limit.
-fn parse_limit_ms(s: &str) -> Result<f64, String> {
-    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
-    if v.is_finite() && v >= 0.0 {
-        Ok(v)
-    } else {
-        Err("must be a finite number of milliseconds, 0 or more".into())
+/// A non-negative decimal number of milliseconds, as whole nanoseconds.
+/// Digits past the sixth decimal are dropped, so the limit never rounds up
+/// past what was asked for.
+fn parse_limit_ms(s: &str) -> Result<i64, String> {
+    const ERR: &str = "must be a decimal number of milliseconds, 0 or more (e.g. 0.5)";
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    let digits = |t: &str| t.bytes().all(|b| b.is_ascii_digit());
+    if (int.is_empty() && frac.is_empty()) || !digits(int) || !digits(frac) {
+        return Err(ERR.into());
     }
+    let whole: i64 = if int.is_empty() {
+        0
+    } else {
+        int.parse().map_err(|_| ERR.to_string())?
+    };
+    let mut ns_frac = 0i64;
+    for b in frac.bytes().chain(std::iter::repeat(b'0')).take(6) {
+        ns_frac = ns_frac * 10 + i64::from(b - b'0');
+    }
+    whole
+        .checked_mul(1_000_000)
+        .and_then(|w| w.checked_add(ns_frac))
+        .ok_or_else(|| ERR.to_string())
 }
 
 pub(crate) fn run(args: &CalibrateArgs) -> ExitCode {
@@ -95,6 +111,18 @@ fn ms(ns: i64) -> String {
     format!("{v:.3}")
 }
 
+/// Milliseconds exact to the nanosecond, with at least three decimals.
+// Only called on Windows outside tests.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ms_exact(ns: i64) -> String {
+    let sign = if ns < 0 { "-" } else { "" };
+    let ns = ns.unsigned_abs();
+    let frac = format!("{:06}", ns % 1_000_000);
+    let frac = frac.trim_end_matches('0');
+    let frac = format!("{frac:0<3}");
+    format!("{sign}{}.{frac}", ns / 1_000_000)
+}
+
 // Only called on Windows outside tests.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn line(out: &mut String, label: &str, d: Option<Dist>) {
@@ -142,15 +170,14 @@ fn render(args: &CalibrateArgs, s: &Summary) -> (String, Option<bool>) {
         let _ = writeln!(out, "FAIL  no pair had replies on both sides");
         return (out, None);
     };
-    // Compare in the same unit without rounding the limit.
-    #[allow(clippy::cast_precision_loss)]
-    let pass = err.p99 as f64 <= args.max_p99_ms * 1_000_000.0;
+    // Both sides are whole nanoseconds, so equality passes exactly.
+    let pass = err.p99 <= args.max_p99_ns;
     let _ = writeln!(
         out,
         "{}  R1: p99 |api - raw| = {} ms, target <= {} ms",
         if pass { "PASS" } else { "FAIL" },
-        ms(err.p99),
-        args.max_p99_ms
+        ms_exact(err.p99),
+        ms_exact(args.max_p99_ns)
     );
     (out, Some(pass))
 }
@@ -167,7 +194,7 @@ mod tests {
             interval: Duration::from_millis(10),
             timeout: Duration::from_secs(1),
             size: 56,
-            max_p99_ms: 0.5,
+            max_p99_ns: 500_000,
         }
     }
 
@@ -195,11 +222,32 @@ mod tests {
 
     #[test]
     fn limit_must_be_finite_and_non_negative() {
-        assert_eq!(parse_limit_ms("0"), Ok(0.0));
-        assert_eq!(parse_limit_ms("0.5"), Ok(0.5));
-        for bad in ["-0.1", "NaN", "inf", "x"] {
+        assert_eq!(parse_limit_ms("0"), Ok(0));
+        assert_eq!(parse_limit_ms("0.5"), Ok(500_000));
+        assert_eq!(parse_limit_ms(".5"), Ok(500_000));
+        assert_eq!(parse_limit_ms("1.000001"), Ok(1_000_001));
+        assert_eq!(parse_limit_ms("1.0000019"), Ok(1_000_001));
+        for bad in ["-0.1", "NaN", "inf", "x", "", ".", "1e3", "1.2.3"] {
             assert!(parse_limit_ms(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn verdict_line_shows_nanoseconds() {
+        assert_eq!(ms_exact(500_100), "0.5001");
+        assert_eq!(ms_exact(500_000), "0.500");
+        assert_eq!(ms_exact(1_000_001), "1.000001");
+        let s = Summary::from_pairs(&[Pair {
+            api: Some(Duration::from_nanos(600_100)),
+            api_rtt_ms: Some(0),
+            raw: Some(Duration::from_nanos(100_000)),
+        }]);
+        let (out, verdict) = render(&args(), &s);
+        assert_eq!(verdict, Some(false));
+        assert!(
+            out.contains("p99 |api - raw| = 0.5001 ms, target <= 0.500 ms"),
+            "{out}"
+        );
     }
 
     #[test]
