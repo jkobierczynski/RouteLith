@@ -81,7 +81,14 @@ impl Reader {
                 reason: reason.to_string(),
             };
             let records = match wal::read(&bytes) {
-                Ok((_, Tail::Corrupt)) => return Err(corrupt("bad record")),
+                // The damaged record's series is unknown, so no read can
+                // claim to be complete; the writer moves the file to
+                // quarantine/ when it next starts.
+                Ok((_, Tail::Corrupt)) => {
+                    return Err(corrupt(
+                        "bad record; restart the writer to set the file aside",
+                    ));
+                }
                 // Complete records before a half-written one.
                 Ok((records, _)) => records,
                 // A file just created, its header not written yet.
@@ -133,9 +140,26 @@ impl Reader {
         Ok(out.into_values().collect())
     }
 
-    /// Check every block of every segment: checksum, decoding, order.
+    /// Check every WAL file, and every block of every segment: checksum,
+    /// decoding, order.
     pub fn verify(&self) -> Result<VerifyReport, StoreError> {
         let mut rep = VerifyReport::default();
+        for seq in layout::list_wal(&self.dir)? {
+            let path = layout::wal_path(&self.dir, seq);
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            match wal::read(&bytes) {
+                Ok((_, Tail::Corrupt)) => {
+                    rep.problems.push(format!("{}: bad record", path.display()))
+                }
+                Ok(_) => {}
+                Err(_) if bytes.len() < wal::HEADER_LEN => {}
+                Err(e) => rep.problems.push(format!("{}: {e}", path.display())),
+            }
+        }
         for id in layout::list_series_dirs(&self.dir)? {
             for seg in layout::list_segments(&self.dir, id)? {
                 rep.segments += 1;

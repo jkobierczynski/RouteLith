@@ -556,3 +556,92 @@ fn a_corrupt_wal_is_quarantined_and_reads_continue() {
         .unwrap();
     assert!((4..6).contains(&rounds.len()), "{}", rounds.len());
 }
+
+#[test]
+fn a_damaged_open_segment_header_is_set_aside_and_the_day_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = WriterOptions {
+        block_rounds: 4,
+        ..WriterOptions::default()
+    };
+    let (mut w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+    let id = w.register(&keys(1)).unwrap()[0];
+    let mut rng = Rng(9);
+    for i in 0..6 {
+        w.append(id, lab_round(&mut rng, T0 + i * STEP_MS, 5_000))
+            .unwrap();
+    }
+    w.sync().unwrap();
+    drop(w);
+    let open = dir.path().join(format!("series/{id}/raw/2026-11-18.open"));
+    let mut bytes = std::fs::read(&open).unwrap();
+    bytes[0] ^= 0xff; // the magic
+    std::fs::write(&open, bytes).unwrap();
+
+    // Twice: the second start must not trip over anything the first left.
+    for _ in 0..2 {
+        let (w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+        w.close().unwrap();
+    }
+    let q = dir.path().join("quarantine");
+    assert!(q.join(format!("series-{id}-2026-11-18.open")).exists());
+    // The WAL still held every round, so all six are back.
+    let rounds = Reader::open(dir.path())
+        .unwrap()
+        .read(id, 0, i64::MAX)
+        .unwrap();
+    assert_eq!(rounds.len(), 6);
+}
+
+#[test]
+fn a_zero_filled_wal_tail_is_a_torn_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut w, _) = Writer::open(dir.path(), WriterOptions::default(), T0).unwrap();
+    let id = w.register(&keys(1)).unwrap()[0];
+    let mut rng = Rng(10);
+    for i in 0..3 {
+        w.append(id, lab_round(&mut rng, T0 + i * STEP_MS, 5_000))
+            .unwrap();
+    }
+    w.sync().unwrap();
+    drop(w);
+    let wal = std::fs::read_dir(dir.path().join("wal"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    append_bytes(&wal, &[0; 4096]);
+    let reader = Reader::open(dir.path()).unwrap();
+    assert_eq!(reader.read(id, 0, i64::MAX).unwrap().len(), 3);
+    assert!(reader.verify().unwrap().problems.is_empty());
+    let (_, rec) = Writer::open(dir.path(), WriterOptions::default(), T0).unwrap();
+    assert!(rec.problems.is_empty(), "{:?}", rec.problems);
+    assert_eq!(rec.replayed, 3);
+}
+
+#[test]
+fn verify_reports_a_corrupt_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut w, _) = Writer::open(dir.path(), WriterOptions::default(), T0).unwrap();
+    let id = w.register(&keys(1)).unwrap()[0];
+    let mut rng = Rng(11);
+    for i in 0..3 {
+        w.append(id, lab_round(&mut rng, T0 + i * STEP_MS, 5_000))
+            .unwrap();
+    }
+    w.sync().unwrap();
+    drop(w);
+    let wal = std::fs::read_dir(dir.path().join("wal"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    flip_byte_near_end(&wal);
+    let problems = Reader::open(dir.path()).unwrap().verify().unwrap().problems;
+    assert!(
+        problems.iter().any(|p| p.contains("bad record")),
+        "{problems:?}"
+    );
+}
