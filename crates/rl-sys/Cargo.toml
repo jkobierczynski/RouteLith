@@ -17,4 +17,5 @@ socket2.workspace = true
 tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+socket2.workspace = true
 windows-sys.workspace = true

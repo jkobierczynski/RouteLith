@@ -160,9 +160,9 @@ fn render(target: &ResolvedTarget, round: &RoundResult, quiet: bool) -> String {
 }
 
 /// Parse `1s`, `250ms`, `500us` or a bare number of seconds.
-fn parse_duration(s: &str) -> Result<Duration, String> {
+pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
-    let (num, unit) = match s.find(|c: char| c.is_ascii_alphabetic()) {
+    let (num, unit) = match s.find(|c: char| c.is_ascii_alphabetic() || c == 'µ') {
         Some(i) => s.split_at(i),
         None => (s, "s"),
     };
@@ -189,6 +189,7 @@ mod tests {
         assert_eq!(parse_duration("1s"), Ok(Duration::from_secs(1)));
         assert_eq!(parse_duration("250ms"), Ok(Duration::from_millis(250)));
         assert_eq!(parse_duration("500us"), Ok(Duration::from_micros(500)));
+        assert_eq!(parse_duration("500µs"), Ok(Duration::from_micros(500)));
         assert_eq!(parse_duration("2"), Ok(Duration::from_secs(2)));
         assert!(parse_duration("5m").is_err());
         assert!(parse_duration("-1s").is_err());

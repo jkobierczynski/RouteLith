@@ -3,6 +3,7 @@
 //! M0 has ICMP only: Linux ping sockets and the Windows ICMP API.
 #![forbid(unsafe_code)]
 
+pub mod calibration;
 pub mod icmp;
 pub mod packet;
 
