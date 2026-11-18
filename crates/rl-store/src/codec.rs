@@ -317,6 +317,15 @@ pub(crate) fn read_frame(buf: &[u8]) -> Frame<'_> {
     if len > MAX_FRAME {
         return Frame::Corrupt;
     }
+    // No frame is ever empty. Zeros to the end of the file are space a
+    // crash allocated but never wrote (a torn tail); anything else is damage.
+    if len == 0 {
+        return if buf.iter().all(|&b| b == 0) {
+            Frame::Truncated
+        } else {
+            Frame::Corrupt
+        };
+    }
     let Some(body) = buf.get(FRAME_HEADER..FRAME_HEADER + len) else {
         return Frame::Truncated;
     };
@@ -379,6 +388,17 @@ pub(crate) fn decode_block(body: &[u8]) -> Option<Vec<StoredRound>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_zero_filled_tail_is_torn_and_an_empty_frame_is_damage() {
+        assert_eq!(read_frame(&[0; 64]), Frame::Truncated);
+        let mut buf = vec![0; 64];
+        buf[40] = 1;
+        assert_eq!(read_frame(&buf), Frame::Corrupt);
+        let mut ok = Vec::new();
+        put_frame(&mut ok, b"x");
+        assert_eq!(read_frame(&ok), Frame::Ok(b"x", ok.len()));
+    }
     use proptest::prelude::*;
 
     fn round(ts_ms: i64, sent: u16, rtts: &[u32]) -> StoredRound {
