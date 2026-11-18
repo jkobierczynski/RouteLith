@@ -59,6 +59,7 @@ impl Default for IcmpConfig {
 #[derive(Debug, Default)]
 pub struct IcmpProbe {
     config: IcmpConfig,
+    limiter: Option<std::sync::Arc<crate::RateLimiter>>,
     #[cfg(any(target_os = "linux", windows))]
     engines: round::Engines,
 }
@@ -73,6 +74,12 @@ impl IcmpProbe {
         }
     }
 
+    /// Share a packets-per-second ceiling with other probes.
+    pub fn with_rate_limiter(mut self, limiter: std::sync::Arc<crate::RateLimiter>) -> Self {
+        self.limiter = Some(limiter);
+        self
+    }
+
     pub fn config(&self) -> IcmpConfig {
         self.config
     }
@@ -83,7 +90,14 @@ impl IcmpProbe {
         target: &ResolvedTarget,
         plan: RoundPlan,
     ) -> Result<RoundResult, ProbeError> {
-        round::run(&self.engines, self.config, target, plan).await
+        round::run(
+            &self.engines,
+            self.config,
+            self.limiter.as_ref(),
+            target,
+            plan,
+        )
+        .await
     }
 
     #[cfg(not(any(target_os = "linux", windows)))]

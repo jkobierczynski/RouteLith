@@ -15,8 +15,8 @@ use super::IcmpConfig;
 use super::linux::Engine;
 #[cfg(windows)]
 use super::windows::Engine;
-use crate::ProbeError;
 use crate::packet::MIN_PAYLOAD;
+use crate::{ProbeError, RateLimiter};
 
 /// Lazily opened engines, one per address family.
 #[derive(Debug, Default)]
@@ -28,6 +28,7 @@ pub(super) struct Engines {
 pub(super) async fn run(
     engines: &Engines,
     config: IcmpConfig,
+    limiter: Option<&Arc<RateLimiter>>,
     target: &ResolvedTarget,
     plan: RoundPlan,
 ) -> Result<RoundResult, ProbeError> {
@@ -46,8 +47,12 @@ pub(super) async fn run(
         let engine = Arc::clone(&engine);
         let at = t0 + plan.sample_offset(i);
         let timeout = plan.timeout;
+        let limiter = limiter.cloned();
         tasks.spawn(async move {
             sleep_until(at).await;
+            if let Some(l) = limiter {
+                l.acquire().await;
+            }
             (i, engine.sample(dest, timeout).await)
         });
     }

@@ -61,6 +61,21 @@ jobs:
       - run: cargo build --release --locked
       - run: sudo tests/lab/netem-accuracy.sh target/release/routelith
 
+  # 1,000 loopback targets for one 300 s step: p99 round-start lateness,
+  # overruns and CPU (architecture doc §21.2, M0 schedule criterion).
+  schedule-bench:
+    name: scheduler bench (1,000 targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Allow unprivileged ICMP (ping sockets)
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+      - run: cargo build --release --locked
+      - run: tests/lab/schedule-bench.sh target/release/routelith
+
   # Risk R1: timing error of the Windows ICMP API against a raw-socket
   # reference on loopback (runners are Administrator). Results go to the job
   # summary. Exit 1 (target missed) is reported, not failed, until the R1
