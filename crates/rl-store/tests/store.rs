@@ -553,11 +553,17 @@ fn a_corrupt_wal_is_quarantined_and_reads_continue() {
     // The live WAL set is clean again, so reads are not blocked: the four
     // rounds already in a block and the fifth, readable in the WAL before
     // the damaged sixth, are all there.
-    let rounds = Reader::open(dir.path())
-        .unwrap()
-        .read(id, 0, i64::MAX)
-        .unwrap();
+    let reader = Reader::open(dir.path()).unwrap();
+    let rounds = reader.read(id, 0, i64::MAX).unwrap();
     assert_eq!(rounds, written[..5]);
+    // The possible loss stays visible to `verify` until the file is removed.
+    let problems = reader.verify().unwrap().problems;
+    assert!(
+        problems.iter().any(|p| p.contains("set aside")),
+        "{problems:?}"
+    );
+    std::fs::remove_file(dir.path().join("quarantine").join(name)).unwrap();
+    assert!(reader.verify().unwrap().problems.is_empty());
 }
 
 #[test]
