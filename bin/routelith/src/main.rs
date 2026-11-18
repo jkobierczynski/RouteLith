@@ -1,19 +1,19 @@
 //! The `routelith` binary: one executable, several modes (architecture doc §3).
 //!
 //! Only the M0 subcommands exist so far; `server`, `check icmp`,
-//! `ctl calibrate` and `ctl verify` work, `ctl render` is a stub.
+//! `ctl calibrate`, `ctl verify` and `ctl render` work.
 #![forbid(unsafe_code)]
 
 mod calibrate;
 mod check;
+mod render;
 mod server;
 mod verify;
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "routelith", version, about, propagate_version = true)]
@@ -52,48 +52,26 @@ enum CtlAction {
     /// reference (Windows only, needs Administrator).
     Calibrate(calibrate::CalibrateArgs),
     /// Render a smoke graph from the store as SVG.
-    Render {
-        /// Target id as configured.
-        #[arg(long)]
-        target: String,
-        /// Time range to draw.
-        #[arg(long, value_enum, default_value_t = Range::H3)]
-        range: Range,
-        /// Output SVG file.
-        #[arg(long)]
-        out: PathBuf,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Range {
-    #[value(name = "3h")]
-    H3,
-    #[value(name = "30h")]
-    H30,
-    #[value(name = "10d")]
-    D10,
+    Render(render::RenderArgs),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let name = match cli.command {
+    match cli.command {
         Command::Check {
             probe: CheckProbe::Icmp(args),
-        } => return run(check::icmp(args)),
+        } => run(check::icmp(args)),
         Command::Ctl {
             action: CtlAction::Calibrate(args),
-        } => return calibrate::run(&args),
+        } => calibrate::run(&args),
         Command::Ctl {
             action: CtlAction::Verify(args),
-        } => return run(verify::run(args)),
-        Command::Server(args) => return run(server::run(args)),
+        } => run(verify::run(args)),
+        Command::Server(args) => run(server::run(args)),
         Command::Ctl {
-            action: CtlAction::Render { .. },
-        } => "ctl render",
-    };
-    eprintln!("routelith {name}: not implemented yet (planned for M0)");
-    ExitCode::from(2)
+            action: CtlAction::Render(args),
+        } => render::run(&args),
+    }
 }
 
 fn run(fut: impl std::future::Future<Output = ExitCode>) -> ExitCode {
