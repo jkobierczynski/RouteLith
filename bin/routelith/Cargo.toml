@@ -12,6 +12,7 @@ publish.workspace = true
 clap.workspace = true
 rl-core.workspace = true
 rl-probe.workspace = true
+rl-render.workspace = true
 rl-sched.workspace = true
 rl-store.workspace = true
 tokio = { workspace = true, features = ["signal"] }

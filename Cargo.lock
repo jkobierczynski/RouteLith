@@ -482,6 +482,7 @@ dependencies = [
  "clap",
  "rl-core",
  "rl-probe",
+ "rl-render",
  "rl-sched",
  "rl-store",
  "tempfile",
