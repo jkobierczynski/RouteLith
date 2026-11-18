@@ -30,8 +30,18 @@ pub(crate) struct CalibrateArgs {
     #[arg(short = 's', long, default_value_t = 56, value_parser = clap::value_parser!(u16).range(8..))]
     size: u16,
     /// Pass if the p99 of |api - raw| is at most this many milliseconds.
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.5, value_parser = parse_limit_ms)]
     max_p99_ms: f64,
+}
+
+/// A finite, non-negative millisecond limit.
+fn parse_limit_ms(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if v.is_finite() && v >= 0.0 {
+        Ok(v)
+    } else {
+        Err("must be a finite number of milliseconds, 0 or more".into())
+    }
 }
 
 pub(crate) fn run(args: &CalibrateArgs) -> ExitCode {
@@ -79,9 +89,9 @@ pub(crate) fn run(args: &CalibrateArgs) -> ExitCode {
 
 // Only called on Windows outside tests.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn ms(us: i64) -> String {
+fn ms(ns: i64) -> String {
     #[allow(clippy::cast_precision_loss)]
-    let v = us as f64 / 1000.0;
+    let v = ns as f64 / 1_000_000.0;
     format!("{v:.3}")
 }
 
@@ -134,7 +144,7 @@ fn render(args: &CalibrateArgs, s: &Summary) -> (String, Option<bool>) {
     };
     // Compare in the same unit without rounding the limit.
     #[allow(clippy::cast_precision_loss)]
-    let pass = err.p99 as f64 <= args.max_p99_ms * 1000.0;
+    let pass = err.p99 as f64 <= args.max_p99_ms * 1_000_000.0;
     let _ = writeln!(
         out,
         "{}  R1: p99 |api - raw| = {} ms, target <= {} ms",
@@ -181,6 +191,15 @@ mod tests {
 
         let bad = Summary::from_pairs(&[pair(300, 100), pair(900, 100)]);
         assert_eq!(render(&args(), &bad).1, Some(false));
+    }
+
+    #[test]
+    fn limit_must_be_finite_and_non_negative() {
+        assert_eq!(parse_limit_ms("0"), Ok(0.0));
+        assert_eq!(parse_limit_ms("0.5"), Ok(0.5));
+        for bad in ["-0.1", "NaN", "inf", "x"] {
+            assert!(parse_limit_ms(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

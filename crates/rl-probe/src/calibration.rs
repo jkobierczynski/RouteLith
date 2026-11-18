@@ -22,7 +22,8 @@ pub struct Pair {
     pub raw: Option<Duration>,
 }
 
-/// Distribution summary in microseconds (nearest-rank percentiles).
+/// Distribution summary in nanoseconds (nearest-rank percentiles). Kept at
+/// the timer's native precision; round only for display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dist {
     pub count: usize,
@@ -35,7 +36,7 @@ pub struct Dist {
 
 impl Dist {
     /// `None` for an empty input.
-    pub fn from_us(mut values: Vec<i64>) -> Option<Self> {
+    pub fn from_ns(mut values: Vec<i64>) -> Option<Self> {
         if values.is_empty() {
             return None;
         }
@@ -82,26 +83,28 @@ pub struct Summary {
 
 impl Summary {
     pub fn from_pairs(pairs: &[Pair]) -> Self {
-        let us = |d: Duration| i64::try_from(d.as_micros()).unwrap_or(i64::MAX);
-        let api: Vec<i64> = pairs.iter().filter_map(|p| p.api).map(us).collect();
-        let raw: Vec<i64> = pairs.iter().filter_map(|p| p.raw).map(us).collect();
+        let ns = |d: Duration| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
+        let api: Vec<i64> = pairs.iter().filter_map(|p| p.api).map(ns).collect();
+        let raw: Vec<i64> = pairs.iter().filter_map(|p| p.raw).map(ns).collect();
         let both: Vec<(i64, i64, Option<u32>)> = pairs
             .iter()
-            .filter_map(|p| Some((us(p.api?), us(p.raw?), p.api_rtt_ms)))
+            .filter_map(|p| Some((ns(p.api?), ns(p.raw?), p.api_rtt_ms)))
             .collect();
         let diff: Vec<i64> = both.iter().map(|(a, r, _)| a - r).collect();
-        let diff_dist = Dist::from_us(diff.clone());
+        let diff_dist = Dist::from_ns(diff.clone());
         let offset = diff_dist.map_or(0, |d| d.median);
         let api_field_off = both
             .iter()
-            .filter(|(_, r, ms)| ms.is_some_and(|ms| (i64::from(ms) * 1000 - r).abs() > 1000))
+            .filter(|(_, r, ms)| {
+                ms.is_some_and(|ms| (i64::from(ms) * 1_000_000 - r).abs() > 1_000_000)
+            })
             .count();
         Self {
             pairs: pairs.len(),
-            api: Dist::from_us(api),
-            raw: Dist::from_us(raw),
-            abs_err: Dist::from_us(diff.iter().map(|d| d.abs()).collect()),
-            abs_err_corrected: Dist::from_us(diff.iter().map(|d| (d - offset).abs()).collect()),
+            api: Dist::from_ns(api),
+            raw: Dist::from_ns(raw),
+            abs_err: Dist::from_ns(diff.iter().map(|d| d.abs()).collect()),
+            abs_err_corrected: Dist::from_ns(diff.iter().map(|d| (d - offset).abs()).collect()),
             diff: diff_dist,
             api_field_off,
         }
@@ -121,6 +124,8 @@ pub fn run(
     use std::net::IpAddr;
     use std::time::Instant;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use rl_sys::windows::{EchoOutcome, IcmpHandle, RawIcmpSocket};
 
     use crate::packet::{MIN_PAYLOAD, build_echo_request, parse_echo_reply};
@@ -138,11 +143,14 @@ pub fn run(
         .collect();
     let ident = (std::process::id() & 0xffff) as u16;
     // Per-run seed, so two overlapping runs in one process never accept each
-    // other's replies.
-    let seed = std::time::SystemTime::now()
+    // other's replies: a process-wide run counter in the top bits, mixed with
+    // the clock so separate processes differ too. The low 16 bits carry seq.
+    static RUN: AtomicU64 = AtomicU64::new(0);
+    let run_id = RUN.fetch_add(1, Ordering::Relaxed);
+    let clock = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64)
-        << 16;
+        .map_or(0, |d| d.as_nanos() as u64);
+    let seed = ((run_id << 48) ^ clock) << 16;
     let mut buf = vec![0u8; 65536];
 
     let mut raw_echo = |seq: u16, buf: &mut [u8]| -> std::io::Result<Option<Duration>> {
@@ -176,6 +184,10 @@ pub fn run(
             let Some(icmp) = buf.get(ihl..n) else {
                 continue;
             };
+            // Only replies from the target (IPv4 source address, bytes 12..16).
+            if buf[..n].get(12..16) != Some(&dest.octets()[..]) {
+                continue;
+            }
             if let Some(reply) = parse_echo_reply(false, icmp) {
                 if reply.ident == ident && reply.seq == seq && reply.nonce == Some(nonce) {
                     return Ok(Some(elapsed));
@@ -185,11 +197,12 @@ pub fn run(
     };
     let api_echo = || -> std::io::Result<(Option<Duration>, Option<u32>)> {
         Ok(match api.echo(IpAddr::V4(dest), &payload, 128, timeout)? {
+            // Same cutoff as the raw side: a reply after the deadline is a loss.
             EchoOutcome::Reply {
                 elapsed,
                 api_rtt_ms,
                 ..
-            } => (Some(elapsed), Some(api_rtt_ms)),
+            } if elapsed <= timeout => (Some(elapsed), Some(api_rtt_ms)),
             _ => (None, None),
         })
     };
@@ -235,9 +248,9 @@ mod tests {
 
     #[test]
     fn percentiles_use_nearest_rank() {
-        let d = Dist::from_us((1..=100).collect()).unwrap();
+        let d = Dist::from_ns((1..=100).collect()).unwrap();
         assert_eq!((d.min, d.median, d.p90, d.p99, d.max), (1, 50, 90, 99, 100));
-        assert_eq!(Dist::from_us(vec![]), None);
+        assert_eq!(Dist::from_ns(vec![]), None);
     }
 
     #[test]
@@ -246,11 +259,11 @@ mod tests {
         let mut pairs: Vec<Pair> = (0..99).map(|i| pair(1300 + i, 1000 + i)).collect();
         pairs.push(pair(1900, 1000));
         let s = Summary::from_pairs(&pairs);
-        assert_eq!(s.diff.unwrap().median, 300);
-        assert_eq!(s.abs_err.unwrap().p99, 300);
-        assert_eq!(s.abs_err.unwrap().max, 900);
+        assert_eq!(s.diff.unwrap().median, 300_000);
+        assert_eq!(s.abs_err.unwrap().p99, 300_000);
+        assert_eq!(s.abs_err.unwrap().max, 900_000);
         assert_eq!(s.abs_err_corrected.unwrap().median, 0);
-        assert_eq!(s.abs_err_corrected.unwrap().max, 600);
+        assert_eq!(s.abs_err_corrected.unwrap().max, 600_000);
     }
 
     #[test]
@@ -281,5 +294,16 @@ mod tests {
         p.api_rtt_ms = Some(7); // 2 ms off
         let s = Summary::from_pairs(&[p, pair(5000, 5000)]);
         assert_eq!(s.api_field_off, 1);
+    }
+
+    #[test]
+    fn sub_microsecond_differences_are_kept() {
+        let p = Pair {
+            api: Some(Duration::from_nanos(1_000_900)),
+            api_rtt_ms: Some(1),
+            raw: Some(Duration::from_nanos(1_000_100)),
+        };
+        let s = Summary::from_pairs(&[p]);
+        assert_eq!(s.diff.unwrap().median, 800);
     }
 }
