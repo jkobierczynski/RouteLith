@@ -111,6 +111,15 @@ impl Summary {
     }
 }
 
+/// Nonce seed for one run: the low 32 bits of the clock (nanoseconds) and
+/// the low 16 bits of a process-wide run counter fill bits 16..64, and the
+/// low 16 bits are left for the sequence number. Runs in one process with
+/// different counters (mod 65536) always get different seeds.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn nonce_seed(run_id: u64, clock_ns: u64) -> u64 {
+    ((run_id & 0xffff) << 48) | ((clock_ns & 0xffff_ffff) << 16)
+}
+
 /// Run `count` calibration pairs against an IPv4 target, `interval` apart.
 /// Blocking; needs Administrator for the raw socket.
 #[cfg(windows)]
@@ -150,7 +159,7 @@ pub fn run(
     let clock = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
-    let seed = ((run_id << 48) ^ clock) << 16;
+    let seed = nonce_seed(run_id, clock);
     let mut buf = vec![0u8; 65536];
 
     let mut raw_echo = |seq: u16, buf: &mut [u8]| -> std::io::Result<Option<Duration>> {
@@ -294,6 +303,17 @@ mod tests {
         p.api_rtt_ms = Some(7); // 2 ms off
         let s = Summary::from_pairs(&[p, pair(5000, 5000)]);
         assert_eq!(s.api_field_off, 1);
+    }
+
+    #[test]
+    fn seeds_differ_per_run_with_the_same_clock() {
+        let a = nonce_seed(0, 123_456_789);
+        let b = nonce_seed(1, 123_456_789);
+        assert_ne!(a, b);
+        // The sequence number's bits stay free.
+        assert_eq!(a & 0xffff, 0);
+        assert_eq!(b & 0xffff, 0);
+        assert_ne!(nonce_seed(0, 1), nonce_seed(0, 2));
     }
 
     #[test]
