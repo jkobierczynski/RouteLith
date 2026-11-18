@@ -47,6 +47,8 @@ pub enum StoreError {
     Corrupt { path: PathBuf, reason: String },
     #[error("invalid round: {0}")]
     InvalidRound(&'static str),
+    #[error("series key {0:?} contains the control character U+001F")]
+    InvalidKey(String),
     #[error("invalid writer options: {0}")]
     InvalidOptions(&'static str),
     #[error("{} is already open by another writer", .0.display())]

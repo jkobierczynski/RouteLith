@@ -406,3 +406,16 @@ fn reader_rejects_a_segment_belonging_to_another_series() {
     assert!(reader.read(ids[0], 0, i64::MAX).is_ok());
     assert!(reader.read(ids[1], 0, i64::MAX).is_err());
 }
+
+#[test]
+fn series_keys_with_the_separator_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut w, _) = Writer::open(dir.path(), WriterOptions::default(), T0).unwrap();
+    let bad = SeriesKey::new("local", "a\u{1f}b", "v4");
+    match w.register(&[bad]) {
+        Err(rl_store::StoreError::InvalidKey(_)) => {}
+        other => panic!("expected InvalidKey, got {other:?}"),
+    }
+    // A refused key is not an I/O failure: the writer keeps working.
+    assert!(w.register(&keys(1)).is_ok());
+}

@@ -91,6 +91,14 @@ fn open(dir: &Path, create: bool) -> Result<Option<Database>, StoreError> {
 
 /// Look up or assign ids for `keys`, in order.
 pub(crate) fn register(dir: &Path, keys: &[SeriesKey]) -> Result<Vec<u64>, StoreError> {
+    // The separator would make two different keys encode the same way.
+    if let Some(bad) = keys.iter().find(|k| {
+        [&k.vantage, &k.target, &k.family]
+            .iter()
+            .any(|f| f.contains(SEP))
+    }) {
+        return Err(StoreError::InvalidKey(bad.to_string()));
+    }
     let db = open(dir, true)?.ok_or_else(|| index_err("index missing"))?;
     let tx = db.begin_write().map_err(index_err)?;
     let mut ids = Vec::with_capacity(keys.len());
