@@ -16,5 +16,8 @@ rl-sched.workspace = true
 rl-store.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

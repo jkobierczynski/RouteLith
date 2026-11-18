@@ -484,6 +484,7 @@ dependencies = [
  "rl-probe",
  "rl-sched",
  "rl-store",
+ "tempfile",
  "tokio",
 ]
 
