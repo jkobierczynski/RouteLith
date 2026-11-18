@@ -26,6 +26,10 @@ DELAY_MS=10
 DELAY_TOL_MS=${DELAY_TOL_MS:-0.1}
 LOSS_PCT=5
 LOSS_TOL_PCT=1.5
+if ! [[ $DELAY_TOL_MS =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "DELAY_TOL_MS must be a non-negative number of milliseconds (got '$DELAY_TOL_MS')" >&2
+    exit 2
+fi
 
 cleanup() {
     ip netns del "$A" 2>/dev/null || true
@@ -87,6 +91,10 @@ ip netns exec "$B" tc qdisc add dev veth-b root netem delay "${DELAY_MS}ms"
 out=$(measure -c 1000 -i 5ms)
 echo "$out"
 delayed=$(median_ms <<<"$out")
+if ! [[ $delayed =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "FAIL  delay measurement produced no median (got '${delayed}')"
+    exit 1
+fi
 expected=$(awk -v b="$base" -v d="$DELAY_MS" 'BEGIN { printf "%.3f", b + d }')
 check delay "$delayed" "$expected" "$DELAY_TOL_MS"
 
@@ -94,7 +102,10 @@ if command -v ping >/dev/null; then
     echo "== reference: iputils ping, same settings"
     ref=$({ ip netns exec "$A" ping -n -c 1000 -i 0.005 -W 1 "$ADDR_B" || true; } |
         sed -n 's/.*time=\([0-9.]*\).*/\1/p' | sort -n |
-        awk '{ v[NR] = $1 } END { if (NR) print v[int((NR + 1) / 2)] }')
+        awk '{ v[NR] = $1 } END {
+            if (NR % 2) print v[(NR + 1) / 2]
+            else if (NR) printf "%.3f\\n", (v[NR / 2] + v[NR / 2 + 1]) / 2
+        }')
     if [[ $ref =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         if awk -v r="$delayed" -v p="$ref" -v t="$DELAY_TOL_MS" 'BEGIN { exit !(r <= p + t) }'; then
             printf 'PASS  vsping measured %s, ping median %s (+ %s allowed)\n' "$delayed" "$ref" "$DELAY_TOL_MS"
