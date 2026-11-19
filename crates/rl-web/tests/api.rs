@@ -316,7 +316,7 @@ async fn metrics_show_the_newest_round() {
         "# TYPE routelith_test_total counter".to_string(),
         "routelith_test_total 7".to_string(),
         // 1.1 ms RTT, 25 % loss: G.711 with PLC loses a lot to loss.
-        format!("routelith_mos_score{{{labels}}} 2.33"),
+        format!("routelith_mos_score{{{labels}}} 2.32"),
     ] {
         assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
     }

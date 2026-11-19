@@ -22,6 +22,10 @@
 pub const PACKET_MS: f64 = 20.0;
 /// G.711 with packet-loss concealment (G.113 Appendix I).
 pub const G711_IE: f64 = 0.0;
+/// G.113 Appendix I gives this for G.711 with Appendix I concealment at
+/// 10 ms packets, and no value for 20 ms ones. A lost 20 ms packet takes
+/// out more speech, so with `PACKET_MS` at 20 this rates loss somewhat
+/// kindly; it is the value commonly used for G.711 with concealment.
 pub const G711_BPL: f64 = 25.1;
 
 /// G.107 default parameters (Table 3).
@@ -83,7 +87,8 @@ pub fn r_factor(delay_ms: f64, loss_pct: f64, ie: f64, bpl: f64) -> f64 {
     // Delay impairments, Id = Idte + Idle + Idd (§7.4).
     let terv =
         TELR - 40.0 * ((1.0 + t / 10.0) / (1.0 + t / 150.0)).log10() + 6.0 * (-0.3 * t * t).exp();
-    let roe = -1.5 * (no + RLR);
+    // Equation 7-20.
+    let roe = -1.5 * (no - RLR);
     let re = 80.0 + 2.5 * (terv - 14.0);
     let idte =
         ((roe - re) / 2.0 + ((roe - re).powi(2) / 4.0 + 100.0).sqrt() - 1.0) * (1.0 - (-t).exp());
@@ -175,11 +180,11 @@ mod tests {
         // which this project's CI cannot reach.
         for (t, r) in [
             (0.0, 93.21),
-            (100.0, 91.08),
-            (150.0, 90.19),
-            (200.0, 86.67),
-            (300.0, 73.93),
-            (400.0, 63.82),
+            (100.0, 90.66),
+            (150.0, 89.54),
+            (200.0, 85.80),
+            (300.0, 72.67),
+            (400.0, 62.25),
         ] {
             let got = r_factor(t, 0.0, 0.0, 1.0);
             assert!(close(got, r, 0.01), "T {t}: {got}");

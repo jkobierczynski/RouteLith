@@ -341,13 +341,13 @@ fn wide(s: &[u16]) -> String {
 
 /// Physical interfaces only: Windows also lists filter, tunnel and other
 /// virtual interfaces that would repeat the same counters.
-fn nic_counters() -> Vec<NicCounters> {
+fn nic_counters() -> Option<Vec<NicCounters>> {
     const HARDWARE_INTERFACE: u8 = 0x1;
     const FILTER_INTERFACE: u8 = 0x2;
     let mut table: *mut MIB_IF_TABLE2 = ptr::null_mut();
     // SAFETY: valid out-pointer; on success the table is freed below.
     if unsafe { GetIfTable2(&mut table) } != NO_ERROR || table.is_null() {
-        return Vec::new();
+        return None;
     }
     // SAFETY: GetIfTable2 succeeded, so `table` points to a MIB_IF_TABLE2
     // followed by `NumEntries` rows, valid until FreeMibTable.
@@ -375,7 +375,7 @@ fn nic_counters() -> Vec<NicCounters> {
         .collect();
     // SAFETY: allocated by GetIfTable2 and not used after this.
     unsafe { FreeMibTable(table.cast()) };
-    nics
+    Some(nics)
 }
 
 fn inet_addr(a: &SOCKADDR_INET) -> Option<IpAddr> {

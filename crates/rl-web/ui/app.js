@@ -119,9 +119,28 @@
 
   function stop() {
     generation++;
-    if (timer) clearInterval(timer);
+    if (timer) clearTimeout(timer);
     timer = null;
     while (observers.length) observers.pop().disconnect();
+  }
+
+  // Refresh the current view now and then every `every` ms, one refresh
+  // at a time: the next is scheduled once this one settles (failed or
+  // not), so an older response never lands after a newer one, and a
+  // failure is retried. Nothing runs or reports once the view is left.
+  function poll(gen, refresh, every) {
+    const tick = () => {
+      if (gen !== generation) return;
+      refresh()
+        .then(
+          () => gen === generation && setStatus("updated " + fmtTime(Date.now())),
+          (e) => gen === generation && setStatus("update failed: " + e.message)
+        )
+        .finally(() => {
+          if (gen === generation) timer = setTimeout(tick, every);
+        });
+    };
+    tick();
   }
 
   async function loadSeries() {
@@ -274,10 +293,8 @@
           (l.mos !== undefined ? "\nMOS " + l.mos.toFixed(2) : "") +
           "\n" + fmtAge(age) + " ago" + (stale ? " (stale)" : "");
       }
-      setStatus("updated " + fmtTime(Date.now()));
     }
-    await refresh();
-    timer = setInterval(() => refresh().catch((e) => setStatus("update failed: " + e.message)), OVERVIEW_REFRESH_MS);
+    poll(gen, refresh, OVERVIEW_REFRESH_MS);
   }
 
   // ---------- target view (§20.2) ----------
@@ -325,16 +342,16 @@
       ...graphs.map((g) => g.root),
       hostPanel
     );
-    await loadHost();
-    await Promise.all(graphs.map((g) => g.load()));
-    if (gen !== generation) return;
-    setStatus("updated " + fmtTime(Date.now()));
-    timer = setInterval(() => {
-      loadHost()
-        .then(() => Promise.all(graphs.map((g) => g.load())))
-        .then(() => setStatus("updated " + fmtTime(Date.now())))
-        .catch((e) => setStatus("update failed: " + e.message));
-    }, GRAPH_REFRESH_MS);
+    // A graph that fails keeps its last data (or its error) while the
+    // others show theirs; the next refresh tries it again.
+    async function refresh() {
+      await loadHost();
+      if (gen !== generation) return;
+      const results = await Promise.allSettled(graphs.map((g) => g.load()));
+      const failed = results.find((r) => r.status === "rejected");
+      if (failed) throw failed.reason;
+    }
+    poll(gen, refresh, GRAPH_REFRESH_MS);
   }
 
   // Health of a vantage at time t: the bucket holding t and the network
@@ -418,8 +435,15 @@
     let layout = null;
 
     async function load() {
+      if (gen !== generation) return;
       const width = Math.max(200, Math.round(canvas.clientWidth || 800));
-      const d = await getJson("/api/v1/series/" + s.id + "/data?range=" + range + "&points=" + Math.min(5000, width));
+      let d;
+      try {
+        d = await getJson("/api/v1/series/" + s.id + "/data?range=" + range + "&points=" + Math.min(5000, width));
+      } catch (e) {
+        if (gen === generation && !data) summary.textContent = "Could not load: " + e.message;
+        throw e;
+      }
       if (gen !== generation) return;
       data = d;
       draw();
@@ -456,6 +480,7 @@
           (mos !== null ? " · MOS " + mos.toFixed(2) : "") + " · " + rounds + " rounds · " + res
         : "No data in this range yet.";
       canvas.dataset.points = String(pts.length);
+      canvas.dataset.range = range;
     }
 
     function draw() {
@@ -646,7 +671,10 @@
       ro.observe(canvas);
       observers.push(ro);
     }
-    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
+    // Removed with the view, so a retired graph is not kept alive.
+    const theme = window.matchMedia("(prefers-color-scheme: dark)");
+    theme.addEventListener("change", draw);
+    observers.push({ disconnect: () => theme.removeEventListener("change", draw) });
     return { root, load };
   }
 

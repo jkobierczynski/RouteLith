@@ -41,7 +41,7 @@ use std::path::PathBuf;
 
 pub use health::{HealthLog, HealthSample, NicDelta, read_health};
 pub use index::SeriesKey;
-pub use reader::{Reader, Resolution, VerifyReport};
+pub use reader::{GraphRounds, Reader, Resolution, VerifyReport};
 pub use rollup::{GRAPH_SAMPLES, QUANTILES, RollupPoint, Tier, quantiles};
 pub use round::{ErrorCounts, FLAG_CLOCK_STEP, StoredRound};
 pub use writer::{Appended, Recovery, Writer, WriterOptions, WriterStats};
@@ -66,8 +66,9 @@ pub enum StoreError {
     /// An earlier write failed; reopen the directory to recover.
     #[error("store stopped after an earlier error ({0}); restart to recover")]
     Stopped(String),
-    /// Retention deleted a segment while it was being read; reading again
-    /// finds its day in the rollups.
-    #[error("{} was deleted by retention during the read", .0.display())]
+    /// Rollup or retention changed `.0` while it was being read, so the
+    /// read may be incomplete. Reading again sees the new state, which may
+    /// hold less history than before.
+    #[error("{} changed during the read", .0.display())]
     Expired(PathBuf),
 }

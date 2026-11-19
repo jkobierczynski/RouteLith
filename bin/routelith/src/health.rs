@@ -40,19 +40,26 @@ fn run(
     stop: &Receiver<()>,
     now_ms: fn() -> i64,
 ) {
-    let mut log = match HealthLog::open(data_dir, vantage, KEEP_DAYS) {
-        Ok(l) => Some(l),
-        Err(e) => {
-            eprintln!("routelith server: health snapshots will not be stored: {e}");
-            None
-        }
-    };
+    let mut log: Option<HealthLog> = None;
+    // One message per change between storing and not storing.
     let mut failing = false;
     let mut prev: Option<(HostReading, i64)> = None;
     loop {
         let t = now_ms();
         let cur = rl_sys::host::read();
         let s = sample(prev.as_ref().map(|(r, t)| (r, *t)), &cur, t);
+        // Opened (again) each minute until it works: a full disk or a
+        // permission fixed later lets history resume without a restart.
+        if log.is_none() {
+            match HealthLog::open(data_dir, vantage, KEEP_DAYS) {
+                Ok(l) => log = Some(l),
+                Err(e) if !failing => {
+                    eprintln!("routelith server: cannot store health snapshots: {e}");
+                    failing = true;
+                }
+                Err(_) => {}
+            }
+        }
         if let Some(log) = &mut log {
             match log.append(&s) {
                 Ok(()) if failing => {
@@ -69,9 +76,9 @@ fn run(
         }
         latest.record(HostHealth {
             sample: s,
-            nics: cur.nics.iter().map(total).collect(),
+            nics: cur.nics.iter().flatten().map(total).collect(),
         });
-        prev = Some((cur, t));
+        prev = Some((baseline(prev.map(|(r, _)| r), cur), t));
         // Sleep to the next whole minute (UTC), so samples line up across
         // machines and restarts.
         let wait = MINUTE_MS - now_ms().rem_euclid(MINUTE_MS);
@@ -99,6 +106,16 @@ fn grew(prev: u64, cur: u64) -> u64 {
     if cur >= prev { cur - prev } else { cur }
 }
 
+/// The reading the next sample counts from: `cur`, but with the last
+/// NIC counters that could be read when `cur` has none, so growth while
+/// they were unreadable shows up once they are back.
+fn baseline(prev: Option<HostReading>, mut cur: HostReading) -> HostReading {
+    if cur.nics.is_none() {
+        cur.nics = prev.and_then(|p| p.nics);
+    }
+    cur
+}
+
 /// The sample for the interval from `prev` to `cur` at `t`. Without a
 /// previous reading only the gateways, DNS servers and load are known.
 pub(crate) fn sample(prev: Option<(&HostReading, i64)>, cur: &HostReading, t: i64) -> HealthSample {
@@ -121,10 +138,15 @@ pub(crate) fn sample(prev: Option<(&HostReading, i64)>, cur: &HostReading, t: i6
             s.cpu_pct = Some((pct * 10.0).round() / 10.0);
         }
     }
+    // Unknown, not zero, while the counters cannot be read (now or at the
+    // baseline).
+    let (Some(prev_nics), Some(cur_nics)) = (&prev.nics, &cur.nics) else {
+        return s;
+    };
     let (mut errors, mut drops) = (0, 0);
-    for n in &cur.nics {
+    for n in cur_nics {
         // An interface that just appeared has no baseline yet.
-        let Some(p) = prev.nics.iter().find(|p| p.name == n.name) else {
+        let Some(p) = prev_nics.iter().find(|p| p.name == n.name) else {
             continue;
         };
         let e = grew(p.rx_errors, n.rx_errors) + grew(p.tx_errors, n.tx_errors);
@@ -162,7 +184,7 @@ mod tests {
         HostReading {
             cpu: Some(CpuTimes { busy, total }),
             load1: Some(0.75),
-            nics,
+            nics: Some(nics),
             gateways: vec![gw.parse().unwrap()],
             dns_servers: vec!["192.0.2.53".parse().unwrap()],
         }
@@ -212,6 +234,21 @@ mod tests {
             ]
         );
         assert_eq!(s.gateways[0].to_string(), "192.0.2.254");
+    }
+
+    #[test]
+    fn unreadable_nic_counters_are_unknown_and_keep_the_baseline() {
+        let a = reading(0, 100, vec![nic("eth0", 5, 0)], "192.0.2.1");
+        let mut gone = reading(10, 200, Vec::new(), "192.0.2.1");
+        gone.nics = None;
+        let s = sample(Some((&a, 0)), &gone, 60_000);
+        assert_eq!((s.nic_errors, s.nic_drops), (None, None));
+        assert_eq!(s.cpu_pct, Some(10.0));
+        // Back: the ten errors since the last good reading are counted.
+        let base = baseline(Some(a), gone);
+        let c = reading(20, 300, vec![nic("eth0", 15, 0)], "192.0.2.1");
+        let s = sample(Some((&base, 60_000)), &c, 120_000);
+        assert_eq!(s.nic_errors, Some(10));
     }
 
     #[test]

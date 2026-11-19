@@ -89,6 +89,7 @@ fn check(name: &str, range_ms: i64) {
             step_ms: Some(STEP_MS),
             width: Graph::DEFAULT_WIDTH,
             height: Graph::DEFAULT_HEIGHT,
+            totals: None,
         },
     );
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

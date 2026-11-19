@@ -36,6 +36,18 @@ pub enum Resolution {
     Rollup(Tier),
 }
 
+/// What [`Reader::read_graph`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRounds {
+    pub resolution: Resolution,
+    /// For rollups, one synthetic round per point, each scaled on its own:
+    /// their counts keep each point's loss ratio, not the range's totals.
+    pub rounds: Vec<StoredRound>,
+    /// Pings sent and replies received over the whole range, unscaled.
+    pub sent: u64,
+    pub received: u64,
+}
+
 /// Step assumed for a series with none recorded (the config default).
 const DEFAULT_STEP_MS: u64 = 300_000;
 /// Attempts at a read that retention or a roll-up changes under it.
@@ -132,8 +144,13 @@ impl Reader {
         let raw_from = from_ms.max(rolled_until);
         if raw_from <= to_ms {
             // Start at a bucket boundary, so the first bucket is whole.
-            let start = raw_from.div_euclid(tier.width_ms()) * tier.width_ms();
+            let start = raw_from.saturating_sub(raw_from.rem_euclid(tier.width_ms()));
             let rounds = self.read(series, start, to_ms)?;
+            // A day rolled up and expired from raw during that read is in
+            // neither part.
+            if rollup::last_rolled_day(&self.dir, series)? != last {
+                return Err(StoreError::Expired(layout::raw_dir(&self.dir, series)));
+            }
             out.retain(|p| p.ts_ms < start);
             // The same bound as the stored points: a point's start is in
             // the range.
@@ -167,14 +184,17 @@ impl Reader {
         })
     }
 
-    /// Whether raw rounds hold the whole range: back to its start, or
-    /// there is nothing rolled up to use instead.
+    /// Whether raw rounds hold the whole range: back to its start, or the
+    /// range starts after the last day rolled up. Retention deletes only
+    /// rolled-up days, so later rounds are all in segments or the WAL,
+    /// even when no segment is left.
     fn raw_complete(&self, series: u64, from_ms: i64) -> Result<bool, StoreError> {
         let oldest_raw = layout::list_segments(&self.dir, series)?
             .first()
-            .map(|s| s.day * layout::DAY_MS);
+            .map(|s| s.day.saturating_mul(layout::DAY_MS));
         Ok(oldest_raw.is_some_and(|o| from_ms >= o)
-            || rollup::last_rolled_day(&self.dir, series)?.is_none())
+            || rollup::last_rolled_day(&self.dir, series)?
+                .is_none_or(|d| from_ms >= d.saturating_add(1).saturating_mul(layout::DAY_MS)))
     }
 
     /// After a raw read: retention may have deleted the oldest raw day
@@ -214,20 +234,32 @@ impl Reader {
         series: u64,
         from_ms: i64,
         to_ms: i64,
-    ) -> Result<(Resolution, Vec<StoredRound>), StoreError> {
+    ) -> Result<GraphRounds, StoreError> {
         retry(|| {
             if self.raw_complete(series, from_ms)? {
                 let rounds = self.read(series, from_ms, to_ms)?;
                 self.still_raw(series, from_ms)?;
-                return Ok((Resolution::Raw, rounds));
+                let sent = rounds.iter().map(|r| u64::from(r.sent)).sum();
+                let received = rounds.iter().map(|r| r.rtts_us.len() as u64).sum();
+                return Ok(GraphRounds {
+                    resolution: Resolution::Raw,
+                    rounds,
+                    sent,
+                    received,
+                });
             }
             let tier = self.covering_tier(series, Tier::R1h, from_ms)?;
             let points = self.read_tier_once(series, tier, from_ms, to_ms)?;
             self.still_tier(series, Tier::R1h, tier, from_ms)?;
-            Ok((
-                Resolution::Rollup(tier),
-                points.iter().map(RollupPoint::to_round).collect(),
-            ))
+            Ok(GraphRounds {
+                resolution: Resolution::Rollup(tier),
+                rounds: points.iter().map(RollupPoint::to_round).collect(),
+                sent: points.iter().map(|p| u64::from(p.sent)).sum(),
+                received: points
+                    .iter()
+                    .map(|p| u64::from(p.received.min(p.sent)))
+                    .sum(),
+            })
         })
     }
 
@@ -246,25 +278,34 @@ impl Reader {
         let step = i64::try_from(self.step_ms(series).unwrap_or(DEFAULT_STEP_MS))
             .unwrap_or(i64::MAX)
             .max(1);
-        let limit = i64::from(max_points.max(1)) * 2;
+        let n = i64::from(max_points.max(1));
+        let limit = n * 2;
+        // Ceiling division of positive values, without the overflow of
+        // `(a + b - 1) / b`.
+        let ceil_div = |a: i64, b: i64| a / b + i64::from(a % b != 0);
         retry(|| {
             if self.raw_complete(series, from_ms)? {
                 let rounds_in_span = span / step;
                 if rounds_in_span <= limit {
                     let rounds = self.read(series, from_ms, to_ms)?;
                     self.still_raw(series, from_ms)?;
-                    return Ok((
-                        Resolution::Raw,
-                        rounds.iter().map(RollupPoint::from_round).collect(),
-                    ));
+                    // The recorded step is the current one: older rounds
+                    // may be denser. Too many go into buckets below.
+                    if rounds.len() as u64 <= limit.unsigned_abs() {
+                        return Ok((
+                            Resolution::Raw,
+                            rounds.iter().map(RollupPoint::from_round).collect(),
+                        ));
+                    }
                 }
-                // About `max_points` buckets of whole steps.
-                let per_bucket = (rounds_in_span + i64::from(max_points.max(1)) - 1)
-                    / i64::from(max_points.max(1));
-                let width = step.saturating_mul(per_bucket);
+                // About `max_points` buckets of whole steps, and never
+                // more than that whatever the rounds' real spacing.
+                let width = step
+                    .saturating_mul(ceil_div(rounds_in_span, n))
+                    .max(ceil_div(span, n));
                 if width < Tier::R1h.width_ms() {
                     // Whole buckets: start at a boundary before `from_ms`.
-                    let start = from_ms.div_euclid(width) * width;
+                    let start = from_ms.saturating_sub(from_ms.rem_euclid(width));
                     let rounds = self.read(series, start, to_ms)?;
                     self.still_raw(series, from_ms)?;
                     return Ok((
