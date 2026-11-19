@@ -19,6 +19,9 @@ rl-sys.workspace = true
 rl-web.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-service.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

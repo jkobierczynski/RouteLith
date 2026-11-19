@@ -1,0 +1,60 @@
+# Routelith server as a systemd service (architecture doc §21.3).
+#
+# Install:
+#   install -m 0755 routelith /usr/bin/routelith
+#   install -m 0644 -D examples/routelith.toml /etc/routelith/routelith.toml
+#   install -m 0644 packaging/linux/routelith.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now routelith
+#
+# The server runs as a transient user (DynamicUser) that can write only its
+# state directory, /var/lib/routelith; keep data_dir = "/var/lib/routelith"
+# in the configuration. ICMP uses unprivileged ping sockets, which need the
+# service's group inside net.ipv4.ping_group_range. systemd's own sysctl
+# defaults allow every group; if yours do not, install
+# 60-routelith-ping.conf (see that file). Raw sockets are not used, so the
+# service needs no capabilities.
+
+[Unit]
+Description=Routelith network latency monitor
+Documentation=https://github.com/jkobierczynski/RouteLith
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/routelith server --config /etc/routelith/routelith.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+DynamicUser=yes
+StateDirectory=routelith
+StateDirectoryMode=0750
+ConfigurationDirectory=routelith
+UMask=0027
+
+# No privileges and a read-only system apart from the state directory.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

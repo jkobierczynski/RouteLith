@@ -35,16 +35,32 @@ const SYNC_EVERY: Duration = Duration::from_secs(1);
 pub(crate) struct ServerArgs {
     /// Path to the TOML configuration file.
     #[arg(short, long)]
-    config: PathBuf,
+    pub(crate) config: PathBuf,
     /// Seconds between stats lines on stderr (0: only at exit; at most a day).
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(0..=86_400))]
-    stats_interval: u64,
+    pub(crate) stats_interval: u64,
 }
 
 /// Exit codes: 0 after a clean shutdown, 1 invalid configuration,
 /// 2 cannot start (unreadable file, store, privileges), or the store failed
 /// or rejected rounds while running.
 pub(crate) async fn run(args: ServerArgs) -> ExitCode {
+    // Install the signal handlers before any work starts, so a SIGTERM
+    // right after start-up still shuts down cleanly.
+    match shutdown_signal() {
+        Ok(signal) => serve(args, signal).await,
+        Err(e) => {
+            eprintln!("routelith server: cannot listen for shutdown signals: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Run until `stop` completes (a signal, or the Windows service manager).
+pub(crate) async fn serve(
+    args: ServerArgs,
+    signal: impl std::future::Future<Output = ()>,
+) -> ExitCode {
     let cfg = match load(&args.config) {
         Ok(cfg) => cfg,
         Err(code) => return code,
@@ -96,10 +112,20 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
         match Writer::open(&cfg.server.data_dir, WriterOptions::default(), now_ms()) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!(
-                    "routelith server: cannot open {}: {e}",
-                    cfg.server.data_dir.display()
-                );
+                let dir = &cfg.server.data_dir;
+                if dir.is_absolute() {
+                    eprintln!("routelith server: cannot open {}: {e}", dir.display());
+                } else {
+                    // Say where a relative path ended up: under a service
+                    // the working directory is not the config's folder.
+                    let full = std::path::absolute(dir).unwrap_or_else(|_| dir.clone());
+                    eprintln!(
+                        "routelith server: cannot open {} (relative to the working \
+                         directory, so {}): {e}; set server.data_dir to an absolute path",
+                        dir.display(),
+                        full.display()
+                    );
+                }
                 return ExitCode::from(2);
             }
         };
@@ -177,16 +203,6 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
                 extra_metrics: Some(extra_metrics(stats.clone(), store_stats.clone())),
             };
             Some((addr, listener, rl_web::router(Arc::new(state))))
-        }
-    };
-
-    // Install the signal handlers before any work starts, so a SIGTERM
-    // right after start-up still shuts down cleanly.
-    let signal = match shutdown_signal() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("routelith server: cannot listen for shutdown signals: {e}");
-            return ExitCode::from(2);
         }
     };
 
