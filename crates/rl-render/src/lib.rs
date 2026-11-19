@@ -106,7 +106,7 @@ impl Bucket {
 
 /// Buckets of the graph, plus their width in ms.
 fn buckets(rounds: &[Round<'_>], g: &Graph<'_>, plot_width: f64) -> (Vec<BucketAcc>, i64) {
-    let range = (g.to_ms - g.from_ms).max(1);
+    let range = g.to_ms.saturating_sub(g.from_ms).max(1);
     let step = g.step_ms.unwrap_or_else(|| infer_step(rounds)).max(1);
     // Wide enough that buckets are at least a pixel and hold whole rounds.
     #[allow(clippy::cast_possible_truncation)]
@@ -232,7 +232,7 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     );
     let (w, h) = (f64::from(width), f64::from(height));
     let (pw, ph) = (w - LEFT - RIGHT, h - TOP - BOTTOM);
-    let range = (g.to_ms - g.from_ms).max(1) as f64;
+    let range = g.to_ms.saturating_sub(g.from_ms).max(1) as f64;
     let (accs, bucket_ms) = buckets(rounds, g, pw);
     let buckets: Vec<Bucket> = accs
         .into_iter()
@@ -263,7 +263,7 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     let tick = nice_step(top * 1.1, 4.0);
     let y_max = (top * 1.1 / tick).ceil() * tick;
 
-    let x = |ms: i64| LEFT + ((ms - g.from_ms) as f64 / range) * pw;
+    let x = |ms: i64| LEFT + (ms.saturating_sub(g.from_ms) as f64 / range) * pw;
     let y = |v: f64| TOP + ph - (v.min(y_max) / y_max) * ph;
 
     let mut s = svg::Doc::new(width, height);
@@ -291,13 +291,18 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
         v += tick;
     }
     // X grid and labels.
-    let (xstep, label): (i64, fn(i64) -> String) = x_ticks(g.to_ms - g.from_ms);
-    let mut t = g.from_ms.div_euclid(xstep) * xstep + xstep;
-    while t < g.to_ms {
-        let xx = x(t);
+    let (xstep, label): (i64, fn(i64) -> String) = x_ticks(g.to_ms.saturating_sub(g.from_ms));
+    // Checked: times near the ends of i64 must stop the loop, not wrap.
+    let mut t = g
+        .from_ms
+        .div_euclid(xstep)
+        .checked_mul(xstep)
+        .and_then(|t| t.checked_add(xstep));
+    while let Some(tick) = t.filter(|&tick| tick < g.to_ms) {
+        let xx = x(tick);
         s.line(xx, TOP, xx, TOP + ph, "stroke=\"#e0e0e0\"");
-        s.text(xx, TOP + ph + 16.0, "middle", "", &label(t));
-        t += xstep;
+        s.text(xx, TOP + ph + 16.0, "middle", "", &label(tick));
+        t = tick.checked_add(xstep);
     }
 
     // Columns.
@@ -573,6 +578,26 @@ mod tests {
         assert!(!bands.is_empty());
         for (x, _, w, _) in bands {
             assert!(x >= LEFT && x + w <= right + 0.05, "{x} + {w}");
+        }
+    }
+
+    #[test]
+    fn times_at_the_ends_of_i64_do_not_wrap() {
+        for (from_ms, to_ms) in [
+            (i64::MAX - 3 * 3_600_000, i64::MAX),
+            (i64::MIN, i64::MIN + 3 * 3_600_000),
+            (i64::MIN, i64::MAX),
+        ] {
+            let g = Graph {
+                title: "t",
+                from_ms,
+                to_ms,
+                step_ms: Some(300_000),
+                width: Graph::DEFAULT_WIDTH,
+                height: Graph::DEFAULT_HEIGHT,
+            };
+            let svg = render(&[], &g);
+            assert!(svg.len() < 100_000, "{} bytes", svg.len());
         }
     }
 
