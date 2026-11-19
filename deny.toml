@@ -4,6 +4,28 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+# hickory-proto 0.25 is the last release for our 1.85 MSRV; every fix
+# below is in 0.26.2 (Rust 1.88) or hickory-net. Each ignore says why the
+# affected code is not reachable from Routelith. Drop them all when moving
+# to 0.26.
+ignore = [
+    { id = "RUSTSEC-2026-0118", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0504", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0505", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0511", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0512", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0530", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0531", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0532", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0549", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0550", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0551", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0487", reason = "zone-file / record-text parsing: Routelith never parses DNS records from text, only decodes the wire format" },
+    { id = "RUSTSEC-2026-0489", reason = "zone-file / record-text parsing: Routelith never parses DNS records from text, only decodes the wire format" },
+    { id = "RUSTSEC-2026-0490", reason = "zone-file / record-text parsing: Routelith never parses DNS records from text, only decodes the wire format" },
+    { id = "RUSTSEC-2026-0119", reason = "name-compression cost grows with the records encoded; Routelith only encodes its own one-question query" },
+    { id = "RUSTSEC-2026-0491", reason = "header counts are checked against the message length before decoding (rl-probe dns::counts_fit)" },
+]
 
 [licenses]
 # Licences compatible with GPL-3.0-or-later.

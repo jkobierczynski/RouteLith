@@ -14,7 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Args;
 use rl_core::config::{self, Config, Family, ProbeConfig};
-use rl_probe::{IcmpConfig, IcmpProbe, Probe, RateLimiter, TcpConfig, TcpProbe};
+use rl_probe::{
+    DnsProbe, IcmpConfig, IcmpProbe, Probe, ProbeError, RateLimiter, TcpConfig, TcpProbe,
+};
 use rl_sched::{Completed, FailCause, Job, Outcome, Sink, Snapshot, Stats};
 use rl_store::{Appended, ErrorCounts, SeriesKey, StoredRound, Writer, WriterOptions};
 use tokio::sync::watch;
@@ -151,10 +153,16 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut jobs = tokio::task::JoinSet::new();
     for (plan, series) in plans.into_iter().zip(ids) {
-        let probe = probes
-            .entry(plan.probe)
-            .or_insert_with(|| make_probe(plan.probe, &limiter))
-            .clone();
+        let probe = match probes.get(&plan.probe) {
+            Some(p) => p.clone(),
+            None => match make_probe(&plan.probe, &limiter) {
+                Ok(p) => probes.entry(plan.probe.clone()).or_insert(p).clone(),
+                Err(e) => {
+                    eprintln!("routelith server: target {}: {e}", plan.target);
+                    return ExitCode::from(1);
+                }
+            },
+        };
         let job = Job {
             // Only ICMP depends on this process's socket permissions.
             v6_usable: usable[1] || !matches!(plan.probe, ProbeConfig::Icmp { .. }),
@@ -300,15 +308,18 @@ struct SeriesPlan {
 
 /// One probe instance per distinct probe configuration, all sharing the
 /// packets-per-second ceiling.
-fn make_probe(cfg: ProbeConfig, limiter: &Arc<RateLimiter>) -> Arc<dyn Probe> {
-    match cfg {
-        ProbeConfig::Tcp { port, mode } => {
+fn make_probe(cfg: &ProbeConfig, limiter: &Arc<RateLimiter>) -> Result<Arc<dyn Probe>, ProbeError> {
+    Ok(match cfg {
+        &ProbeConfig::Tcp { port, mode } => {
             Arc::new(TcpProbe::new(TcpConfig { port, mode }).with_rate_limiter(limiter.clone()))
         }
-        ProbeConfig::Icmp { payload_size } => {
+        &ProbeConfig::Icmp { payload_size } => {
             Arc::new(IcmpProbe::new(IcmpConfig { payload_size }).with_rate_limiter(limiter.clone()))
         }
-    }
+        ProbeConfig::Dns(d) => {
+            Arc::new(DnsProbe::new(d.clone())?.with_rate_limiter(limiter.clone()))
+        }
+    })
 }
 
 /// Targets as series: a `both` target measures v4 and v6 separately.
@@ -327,7 +338,7 @@ fn series_plans(cfg: &Config) -> Vec<SeriesPlan> {
                 host: t.host.clone(),
                 family,
                 schedule: t.schedule,
-                probe: t.probe,
+                probe: t.probe.clone(),
             });
         }
     }

@@ -6,9 +6,9 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use clap::Args;
-use rl_core::config::TcpMode;
+use rl_core::config::{DNS_QTYPES, DNS_RCODES, DnsConfig, DnsTransport, TcpMode};
 use rl_core::{ResolvedTarget, RoundPlan, RoundResult, RoundStats, Sample, SampleError};
-use rl_probe::{IcmpConfig, IcmpProbe, Probe, TcpConfig, TcpProbe};
+use rl_probe::{DnsProbe, IcmpConfig, IcmpProbe, Probe, TcpConfig, TcpProbe};
 
 #[derive(Debug, Args)]
 pub(crate) struct IcmpArgs {
@@ -29,6 +29,44 @@ pub(crate) struct TcpArgs {
     /// Time until the server's first byte (SSH, SMTP) instead of the handshake.
     #[arg(long)]
     banner: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DnsArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// Name to query; `{rand}` becomes a random label per sample.
+    query: String,
+    /// Record type.
+    #[arg(short = 't', long = "type", default_value = "A", value_parser = upper_in(DNS_QTYPES))]
+    qtype: String,
+    /// Server port.
+    #[arg(short, long, default_value_t = 53, value_parser = clap::value_parser!(u16).range(1..))]
+    port: u16,
+    /// Query over TCP (a new connection per sample) instead of UDP.
+    #[arg(long)]
+    tcp: bool,
+    /// Clear the recursion-desired bit.
+    #[arg(long)]
+    no_recurse: bool,
+    /// Response code that counts as success.
+    #[arg(long, default_value = "NOERROR", value_parser = upper_in(DNS_RCODES))]
+    expect_rcode: String,
+    /// Expected answer (repeat for a set); other answers are mismatches.
+    #[arg(long = "expect")]
+    expect_answers: Vec<String>,
+}
+
+/// A clap parser accepting one of `allowed`, case-insensitively, as upper case.
+fn upper_in(allowed: &'static [&'static str]) -> impl Fn(&str) -> Result<String, String> + Clone {
+    move |s: &str| {
+        let up = s.to_ascii_uppercase();
+        if allowed.contains(&up.as_str()) {
+            Ok(up)
+        } else {
+            Err(format!("expected one of {}", allowed.join(", ")))
+        }
+    }
 }
 
 /// Arguments every probe takes.
@@ -92,6 +130,43 @@ pub(crate) async fn tcp(args: TcpArgs) -> ExitCode {
             "TCP {} ({}) port {port}: {} samples, {what}",
             t.name,
             r.meta.resolved,
+            r.samples.len(),
+        )
+    })
+    .await
+}
+
+pub(crate) async fn dns(args: DnsArgs) -> ExitCode {
+    let transport = if args.tcp {
+        DnsTransport::Tcp
+    } else {
+        DnsTransport::Udp
+    };
+    let cfg = DnsConfig {
+        port: args.port,
+        query: args.query.clone(),
+        qtype: args.qtype.clone(),
+        transport,
+        recursion: !args.no_recurse,
+        expect_rcode: args.expect_rcode.clone(),
+        expect_answers: (!args.expect_answers.is_empty()).then(|| args.expect_answers.clone()),
+    };
+    let probe = match DnsProbe::new(cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("routelith check: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    run(&args.common, &probe, |t, r| {
+        format!(
+            "DNS {} {} @{} ({}) port {} over {}: {} samples",
+            args.qtype,
+            args.query,
+            t.name,
+            r.meta.resolved,
+            args.port,
+            transport.as_str(),
             r.samples.len(),
         )
     })

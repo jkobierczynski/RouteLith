@@ -18,6 +18,8 @@ rl-sched = { path = "crates/rl-sched" }
 rl-store = { path = "crates/rl-store" }
 rl-render = { path = "crates/rl-render" }
 crc32c = "0.6"
+# 0.26 needs Rust 1.88, above the 1.85 MSRV.
+hickory-proto = { version = "0.25.2", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 proptest = "1.11"

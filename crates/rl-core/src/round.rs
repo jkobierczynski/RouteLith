@@ -73,6 +73,9 @@ pub enum SampleError {
     /// is closed. The time until the refusal is kept (§4.3).
     #[error("connection refused after {:.3} ms", f64::from(*rtt_us) / 1000.0)]
     Refused { rtt_us: u32 },
+    /// A DNS server answered, but not with the expected rcode or answer set.
+    #[error("unexpected DNS answer: {0}")]
+    DnsMismatch(String),
     /// The request never left this host (socket error, resource limit).
     #[error("send failed: {0}")]
     SendFailed(String),

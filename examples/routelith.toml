@@ -1,4 +1,4 @@
-# Example Routelith configuration (ICMP and TCP targets).
+# Example Routelith configuration (ICMP, TCP and DNS targets).
 # Check it with: routelith ctl verify examples/routelith.toml
 
 [server]
@@ -15,7 +15,8 @@ pings   = 20       # samples per round
 # size    = 56     # ICMP payload bytes
 # family  = "v4"   # v4, v6, both (two series) or prefer-v6
 # Each target measures ICMP echo unless it sets probe = "tcp" (connect time to
-# its port; mode = "banner" times the server's first byte instead).
+# its port; mode = "banner" times the server's first byte instead) or
+# probe = "dns" (one query per sample to server; see the dns-quad9-query target).
 
 [[group]]
 name = "Core"
@@ -43,3 +44,10 @@ pings = 10
   host  = "1.1.1.1"
   probe = "tcp"
   port  = 443
+
+  [[group.target]]
+  name   = "dns-quad9-query"
+  probe  = "dns"
+  server = "9.9.9.9"
+  query  = "{rand}.example.com"   # a fresh label per sample defeats caches
+  expect_rcode = "NXDOMAIN"
