@@ -119,12 +119,20 @@ mod tests {
                 g > 100 && g > r + 50 && g > b + 50
             })
             .count();
-        let grey = pixels
-            .iter()
-            .filter(|p| p[0] == p[1] && p[1] == p[2] && (60..230).contains(&p[0]))
-            .count();
         assert!(green > 20, "median lines ({green} px)");
-        assert!(grey > 2_000, "smoke ({grey} px)");
+        // Smoke: the same graph without its smoke group, so the border,
+        // grid and labels (grey too) are in both and cancel out.
+        let svg = graph_svg();
+        let start = svg.find("<g fill=\"#000000\">").expect("a smoke group");
+        let end = start + svg[start..].find("</g>\n").unwrap() + "</g>\n".len();
+        let bare = format!("{}{}", &svg[..start], &svg[end..]);
+        let (_, _, without) = decode(&svg_to_png(&bare, 1.0).unwrap());
+        let smoke = px
+            .chunks(4)
+            .zip(without.chunks(4))
+            .filter(|(a, b)| a[0] == a[1] && a[1] == a[2] && i32::from(a[0]) + 20 < i32::from(b[0]))
+            .count();
+        assert!(smoke > 2_000, "smoke ({smoke} px)");
         // Text: the title's top-left corner has dark pixels from glyphs.
         let dark_top = pixels[..(w as usize * 30)]
             .iter()
