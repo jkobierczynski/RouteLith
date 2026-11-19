@@ -9,8 +9,8 @@
   60 s; the count resets after a day). The configuration, data and log in
   %ProgramData%\Routelith are kept on uninstall and upgrade.
 
-  Build: cargo wix -p routelith (needs the WiX Toolset 3; the WixUtilExtension
-  arguments come from [package.metadata.wix] in Cargo.toml).
+  Build: cargo wix -p routelith (needs the WiX Toolset 3; cargo-wix always
+  adds the WixUIExtension and WixUtilExtension).
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
      xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">

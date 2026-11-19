@@ -27,8 +27,3 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
-
-# MSI: `cargo wix -p routelith` builds wix/main.wxs (WiX Toolset 3).
-[package.metadata.wix]
-compiler-args = ["-ext", "WixUtilExtension"]
-linker-args = ["-ext", "WixUtilExtension"]
