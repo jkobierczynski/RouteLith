@@ -618,13 +618,15 @@ mod tests {
             assert!(svg.len() < 100_000, "{} bytes", svg.len());
         }
         // Populated: a round at each end and one at 0, over the whole i64
-        // range and a wide one that reaches the tick loop.
-        let rtts = [1_000u32];
-        for (from_ms, to_ms) in [(i64::MIN, i64::MAX), (-1, i64::MAX)] {
+        // range and a wide one that reaches the tick loop. Two replies per
+        // round, so each column has a smoke band to draw.
+        let rtts = [1_000u32, 3_000];
+        let width = f64::from(Graph::DEFAULT_WIDTH);
+        for (from_ms, to_ms, lo, hi) in [(i64::MIN, i64::MAX, 0.2, 0.8), (-1, i64::MAX, 0.0, 0.2)] {
             let rounds: Vec<Round<'_>> = [from_ms, 0, to_ms]
                 .map(|ts_ms| Round {
                     ts_ms,
-                    sent: 1,
+                    sent: 2,
                     rtts_us: &rtts,
                 })
                 .to_vec();
@@ -639,13 +641,13 @@ mod tests {
             let svg = render(&rounds, &g);
             let grid = svg.matches("stroke=\"#e0e0e0\"").count();
             assert!(grid < 2 * MAX_X_TICKS as usize, "{grid} grid lines");
-            // The round at 0 is drawn in the plot, not at its right edge.
-            let width = f64::from(Graph::DEFAULT_WIDTH);
+            // The round at 0 sits mid-plot over the whole range and at the
+            // left edge from -1, never wrapped to the right.
             assert!(
                 rects(&svg)
                     .iter()
-                    .any(|&(x, ..)| x > width * 0.2 && x < width * 0.8),
-                "no column in the middle"
+                    .any(|&(x, ..)| x > width * lo && x < width * hi),
+                "no column in {lo}..{hi} of the width for {from_ms}..{to_ms}"
             );
         }
     }
