@@ -76,10 +76,48 @@ pub struct TargetConfig {
     pub host: String,
     pub family: Family,
     pub schedule: Schedule,
-    /// ICMP payload bytes.
-    pub payload_size: u16,
+    /// What is measured and the probe's own settings.
+    pub probe: ProbeConfig,
     /// 1-based line of the target's table, for messages.
     pub line: usize,
+}
+
+/// The probe of a target and its settings (architecture doc §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProbeConfig {
+    /// ICMP echo with this many payload bytes.
+    Icmp { payload_size: u16 },
+    /// TCP connect time to `port` (§4.3).
+    Tcp { port: u16, mode: TcpMode },
+}
+
+impl ProbeConfig {
+    /// The `probe` value that selects this probe.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Icmp { .. } => "icmp",
+            Self::Tcp { .. } => "tcp",
+        }
+    }
+}
+
+/// What a TCP sample times (§4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TcpMode {
+    /// From `connect()` until the handshake completes.
+    #[default]
+    Connect,
+    /// From `connect()` until the server's first byte (SSH, SMTP banners).
+    Banner,
+}
+
+impl TcpMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Banner => "banner",
+        }
+    }
 }
 
 /// When and how often a target is measured.
@@ -297,6 +335,7 @@ settings_struct!(RawTarget {
     query: Option<Spanned<toml::Value>>,
     qtype: Option<Spanned<toml::Value>>,
     port: Option<Spanned<toml::Value>>,
+    mode: Option<Spanned<toml::Value>>,
 });
 
 // ---- validation -----------------------------------------------------------
@@ -500,31 +539,43 @@ impl Validator<'_> {
         if !valid_name(name) {
             self.error(&raw.name.span(), name_rule("target name"));
         }
-        if let Some(probe) = raw.probe.as_ref().filter(|p| p.get_ref() != "icmp") {
-            let p = probe.get_ref();
-            let msg = if ["tcp", "udp", "dns", "http", "https"].contains(&p.as_str()) {
-                format!("probe {p:?} is not available until M1; M0 measures \"icmp\" only")
-            } else {
-                format!("unknown probe {p:?}; M0 measures \"icmp\" only")
-            };
-            self.error(&probe.span(), msg);
-            // Still check the target's own schedule values.
-            self.check_layer(s);
-            return None;
-        }
-        for (key, value) in [
-            ("url", &raw.url),
-            ("expect_status", &raw.expect_status),
-            ("metric", &raw.metric),
-            ("server", &raw.server),
-            ("query", &raw.query),
-            ("qtype", &raw.qtype),
-            ("port", &raw.port),
+        let kind = match raw.probe.as_ref().map(|p| (p, p.get_ref().as_str())) {
+            None | Some((_, "icmp")) => "icmp",
+            Some((_, "tcp")) => "tcp",
+            Some((probe, p)) => {
+                let msg = if ["udp", "dns", "http", "https"].contains(&p) {
+                    format!(
+                        "probe {p:?} is not available yet; this version measures \"icmp\" and \"tcp\""
+                    )
+                } else {
+                    format!("unknown probe {p:?}; this version measures \"icmp\" and \"tcp\"")
+                };
+                self.error(&probe.span(), msg);
+                // Still check the target's own schedule values.
+                self.check_layer(s);
+                return None;
+            }
+        };
+        for (key, value, applies) in [
+            ("url", &raw.url, false),
+            ("expect_status", &raw.expect_status, false),
+            ("metric", &raw.metric, false),
+            ("server", &raw.server, false),
+            ("query", &raw.query, false),
+            ("qtype", &raw.qtype, false),
+            ("port", &raw.port, kind == "tcp"),
+            ("mode", &raw.mode, kind == "tcp"),
         ] {
-            if let Some(v) = value {
-                self.error(&v.span(), format!("{key} does not apply to icmp targets"));
+            if let (Some(v), false) = (value, applies) {
+                self.error(&v.span(), format!("{key} does not apply to {kind} targets"));
             }
         }
+        // Only the target's own `size`: a group or [defaults] size is a
+        // shared ICMP default and may sit above TCP targets.
+        if let (Some(v), false) = (&raw.size, kind == "icmp") {
+            self.error(&v.span(), format!("size does not apply to {kind} targets"));
+        }
+        let tcp = if kind == "tcp" { self.tcp(raw) } else { None };
         // A host problem is recorded, but the settings are still checked.
         let host = match &raw.host {
             Some(h) if !h.get_ref().trim().is_empty() => Some(h),
@@ -544,7 +595,7 @@ impl Validator<'_> {
                     &h.span(),
                     format!(
                         "host {:?} is neither an IP address nor a host name \
-                         (icmp targets take a bare name such as \"example.org\", not a URL)",
+                         ({kind} targets take a bare name such as \"example.org\", not a URL)",
                         h.get_ref()
                     ),
                 );
@@ -607,8 +658,48 @@ impl Validator<'_> {
                 spread: spread?,
                 timeout: timeout?,
             },
-            payload_size: size?,
+            probe: match kind {
+                "tcp" => tcp?,
+                _ => ProbeConfig::Icmp {
+                    payload_size: size?,
+                },
+            },
             line: self.position(span.start).0,
+        })
+    }
+
+    /// The TCP settings of a target: `port` (required) and `mode`.
+    fn tcp(&mut self, raw: &RawTarget) -> Option<ProbeConfig> {
+        let port = match &raw.port {
+            None => {
+                self.error(
+                    &raw.name.span(),
+                    format!("tcp target {:?} needs a port", raw.name.get_ref()),
+                );
+                None
+            }
+            Some(v) => match v.get_ref().as_integer().map(u16::try_from) {
+                Some(Ok(p)) if p >= 1 => Some(p),
+                _ => {
+                    self.error(&v.span(), "port must be a whole number from 1 to 65535");
+                    None
+                }
+            },
+        };
+        let mode = match &raw.mode {
+            None => Some(TcpMode::default()),
+            Some(v) => match v.get_ref().as_str() {
+                Some("connect") => Some(TcpMode::Connect),
+                Some("banner") => Some(TcpMode::Banner),
+                _ => {
+                    self.error(&v.span(), "mode must be \"connect\" or \"banner\"");
+                    None
+                }
+            },
+        };
+        Some(ProbeConfig::Tcp {
+            port: port?,
+            mode: mode?,
         })
     }
 
@@ -844,7 +935,7 @@ name = "Core"
                 timeout: Duration::from_secs(2),
             }
         );
-        assert_eq!(t.payload_size, 56);
+        assert_eq!(t.probe, ProbeConfig::Icmp { payload_size: 56 });
     }
 
     #[test]
@@ -1067,7 +1158,112 @@ name = "G"
 "#;
         let e = errors(src);
         assert_eq!(e.len(), 1, "{e:?}");
-        assert!(e[0].contains("not available until M1"), "{e:?}");
+        assert!(e[0].contains("not available yet"), "{e:?}");
+    }
+
+    #[test]
+    fn tcp_targets_take_a_port_and_mode() {
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+[[group]]
+name = "G"
+  [[group.target]]
+  name = "ssh"
+  host = "10.0.0.1"
+  probe = "tcp"
+  port = 22
+  mode = "banner"
+  [[group.target]]
+  name = "web"
+  host = "10.0.0.2"
+  probe = "tcp"
+  port = 443
+"#;
+        let p = parse(src);
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let t = p.config.unwrap().targets;
+        assert_eq!(
+            t[0].probe,
+            ProbeConfig::Tcp {
+                port: 22,
+                mode: TcpMode::Banner
+            }
+        );
+        assert_eq!(
+            t[1].probe,
+            ProbeConfig::Tcp {
+                port: 443,
+                mode: TcpMode::Connect
+            }
+        );
+    }
+
+    #[test]
+    fn size_on_a_tcp_target_is_an_error_but_a_shared_size_is_not() {
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+[[group]]
+name = "G"
+size = 100
+  [[group.target]]
+  name = "web"
+  host = "h"
+  probe = "tcp"
+  port = 443
+  [[group.target]]
+  name = "sized"
+  host = "h"
+  probe = "tcp"
+  port = 443
+  size = 64
+"#;
+        let e = errors(src);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].starts_with("16:") && e[0].contains("size does not apply to tcp targets"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn tcp_settings_are_checked() {
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+[[group]]
+name = "G"
+  [[group.target]]
+  name = "noport"
+  host = "h"
+  probe = "tcp"
+  [[group.target]]
+  name = "badport"
+  host = "h"
+  probe = "tcp"
+  port = 70000
+  mode = "half-open"
+  [[group.target]]
+  name = "icmp"
+  host = "h"
+  mode = "banner"
+"#;
+        let e = errors(src);
+        assert_eq!(e.len(), 4, "{e:?}");
+        assert!(
+            e[0].starts_with("6:") && e[0].contains("needs a port"),
+            "{e:?}"
+        );
+        assert!(
+            e[1].starts_with("13:") && e[1].contains("port must"),
+            "{e:?}"
+        );
+        assert!(
+            e[2].starts_with("14:") && e[2].contains("mode must"),
+            "{e:?}"
+        );
+        assert!(
+            e[3].starts_with("18:") && e[3].contains("does not apply to icmp"),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -1100,7 +1296,7 @@ vantages = ["hasselt"]
     fn shipped_example_is_valid() {
         let p = parse(include_str!("../../../examples/routelith.toml"));
         assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
-        assert_eq!(p.config.unwrap().targets.len(), 3);
+        assert_eq!(p.config.unwrap().targets.len(), 4);
     }
 
     #[test]

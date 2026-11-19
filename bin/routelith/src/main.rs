@@ -1,6 +1,6 @@
 //! The `routelith` binary: one executable, several modes (architecture doc §3).
 //!
-//! Only the M0 subcommands exist so far; `server`, `check icmp`,
+//! `server`, `check icmp`, `check tcp`,
 //! `ctl calibrate`, `ctl verify` and `ctl render` work.
 #![forbid(unsafe_code)]
 
@@ -42,6 +42,8 @@ enum Command {
 enum CheckProbe {
     /// ICMP echo round (unprivileged: Linux ping socket, Windows ICMP API).
     Icmp(check::IcmpArgs),
+    /// TCP connect time (or time to the server's banner).
+    Tcp(check::TcpArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -61,6 +63,9 @@ fn main() -> ExitCode {
         Command::Check {
             probe: CheckProbe::Icmp(args),
         } => run(check::icmp(args)),
+        Command::Check {
+            probe: CheckProbe::Tcp(args),
+        } => run(check::tcp(args)),
         Command::Ctl {
             action: CtlAction::Calibrate(args),
         } => calibrate::run(&args),

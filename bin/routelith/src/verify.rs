@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Args;
-use rl_core::config::{self, Config, Family, Severity, TargetConfig};
+use rl_core::config::{self, Config, Family, ProbeConfig, Severity, TargetConfig};
 use tokio::sync::Semaphore;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -125,6 +125,10 @@ fn check_privileges(cfg: &Config, resolved: &HashMap<usize, Vec<IpAddr>>, path: 
     // whose addresses are unknown.
     let (mut need, mut maybe) = ([false; 2], [false; 2]);
     for (i, t) in cfg.targets.iter().enumerate() {
+        // Only ICMP needs a privileged socket.
+        if !matches!(t.probe, ProbeConfig::Icmp { .. }) {
+            continue;
+        }
         match families_used(t, resolved.get(&i).map(Vec::as_slice)) {
             Some((v4, v6)) => {
                 need[0] |= v4;

@@ -6,11 +6,34 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use clap::Args;
+use rl_core::config::TcpMode;
 use rl_core::{ResolvedTarget, RoundPlan, RoundResult, RoundStats, Sample, SampleError};
-use rl_probe::{IcmpConfig, IcmpProbe, Probe};
+use rl_probe::{IcmpConfig, IcmpProbe, Probe, TcpConfig, TcpProbe};
 
 #[derive(Debug, Args)]
 pub(crate) struct IcmpArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// ICMP payload size in bytes (minimum 8).
+    #[arg(short = 's', long, default_value_t = 56)]
+    size: u16,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TcpArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// TCP port to connect to.
+    #[arg(short, long, value_parser = clap::value_parser!(u16).range(1..))]
+    port: u16,
+    /// Time until the server's first byte (SSH, SMTP) instead of the handshake.
+    #[arg(long)]
+    banner: bool,
+}
+
+/// Arguments every probe takes.
+#[derive(Debug, Args)]
+struct CommonArgs {
     /// Host name or IP address to measure.
     host: String,
     /// Number of samples in the round.
@@ -22,9 +45,6 @@ pub(crate) struct IcmpArgs {
     /// Per-sample timeout, e.g. 2s.
     #[arg(short = 'W', long, default_value = "2s", value_parser = parse_duration)]
     timeout: Duration,
-    /// ICMP payload size in bytes (minimum 8).
-    #[arg(short = 's', long, default_value_t = 56)]
-    size: u16,
     /// Use IPv4 only.
     #[arg(short = '4', conflicts_with = "ipv6")]
     ipv4: bool,
@@ -40,6 +60,50 @@ const MAX_INTERVAL: Duration = Duration::from_secs(3600);
 const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) async fn icmp(args: IcmpArgs) -> ExitCode {
+    let probe = IcmpProbe::new(IcmpConfig {
+        payload_size: args.size,
+    });
+    run(&args.common, &probe, |t, r| {
+        format!(
+            "ICMP {} ({}): {} samples, {}-byte payload",
+            t.name,
+            r.meta.resolved,
+            r.samples.len(),
+            r.meta.payload_size
+        )
+    })
+    .await
+}
+
+pub(crate) async fn tcp(args: TcpArgs) -> ExitCode {
+    let mode = if args.banner {
+        TcpMode::Banner
+    } else {
+        TcpMode::Connect
+    };
+    let port = args.port;
+    let probe = TcpProbe::new(TcpConfig { port, mode });
+    run(&args.common, &probe, |t, r| {
+        let what = match mode {
+            TcpMode::Connect => "connect time",
+            TcpMode::Banner => "time to banner",
+        };
+        format!(
+            "TCP {} ({}) port {port}: {} samples, {what}",
+            t.name,
+            r.meta.resolved,
+            r.samples.len(),
+        )
+    })
+    .await
+}
+
+/// Resolve, run one round and print it under the probe's `header` line.
+async fn run(
+    args: &CommonArgs,
+    probe: &dyn Probe,
+    header: impl Fn(&ResolvedTarget, &RoundResult) -> String,
+) -> ExitCode {
     // Bounds that keep every offset and deadline of the round representable
     // (and match the configuration's limits).
     if args.interval > MAX_INTERVAL || args.timeout.is_zero() || args.timeout > MAX_TIMEOUT {
@@ -68,12 +132,9 @@ pub(crate) async fn icmp(args: IcmpArgs) -> ExitCode {
         timeout: args.timeout,
         round_start: SystemTime::now(),
     };
-    let probe = IcmpProbe::new(IcmpConfig {
-        payload_size: args.size,
-    });
     match probe.run_round(&target, plan).await {
         Ok(round) => {
-            print!("{}", render(&target, &round, args.quiet));
+            print!("{}", render(&header(&target, &round), &round, args.quiet));
             exit_code(&round.samples)
         }
         Err(e) => {
@@ -129,17 +190,10 @@ fn ms(us: u32) -> String {
 
 /// Render a round as text. The summary lines are stable and parsed by the
 /// accuracy lab script (`tests/lab/netem-accuracy.sh`).
-fn render(target: &ResolvedTarget, round: &RoundResult, quiet: bool) -> String {
+fn render(header: &str, round: &RoundResult, quiet: bool) -> String {
     let mut out = String::new();
     let stats = RoundStats::from_samples(&round.samples);
-    let _ = writeln!(
-        out,
-        "ICMP {} ({}): {} samples, {}-byte payload",
-        target.name,
-        round.meta.resolved,
-        round.samples.len(),
-        round.meta.payload_size
-    );
+    let _ = writeln!(out, "{header}");
     if !quiet {
         for (i, sample) in round.samples.iter().enumerate() {
             let line = match sample {
@@ -224,7 +278,11 @@ mod tests {
                 payload_size: 56,
             },
         };
-        let text = render(&target, &round, true);
+        let text = render(
+            &format!("ICMP lab ({}): 3 samples, 56-byte payload", target.addr),
+            &round,
+            true,
+        );
         assert_eq!(
             text,
             "ICMP lab (192.0.2.1): 3 samples, 56-byte payload\n\

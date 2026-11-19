@@ -1,4 +1,4 @@
-# Example Routelith configuration (M0: ICMP only).
+# Example Routelith configuration (ICMP and TCP targets).
 # Check it with: routelith ctl verify examples/routelith.toml
 
 [server]
@@ -14,6 +14,8 @@ pings   = 20       # samples per round
 # timeout = "2s"   # per-sample timeout
 # size    = 56     # ICMP payload bytes
 # family  = "v4"   # v4, v6, both (two series) or prefer-v6
+# Each target measures ICMP echo unless it sets probe = "tcp" (connect time to
+# its port; mode = "banner" times the server's first byte instead).
 
 [[group]]
 name = "Core"
@@ -35,3 +37,9 @@ pings = 10
   [[group.target]]
   name = "cloudflare"
   host = "1.1.1.1"
+
+  [[group.target]]
+  name  = "cloudflare-https"
+  host  = "1.1.1.1"
+  probe = "tcp"
+  port  = 443
