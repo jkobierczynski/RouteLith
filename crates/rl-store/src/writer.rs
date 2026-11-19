@@ -25,6 +25,7 @@ use rl_core::TimingBackend;
 
 use crate::index::{self, SeriesKey};
 use crate::layout::{self, day_of};
+use crate::rollup::{self, RollupPoint, Tier};
 use crate::round::StoredRound;
 use crate::segment::{self, Tail};
 use crate::wal::{self, WalWriter};
@@ -40,6 +41,13 @@ pub struct WriterOptions {
     /// Checkpoint when the WAL grows past this many bytes.
     pub wal_max_bytes: u64,
     pub zstd_level: i32,
+    /// Days of raw rounds kept; older sealed day segments are deleted whole
+    /// once their rollups exist (§6.4: 30 days).
+    pub raw_days: i64,
+    /// Days of hourly rollups kept (§6.4: 400 days).
+    pub r1h_days: i64,
+    /// Days of daily rollups kept (§6.4: 10 years).
+    pub r1d_days: i64,
 }
 
 impl Default for WriterOptions {
@@ -49,6 +57,9 @@ impl Default for WriterOptions {
             seal_grace_ms: 10 * 60 * 1000,
             wal_max_bytes: 64 << 20,
             zstd_level: 3,
+            raw_days: 30,
+            r1h_days: 400,
+            r1d_days: 3653,
         }
     }
 }
@@ -63,6 +74,10 @@ pub struct WriterStats {
     pub blocks: u64,
     pub sealed: u64,
     pub checkpoints: u64,
+    /// Sealed days consolidated into the r1h and r1d tiers.
+    pub rolled_days: u64,
+    /// Files deleted by retention (raw segments and rollup files).
+    pub expired_files: u64,
 }
 
 /// What [`Writer::open`] found and repaired.
@@ -175,6 +190,9 @@ pub struct Writer {
     keep_wal: BTreeSet<u64>,
     /// Set by the first failed write; every later call returns it.
     failed: Option<String>,
+    /// The seal cutoff day of the last rollup and retention pass; the pass
+    /// runs again when the cutoff moves or a day is sealed.
+    rolled_at: Option<i64>,
     stats: WriterStats,
     _lock: DirLock,
 }
@@ -193,6 +211,11 @@ impl Writer {
     ) -> Result<(Self, Recovery), StoreError> {
         if !(1..=MAX_BLOCK_ROUNDS).contains(&opts.block_rounds) {
             return Err(StoreError::InvalidOptions("block_rounds must be 1 to 4096"));
+        }
+        if opts.raw_days < 1 || opts.r1h_days < 1 || opts.r1d_days < 1 {
+            return Err(StoreError::InvalidOptions(
+                "retention must be at least one day per tier",
+            ));
         }
         // Every directory `create_dir_all` is about to make.
         let mut created = Vec::new();
@@ -403,6 +426,7 @@ impl Writer {
             dirty_dirs,
             keep_wal: BTreeSet::new(),
             failed: None,
+            rolled_at: None,
             stats: WriterStats::default(),
             _lock: lock,
         };
@@ -464,6 +488,15 @@ impl Writer {
             return Err(StoreError::Stopped(msg.clone()));
         }
         index::register(&self.dir, keys)
+    }
+
+    /// Record each series' step (round interval) in milliseconds, so
+    /// readers know the cadence even when rounds are sparse (§21.3 E5).
+    pub fn set_steps(&mut self, steps: &[(u64, u64)]) -> Result<(), StoreError> {
+        if let Some(msg) = &self.failed {
+            return Err(StoreError::Stopped(msg.clone()));
+        }
+        index::set_steps(&self.dir, steps)
     }
 
     pub fn stats(&self) -> WriterStats {
@@ -536,6 +569,59 @@ impl Writer {
         }
         if !stale.is_empty() || self.wal.bytes() > self.opts.wal_max_bytes {
             self.checkpoint()?;
+        }
+        if !stale.is_empty() || self.rolled_at != Some(cutoff) {
+            self.roll_up(cutoff)?;
+            self.rolled_at = Some(cutoff);
+        }
+        Ok(())
+    }
+
+    /// Build the r1h and r1d points of every sealed day that has none yet,
+    /// then apply retention. `today` is the seal cutoff day: days before it
+    /// are sealed or will not change.
+    fn roll_up(&mut self, today: i64) -> Result<(), StoreError> {
+        for id in layout::list_series_dirs(&self.dir)? {
+            let last = rollup::last_rolled_day(&self.dir, id)?;
+            for seg in layout::list_segments(&self.dir, id)? {
+                if !seg.sealed || last.is_some_and(|l| seg.day <= l) {
+                    continue;
+                }
+                let bytes = std::fs::read(&seg.path)?;
+                let scan = segment::scan(&bytes).map_err(|r| damaged_sealed(&seg.path, r))?;
+                if scan.tail != Tail::Clean || scan.series != id || scan.day != seg.day {
+                    return Err(damaged_sealed(&seg.path, "bad block or header"));
+                }
+                let rounds = segment::read_range(&bytes, &scan, i64::MIN, i64::MAX)
+                    .map_err(|r| damaged_sealed(&seg.path, r))?;
+                // r1h first: an r1d point marks the day as fully rolled up.
+                for tier in [Tier::R1h, Tier::R1d] {
+                    let points = RollupPoint::build(&rounds, tier.width_ms());
+                    rollup::append_day(&self.dir, id, tier, seg.day, &points)?;
+                }
+                self.stats.rolled_days += 1;
+            }
+            // Retention: whole files only (§6.4). Every sealed raw day was
+            // rolled up above before any is deleted.
+            let raw_before = today - self.opts.raw_days;
+            let mut removed = false;
+            for seg in layout::list_segments(&self.dir, id)? {
+                if seg.sealed && seg.day < raw_before {
+                    std::fs::remove_file(&seg.path)?;
+                    self.stats.expired_files += 1;
+                    removed = true;
+                }
+            }
+            if removed {
+                layout::sync_dir(&layout::raw_dir(&self.dir, id))?;
+            }
+            for (tier, days) in [
+                (Tier::R1h, self.opts.r1h_days),
+                (Tier::R1d, self.opts.r1d_days),
+            ] {
+                self.stats.expired_files +=
+                    rollup::expire(&self.dir, id, tier, today - days)? as u64;
+            }
         }
         Ok(())
     }

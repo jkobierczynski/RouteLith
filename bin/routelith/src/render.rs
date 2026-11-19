@@ -122,7 +122,12 @@ fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
             title: &title,
             from_ms,
             to_ms,
-            step_ms: bucket_step(configured_step(cfg.as_ref(), &key), smallest_gap(&rounds)),
+            // The config's step, else the one the server recorded (§21.3 E5).
+            step_ms: bucket_step(
+                configured_step(cfg.as_ref(), &key)
+                    .or_else(|| reader.step_ms(id).and_then(|s| i64::try_from(s).ok())),
+                smallest_gap(&rounds),
+            ),
             width: Graph::DEFAULT_WIDTH,
             height: Graph::DEFAULT_HEIGHT,
         },

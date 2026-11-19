@@ -126,6 +126,18 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let steps: Vec<(u64, u64)> = ids
+        .iter()
+        .zip(&plans)
+        .map(|(&id, p)| {
+            let ms = u64::try_from(p.schedule.step.as_millis()).unwrap_or(u64::MAX);
+            (id, ms)
+        })
+        .collect();
+    if let Err(e) = writer.set_steps(&steps) {
+        eprintln!("routelith server: cannot record series steps: {e}");
+        return ExitCode::from(2);
+    }
 
     // Install the signal handlers before any work starts, so a SIGTERM
     // right after start-up still shuts down cleanly.
