@@ -142,3 +142,103 @@ fn ranges_pick_their_resolution() {
     assert_eq!(pts[1].ts_ms, T0 + 4 * STEP_MS);
     drop(w);
 }
+
+/// After retention: a rolled-up day stays closed across a restart, graphs
+/// and point reads fall back to the rollups, and a range whose hourly
+/// files have expired is read from the daily tier.
+#[test]
+fn rollups_serve_reads_after_raw_and_hourly_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = WriterOptions {
+        raw_days: 2,
+        r1h_days: 3,
+        r1d_days: 400,
+        ..WriterOptions::default()
+    };
+    let (mut w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+    let [id] = w.register(&[SeriesKey::new("local", "gw", "v4")]).unwrap()[..] else {
+        panic!()
+    };
+    w.set_steps(&[(id, 300_000)]).unwrap();
+    for r in (0..2 * 288).map(round) {
+        w.append(id, r).unwrap();
+    }
+    // Raw days 0 and 1 rolled up, then deleted.
+    w.maintain(T0 + 4 * DAY_MS + HOUR_MS).unwrap();
+    assert!(layout::segment_file_names(dir.path(), id).is_empty());
+    w.close().unwrap();
+
+    // With no raw segment left, the restart still knows day 0 is closed.
+    let (mut w, _) = Writer::open(dir.path(), opts, T0 + 4 * DAY_MS + 2 * HOUR_MS).unwrap();
+    assert_eq!(
+        w.append(id, round(5)).unwrap(),
+        rl_store::Appended::Late,
+        "a round for a rolled-up day would be lost by the next roll-up"
+    );
+
+    // A graph of day 0 comes from the hourly rollups.
+    let reader = Reader::open(dir.path()).unwrap();
+    let (res, rounds) = reader.read_graph(id, T0, T0 + DAY_MS - 1).unwrap();
+    assert_eq!(res, Resolution::Rollup(Tier::R1h));
+    assert_eq!(rounds.len(), 24);
+    assert_eq!(rounds[0].ts_ms, T0);
+    assert_eq!(rounds[0].rtts_us.len(), QUANTILES);
+    // 238 of 240 received: 20 quantiles stand for ceil(20 × 240 / 238).
+    assert_eq!(rounds[0].sent, 21);
+
+    // Points start inside the range, for stored and on-the-fly points
+    // alike: the hour starting before `from` is left out.
+    let from = T0 + 30 * 60_000;
+    let pts = reader.read_tier(id, Tier::R1h, from, T0 + DAY_MS).unwrap();
+    assert!(pts.iter().all(|p| p.ts_ms >= from), "{:?}", pts[0].ts_ms);
+
+    // 2026-12: the November hourly file has expired, the daily file not.
+    w.maintain(T0 + 17 * DAY_MS + HOUR_MS).unwrap();
+    w.close().unwrap();
+    let reader = Reader::open(dir.path()).unwrap();
+    assert!(
+        reader
+            .read_tier(id, Tier::R1h, T0, T0 + 2 * DAY_MS)
+            .unwrap()
+            .is_empty()
+    );
+    let (res, pts) = reader.read_points(id, T0, T0 + 2 * DAY_MS, 800).unwrap();
+    assert_eq!(res, Resolution::Rollup(Tier::R1d));
+    assert_eq!(pts.len(), 2);
+    let (res, rounds) = reader.read_graph(id, T0, T0 + 2 * DAY_MS).unwrap();
+    assert_eq!((res, rounds.len()), (Resolution::Rollup(Tier::R1d), 2));
+}
+
+/// A rollup file is published whole: a leftover temporary file from a
+/// crash before the rename is ignored by reads and replaced by the next
+/// build.
+#[test]
+fn a_crash_while_creating_a_rollup_file_is_recovered() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut w, _) = Writer::open(dir.path(), WriterOptions::default(), T0).unwrap();
+    let [id] = w.register(&[SeriesKey::new("local", "gw", "v4")]).unwrap()[..] else {
+        panic!()
+    };
+    for r in (0..288).map(round) {
+        w.append(id, r).unwrap();
+    }
+    w.close().unwrap();
+    // A crash after creating the file, before its header was complete.
+    let r1h = dir.path().join("series").join(id.to_string()).join("r1h");
+    std::fs::create_dir_all(&r1h).unwrap();
+    std::fs::write(r1h.join("2026-11.roll.tmp"), b"RLRO").unwrap();
+
+    let (mut w, _) = Writer::open(dir.path(), WriterOptions::default(), T0 + DAY_MS).unwrap();
+    w.maintain(T0 + DAY_MS + HOUR_MS).unwrap();
+    assert_eq!(w.stats().rolled_days, 1);
+    w.close().unwrap();
+    let reader = Reader::open(dir.path()).unwrap();
+    assert_eq!(
+        reader
+            .read_tier(id, Tier::R1h, T0, T0 + DAY_MS - 1)
+            .unwrap()
+            .len(),
+        24
+    );
+    assert!(!r1h.join("2026-11.roll.tmp").exists());
+}

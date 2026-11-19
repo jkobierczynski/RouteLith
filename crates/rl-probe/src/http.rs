@@ -12,7 +12,9 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -30,7 +32,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use rustls_pki_types::pem::PemObject;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpSocket;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until, timeout_at};
@@ -186,13 +188,25 @@ impl Outcome {
 async fn sample(s: &Shared, dest: SocketAddr, timeout: Duration) -> Outcome {
     let start = Instant::now();
     let deadline = start + timeout;
-    match timeout_at(deadline, request(s, dest, start)).await {
-        Err(_) => Outcome::failed(Sample::Lost),
+    // Set once the TLS handshake is done, so a timeout after it still
+    // reports the certificate.
+    let cert = OnceLock::new();
+    match timeout_at(deadline, request(s, dest, start, &cert)).await {
+        Err(_) => Outcome {
+            sample: Sample::Lost,
+            phases: None,
+            cert_not_after: cert.get().copied(),
+        },
         Ok(out) => out,
     }
 }
 
-async fn request(s: &Shared, dest: SocketAddr, start: Instant) -> Outcome {
+async fn request(
+    s: &Shared,
+    dest: SocketAddr,
+    start: Instant,
+    cert_cell: &OnceLock<SystemTime>,
+) -> Outcome {
     let socket = match open(dest) {
         Ok(sock) => sock,
         Err(e) => return Outcome::failed(Sample::Error(SampleError::SendFailed(e.to_string()))),
@@ -224,6 +238,9 @@ async fn request(s: &Shared, dest: SocketAddr, start: Instant) -> Outcome {
                     .peer_certificates()
                     .and_then(|c| c.first())
                     .and_then(|c| crate::x509::not_after(c));
+                if let Some(t) = cert {
+                    let _ = cert_cell.set(t);
+                }
                 exchange(s, stream, start, connect, Some(tls), cert).await
             }
         },
@@ -246,6 +263,11 @@ where
         sample: Sample::Error(e),
         phases: None,
         cert_not_after,
+    };
+    let first_byte = Arc::new(OnceLock::new());
+    let stream = FirstByte {
+        inner: stream,
+        at: Arc::clone(&first_byte),
     };
     let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
     {
@@ -278,7 +300,12 @@ where
             return fail(SampleError::Other(format!("HTTP: {e}")));
         }
     };
-    let ttfb = start.elapsed();
+    // The first response byte, not the end of the response head. Nothing
+    // is read before the request is sent, so this is the first byte of
+    // the response.
+    let ttfb = first_byte
+        .get()
+        .map_or_else(|| start.elapsed(), |&at: &Instant| at - start);
     let status = resp.status().as_u16();
     let mut body = resp.into_body();
     let mut read = Vec::new();
@@ -349,6 +376,58 @@ fn open(dest: SocketAddr) -> io::Result<TcpSocket> {
     socket.set_zero_linger()?;
     socket.set_nodelay(true)?;
     Ok(socket)
+}
+
+/// A stream that records when a read first returns data. Over TLS it wraps
+/// the decrypted stream, so handshake records don't count.
+struct FirstByte<S> {
+    inner: S,
+    at: Arc<OnceLock<Instant>>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for FirstByte<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            let _ = self.at.set(Instant::now());
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for FirstByte<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
 }
 
 fn micros(d: Duration) -> u32 {
@@ -560,6 +639,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ttfb_is_the_first_byte_not_the_whole_head() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let mut head = Vec::new();
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut buf).await.unwrap();
+                head.extend_from_slice(&buf[..n]);
+            }
+            s.write_all(b"H").await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let rest = b"TTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+            s.write_all(rest).await.unwrap();
+            let _ = s.shutdown().await;
+        });
+        let probe = HttpProbe::new(cfg(&format!("http://127.0.0.1:{port}/"))).unwrap();
+        let round = probe.run_round(&target(), plan(1)).await.unwrap();
+        let p = round.http.unwrap().phases[0].unwrap();
+        assert!(p.total_us >= 150_000, "{p:?}");
+        assert!(p.ttfb_us < 100_000, "{p:?}");
+    }
+
+    #[tokio::test]
     async fn unexpected_status_and_body_are_errors() {
         let (port, _) = plain_server(503, "down", Duration::ZERO).await;
         let probe = HttpProbe::new(cfg(&format!("http://127.0.0.1:{port}/"))).unwrap();
@@ -601,6 +706,12 @@ mod tests {
     /// A TLS server with a fresh self-signed certificate for `lab.test`;
     /// returns its port and the certificate PEM.
     async fn tls_server() -> (u16, String) {
+        tls_server_answering(true).await
+    }
+
+    /// Like [`tls_server`]; with `answer` false it completes the handshake
+    /// and then never responds.
+    async fn tls_server_answering(answer: bool) -> (u16, String) {
         let mut params = rcgen::CertificateParams::new(vec!["lab.test".into()]).unwrap();
         params.not_after = rcgen::date_time_ymd(2031, 6, 15);
         let key = rcgen::KeyPair::generate().unwrap();
@@ -625,7 +736,12 @@ mod tests {
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     if let Ok(tls) = acceptor.accept(s).await {
-                        serve(tls, 200, "ok", Duration::ZERO).await;
+                        if answer {
+                            serve(tls, 200, "ok", Duration::ZERO).await;
+                        } else {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            drop(tls);
+                        }
                     }
                 });
             }
@@ -705,6 +821,22 @@ mod tests {
             round.samples
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_timeout_after_the_handshake_keeps_the_certificate() {
+        let (port, _) = tls_server_answering(false).await;
+        let mut c = cfg(&format!("https://lab.test:{port}/"));
+        c.tls_verify = false;
+        let mut p = plan(1);
+        p.timeout = Duration::from_millis(300);
+        let round = HttpProbe::new(c)
+            .unwrap()
+            .run_round(&target(), p)
+            .await
+            .unwrap();
+        assert_eq!(round.samples[0], Sample::Lost);
+        assert!(round.http.unwrap().cert_not_after.is_some());
     }
 
     #[test]

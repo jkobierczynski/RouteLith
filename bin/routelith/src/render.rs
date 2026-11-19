@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Args, ValueEnum};
 use rl_core::config::{self, Config};
 use rl_render::{Graph, Round};
-use rl_store::{Reader, SeriesKey};
+use rl_store::{Reader, Resolution, SeriesKey};
 
 #[derive(Debug, Args)]
 #[command(group(clap::ArgGroup::new("source").required(true).args(["config", "data_dir"])))]
@@ -104,8 +104,10 @@ fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
         None => now_ms(),
     };
     let from_ms = to_ms - args.range.ms();
-    let rounds = reader
-        .read(id, from_ms, to_ms)
+    // Raw rounds while retention keeps them, else the hourly or daily
+    // rollups.
+    let (resolution, rounds) = reader
+        .read_graph(id, from_ms, to_ms)
         .map_err(|e| (2, format!("reading {key}: {e}")))?;
     let view: Vec<Round<'_>> = rounds
         .iter()
@@ -123,18 +125,27 @@ fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
             from_ms,
             to_ms,
             // The config's step, else the one the server recorded (§21.3 E5).
-            step_ms: bucket_step(
-                configured_step(cfg.as_ref(), &key)
-                    .or_else(|| reader.step_ms(id).and_then(|s| i64::try_from(s).ok())),
-                smallest_gap(&rounds),
-            ),
+            step_ms: match resolution {
+                Resolution::Rollup(tier) => Some(tier.width_ms()),
+                Resolution::Buckets(width) => Some(width),
+                Resolution::Raw => bucket_step(
+                    configured_step(cfg.as_ref(), &key)
+                        .or_else(|| reader.step_ms(id).and_then(|s| i64::try_from(s).ok())),
+                    smallest_gap(&rounds),
+                ),
+            },
             width: Graph::DEFAULT_WIDTH,
             height: Graph::DEFAULT_HEIGHT,
         },
     );
     std::fs::write(&args.out, svg).map_err(|e| (2, format!("{}: {e}", args.out.display())))?;
+    let what = match resolution {
+        Resolution::Raw => "rounds".to_string(),
+        Resolution::Rollup(tier) => format!("{} points", tier.name()),
+        Resolution::Buckets(width) => format!("{} s buckets", width / 1000),
+    };
     eprintln!(
-        "routelith ctl render: {} rounds of {key} over {} written to {}",
+        "routelith ctl render: {} {what} of {key} over {} written to {}",
         rounds.len(),
         args.range.name(),
         args.out.display()
