@@ -42,7 +42,7 @@ use std::path::PathBuf;
 pub use health::{HealthLog, HealthSample, NicDelta, read_health};
 pub use index::SeriesKey;
 pub use reader::{Reader, Resolution, VerifyReport};
-pub use rollup::{QUANTILES, RollupPoint, Tier, quantiles};
+pub use rollup::{GRAPH_SAMPLES, QUANTILES, RollupPoint, Tier, quantiles};
 pub use round::{ErrorCounts, FLAG_CLOCK_STEP, StoredRound};
 pub use writer::{Appended, Recovery, Writer, WriterOptions, WriterStats};
 

@@ -182,9 +182,12 @@ fn rollups_serve_reads_after_raw_and_hourly_expiry() {
     assert_eq!(res, Resolution::Rollup(Tier::R1h));
     assert_eq!(rounds.len(), 24);
     assert_eq!(rounds[0].ts_ms, T0);
-    assert_eq!(rounds[0].rtts_us.len(), QUANTILES);
-    // 238 of 240 received: 20 quantiles stand for ceil(20 × 240 / 238).
-    assert_eq!(rounds[0].sent, 21);
+    // 238 of 240 received: the loss ratio is kept exactly, and the
+    // replies span the hour's quantiles.
+    assert_eq!((rounds[0].sent, rounds[0].rtts_us.len()), (240, 238));
+    let q = &reader.read_tier(id, Tier::R1h, T0, T0).unwrap()[0].quantiles_us;
+    assert_eq!(rounds[0].rtts_us.first(), q.first());
+    assert_eq!(rounds[0].rtts_us.last(), q.last());
 
     // Points start inside the range, for stored and on-the-fly points
     // alike: the hour starting before `from` is left out.
@@ -241,4 +244,42 @@ fn a_crash_while_creating_a_rollup_file_is_recovered() {
         24
     );
     assert!(!r1h.join("2026-11.roll.tmp").exists());
+}
+
+/// Once every tier has expired a day, a restart still refuses a round for
+/// it: retention would delete it again at the next pass.
+#[test]
+fn rounds_older_than_every_tier_are_late() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = WriterOptions {
+        raw_days: 1,
+        r1h_days: 1,
+        r1d_days: 1,
+        ..WriterOptions::default()
+    };
+    let (mut w, _) = Writer::open(dir.path(), opts, T0).unwrap();
+    let [id] = w.register(&[SeriesKey::new("local", "gw", "v4")]).unwrap()[..] else {
+        panic!()
+    };
+    for r in (0..288).map(round) {
+        w.append(id, r).unwrap();
+    }
+    // Two years on: raw, hourly and daily files of day 0 are all gone.
+    let later = T0 + 800 * DAY_MS;
+    w.maintain(later).unwrap();
+    w.close().unwrap();
+    assert!(layout::segment_file_names(dir.path(), id).is_empty());
+    let (mut w, _) = Writer::open(dir.path(), opts, later + HOUR_MS).unwrap();
+    assert!(
+        Reader::open(dir.path())
+            .unwrap()
+            .read_tier(id, Tier::R1d, 0, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(w.append(id, round(5)).unwrap(), rl_store::Appended::Late);
+    // A current round is still stored.
+    let mut now = round(0);
+    now.ts_ms = later + 2 * HOUR_MS;
+    assert_eq!(w.append(id, now).unwrap(), rl_store::Appended::Stored);
 }
