@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::index::{self, SeriesKey};
 use crate::layout::{self, day_of};
+use crate::rollup::{self, RollupPoint, Tier};
 use crate::round::StoredRound;
 use crate::segment::{self, Tail};
 use crate::{StoreError, codec, wal};
@@ -18,7 +19,39 @@ use crate::{StoreError, codec, wal};
 pub struct Reader {
     dir: PathBuf,
     series: Vec<(SeriesKey, u64)>,
+    /// Recorded step per series, milliseconds.
+    steps: BTreeMap<u64, u64>,
 }
+
+/// The resolution a range was read at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    /// One point per stored round.
+    Raw,
+    /// Raw rounds consolidated on the fly into buckets of this many
+    /// milliseconds (a whole number of steps, under an hour): for ranges
+    /// with too many rounds to draw one by one but too few hours for r1h.
+    Buckets(i64),
+    /// One point per hour or day.
+    Rollup(Tier),
+}
+
+/// What [`Reader::read_graph`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRounds {
+    pub resolution: Resolution,
+    /// For rollups, one synthetic round per point, each scaled on its own:
+    /// their counts keep each point's loss ratio, not the range's totals.
+    pub rounds: Vec<StoredRound>,
+    /// Pings sent and replies received over the whole range, unscaled.
+    pub sent: u64,
+    pub received: u64,
+}
+
+/// Step assumed for a series with none recorded (the config default).
+const DEFAULT_STEP_MS: u64 = 300_000;
+/// Attempts at a read that retention or a roll-up changes under it.
+const ATTEMPTS: usize = 5;
 
 /// Result of [`Reader::verify`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -33,12 +66,25 @@ pub struct VerifyReport {
     pub problems: Vec<String>,
 }
 
+/// Run a read again while retention or a roll-up changes the files under
+/// it (each change is quick, and happens about once a day).
+fn retry<T>(mut f: impl FnMut() -> Result<T, StoreError>) -> Result<T, StoreError> {
+    let mut n = 0;
+    loop {
+        match f() {
+            Err(StoreError::Expired(_)) if n + 1 < ATTEMPTS => n += 1,
+            r => return r,
+        }
+    }
+}
+
 impl Reader {
     /// Open a data directory and load its series index.
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
             dir: dir.to_path_buf(),
             series: index::load(dir)?,
+            steps: index::load_steps(dir)?,
         })
     }
 
@@ -54,6 +100,230 @@ impl Reader {
             .filter(|(k, _)| k.target == target)
             .map(|(k, id)| (k, *id))
             .collect()
+    }
+
+    /// The step (round interval) recorded for a series, in milliseconds.
+    /// `None` for a series written before steps were recorded and not
+    /// measured since.
+    pub fn step_ms(&self, series: u64) -> Option<u64> {
+        self.steps.get(&series).copied()
+    }
+
+    /// Points of one rollup tier with `from_ms <= ts <= to_ms`, oldest
+    /// first. Days not rolled up yet (today, and days awaiting their seal)
+    /// are consolidated from the raw rounds on the fly, so the range has no
+    /// hole at its recent end.
+    pub fn read_tier(
+        &self,
+        series: u64,
+        tier: Tier,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<RollupPoint>, StoreError> {
+        retry(|| self.read_tier_once(series, tier, from_ms, to_ms))
+    }
+
+    fn read_tier_once(
+        &self,
+        series: u64,
+        tier: Tier,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<RollupPoint>, StoreError> {
+        // The points and the boundary of what they cover must be read
+        // together: a day rolled up in between would be in neither.
+        let before = rollup::last_rolled_day(&self.dir, series)?;
+        let mut out = rollup::read(&self.dir, series, tier, from_ms, to_ms)?;
+        let last = rollup::last_rolled_day(&self.dir, series)?;
+        if last != before {
+            return Err(StoreError::Expired(rollup::tier_dir(
+                &self.dir, series, tier,
+            )));
+        }
+        let rolled_until = last.map_or(i64::MIN, |d| (d + 1).saturating_mul(layout::DAY_MS));
+        let raw_from = from_ms.max(rolled_until);
+        if raw_from <= to_ms {
+            // Start at a bucket boundary, so the first bucket is whole.
+            let start = raw_from.saturating_sub(raw_from.rem_euclid(tier.width_ms()));
+            let rounds = self.read(series, start, to_ms)?;
+            // A day rolled up and expired from raw during that read is in
+            // neither part.
+            if rollup::last_rolled_day(&self.dir, series)? != last {
+                return Err(StoreError::Expired(layout::raw_dir(&self.dir, series)));
+            }
+            out.retain(|p| p.ts_ms < start);
+            // The same bound as the stored points: a point's start is in
+            // the range.
+            out.extend(
+                RollupPoint::build(&rounds, tier.width_ms())
+                    .into_iter()
+                    .filter(|p| p.ts_ms >= from_ms),
+            );
+        }
+        Ok(out)
+    }
+
+    /// The finest rollup tier that still holds the start of a range: the
+    /// hourly files are kept for less time than the daily ones.
+    fn covering_tier(&self, series: u64, finest: Tier, from_ms: i64) -> Result<Tier, StoreError> {
+        if finest == Tier::R1d {
+            return Ok(Tier::R1d);
+        }
+        let hourly = rollup::first_ts(&self.dir, series, Tier::R1h)?;
+        if hourly.is_some_and(|h| h <= from_ms) {
+            return Ok(Tier::R1h);
+        }
+        // Daily points older than every hourly one: hourly has expired
+        // there.
+        let daily = rollup::first_ts(&self.dir, series, Tier::R1d)?;
+        let hourly_day = hourly.map(|h| h.div_euclid(layout::DAY_MS) * layout::DAY_MS);
+        Ok(match (daily, hourly_day) {
+            (Some(d), Some(h)) if d < h => Tier::R1d,
+            (Some(_), None) => Tier::R1d,
+            _ => Tier::R1h,
+        })
+    }
+
+    /// Whether raw rounds hold the whole range: back to its start, or the
+    /// range starts after the last day rolled up. Retention deletes only
+    /// rolled-up days, so later rounds are all in segments or the WAL,
+    /// even when no segment is left.
+    fn raw_complete(&self, series: u64, from_ms: i64) -> Result<bool, StoreError> {
+        let oldest_raw = layout::list_segments(&self.dir, series)?
+            .first()
+            .map(|s| s.day.saturating_mul(layout::DAY_MS));
+        Ok(oldest_raw.is_some_and(|o| from_ms >= o)
+            || rollup::last_rolled_day(&self.dir, series)?
+                .is_none_or(|d| from_ms >= d.saturating_add(1).saturating_mul(layout::DAY_MS)))
+    }
+
+    /// After a raw read: retention may have deleted the oldest raw day
+    /// between the choice and the listing, leaving no file to miss.
+    fn still_raw(&self, series: u64, from_ms: i64) -> Result<(), StoreError> {
+        if self.raw_complete(series, from_ms)? {
+            Ok(())
+        } else {
+            Err(StoreError::Expired(layout::raw_dir(&self.dir, series)))
+        }
+    }
+
+    /// After a tier read: retention may have deleted the hourly file that
+    /// made the tier the right choice.
+    fn still_tier(
+        &self,
+        series: u64,
+        finest: Tier,
+        chosen: Tier,
+        from_ms: i64,
+    ) -> Result<(), StoreError> {
+        if self.covering_tier(series, finest, from_ms)? == chosen {
+            Ok(())
+        } else {
+            Err(StoreError::Expired(rollup::tier_dir(
+                &self.dir, series, chosen,
+            )))
+        }
+    }
+
+    /// Rounds for drawing a smoke graph of `from_ms..=to_ms`: the raw
+    /// rounds while they cover the range, else one round per rollup point
+    /// (its quantiles as the replies, and as many sent as keeps its loss
+    /// ratio), with the point width as the step to draw at.
+    pub fn read_graph(
+        &self,
+        series: u64,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<GraphRounds, StoreError> {
+        retry(|| {
+            if self.raw_complete(series, from_ms)? {
+                let rounds = self.read(series, from_ms, to_ms)?;
+                self.still_raw(series, from_ms)?;
+                let sent = rounds.iter().map(|r| u64::from(r.sent)).sum();
+                let received = rounds.iter().map(|r| r.rtts_us.len() as u64).sum();
+                return Ok(GraphRounds {
+                    resolution: Resolution::Raw,
+                    rounds,
+                    sent,
+                    received,
+                });
+            }
+            let tier = self.covering_tier(series, Tier::R1h, from_ms)?;
+            let points = self.read_tier_once(series, tier, from_ms, to_ms)?;
+            self.still_tier(series, Tier::R1h, tier, from_ms)?;
+            Ok(GraphRounds {
+                resolution: Resolution::Rollup(tier),
+                rounds: points.iter().map(RollupPoint::to_round).collect(),
+                sent: points.iter().map(|p| u64::from(p.sent)).sum(),
+                received: points
+                    .iter()
+                    .map(|p| u64::from(p.received.min(p.sent)))
+                    .sum(),
+            })
+        })
+    }
+
+    /// Points for drawing `from_ms..=to_ms` about `max_points` wide: the
+    /// finest resolution with at most twice that many points, and not raw
+    /// (or raw buckets) when the range starts before the oldest raw day
+    /// still on disk.
+    pub fn read_points(
+        &self,
+        series: u64,
+        from_ms: i64,
+        to_ms: i64,
+        max_points: u32,
+    ) -> Result<(Resolution, Vec<RollupPoint>), StoreError> {
+        let span = to_ms.saturating_sub(from_ms).max(1);
+        let step = i64::try_from(self.step_ms(series).unwrap_or(DEFAULT_STEP_MS))
+            .unwrap_or(i64::MAX)
+            .max(1);
+        let n = i64::from(max_points.max(1));
+        let limit = n * 2;
+        // Ceiling division of positive values, without the overflow of
+        // `(a + b - 1) / b`.
+        let ceil_div = |a: i64, b: i64| a / b + i64::from(a % b != 0);
+        retry(|| {
+            if self.raw_complete(series, from_ms)? {
+                let rounds_in_span = span / step;
+                if rounds_in_span <= limit {
+                    let rounds = self.read(series, from_ms, to_ms)?;
+                    self.still_raw(series, from_ms)?;
+                    // The recorded step is the current one: older rounds
+                    // may be denser. Too many go into buckets below.
+                    if rounds.len() as u64 <= limit.unsigned_abs() {
+                        return Ok((
+                            Resolution::Raw,
+                            rounds.iter().map(RollupPoint::from_round).collect(),
+                        ));
+                    }
+                }
+                // About `max_points` buckets of whole steps, and never
+                // more than that whatever the rounds' real spacing.
+                let width = step
+                    .saturating_mul(ceil_div(rounds_in_span, n))
+                    .max(ceil_div(span, n));
+                if width < Tier::R1h.width_ms() {
+                    // Whole buckets: start at a boundary before `from_ms`.
+                    let start = from_ms.saturating_sub(from_ms.rem_euclid(width));
+                    let rounds = self.read(series, start, to_ms)?;
+                    self.still_raw(series, from_ms)?;
+                    return Ok((
+                        Resolution::Buckets(width),
+                        RollupPoint::build(&rounds, width),
+                    ));
+                }
+            }
+            let finest = if span / Tier::R1h.width_ms() <= limit {
+                Tier::R1h
+            } else {
+                Tier::R1d
+            };
+            let tier = self.covering_tier(series, finest, from_ms)?;
+            let points = self.read_tier_once(series, tier, from_ms, to_ms)?;
+            self.still_tier(series, finest, tier, from_ms)?;
+            Ok((Resolution::Rollup(tier), points))
+        })
     }
 
     /// Rounds of a series with `from_ms <= ts <= to_ms`, oldest first,
@@ -182,8 +452,10 @@ impl Reader {
             for seg in layout::list_segments(&self.dir, id)? {
                 rep.segments += 1;
                 let path = seg.path.display();
-                let Some((bytes, sealed)) = self.read_segment(id, &seg)? else {
-                    continue;
+                let (bytes, sealed) = match self.read_segment(id, &seg) {
+                    Ok(Some(b)) => b,
+                    Ok(None) | Err(StoreError::Expired(_)) => continue,
+                    Err(e) => return Err(e),
                 };
                 let scan = match segment::scan(&bytes) {
                     Ok(s) => s,
@@ -261,6 +533,8 @@ impl Reader {
                     Err(e) => Err(e.into()),
                 }
             }
+            // Deleted by retention after it was listed.
+            Err(e) if missing(&e) => Err(StoreError::Expired(seg.path.clone())),
             Err(e) => Err(e.into()),
         }
     }
@@ -279,6 +553,8 @@ impl Reader {
                             m => m?,
                         }
                     }
+                    // Deleted by retention after it was listed.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     m => m?,
                 }
                 .len();

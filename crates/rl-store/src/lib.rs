@@ -1,8 +1,10 @@
-//! smokestore: WAL, day segments, codecs and (later) rollups.
+//! smokestore: WAL, day segments, codecs and rollups.
 //!
-//! M0 has the raw tier only (architecture doc §6, decision D6): every round
-//! is kept at full resolution in one segment file per series and UTC day,
-//! with a WAL for crash safety and the series index in `meta.redb`.
+//! Every round is kept at full resolution in one segment file per series
+//! and UTC day, with a WAL for crash safety and the series index in
+//! `meta.redb` (architecture doc §6, decision D6). When a day is sealed its
+//! rounds are consolidated into hourly and daily rollup points that keep
+//! the distribution (§6.4), and retention deletes whole files per tier.
 //!
 //! ```no_run
 //! # use rl_store::*;
@@ -24,9 +26,11 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+pub mod health;
 mod index;
 pub mod layout;
 mod reader;
+mod rollup;
 mod round;
 mod segment;
 mod varint;
@@ -35,8 +39,10 @@ mod writer;
 
 use std::path::PathBuf;
 
+pub use health::{HealthLog, HealthSample, NicDelta, read_health};
 pub use index::SeriesKey;
-pub use reader::{Reader, VerifyReport};
+pub use reader::{GraphRounds, Reader, Resolution, VerifyReport};
+pub use rollup::{GRAPH_SAMPLES, QUANTILES, RollupPoint, Tier, quantiles};
 pub use round::{ErrorCounts, FLAG_CLOCK_STEP, StoredRound};
 pub use writer::{Appended, Recovery, Writer, WriterOptions, WriterStats};
 
@@ -60,4 +66,9 @@ pub enum StoreError {
     /// An earlier write failed; reopen the directory to recover.
     #[error("store stopped after an earlier error ({0}); restart to recover")]
     Stopped(String),
+    /// Rollup or retention changed `.0` while it was being read, so the
+    /// read may be incomplete. Reading again sees the new state, which may
+    /// hold less history than before.
+    #[error("{} changed during the read", .0.display())]
+    Expired(PathBuf),
 }

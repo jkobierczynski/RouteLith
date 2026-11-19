@@ -16,6 +16,10 @@ use crate::layout::index_path;
 
 const SERIES: TableDefinition<&str, u64> = TableDefinition::new("series");
 const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
+/// Series id → step (round interval) in milliseconds, as last configured.
+/// Added in M1; an index written before has no such table until the
+/// writer sets the steps.
+const STEPS: TableDefinition<u64, u64> = TableDefinition::new("steps");
 const NEXT_ID: &str = "next_series_id";
 const SEP: char = '\u{1f}';
 const LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -134,6 +138,40 @@ pub(crate) fn register(dir: &Path, keys: &[SeriesKey]) -> Result<Vec<u64>, Store
     Ok(ids)
 }
 
+/// Record each series' step in milliseconds (architecture doc §21.3 E5).
+pub(crate) fn set_steps(dir: &Path, steps: &[(u64, u64)]) -> Result<(), StoreError> {
+    let db = open(dir, true)?.ok_or_else(|| index_err("index missing"))?;
+    let tx = db.begin_write().map_err(index_err)?;
+    {
+        let mut table = tx.open_table(STEPS).map_err(index_err)?;
+        for &(id, step_ms) in steps {
+            table.insert(id, step_ms).map_err(index_err)?;
+        }
+    }
+    tx.commit().map_err(index_err)?;
+    crate::layout::sync_dir(dir)?;
+    Ok(())
+}
+
+/// Every series' recorded step in milliseconds. Empty if none is recorded.
+pub(crate) fn load_steps(dir: &Path) -> Result<std::collections::BTreeMap<u64, u64>, StoreError> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(db) = open(dir, false)? else {
+        return Ok(out);
+    };
+    let tx = db.begin_read().map_err(index_err)?;
+    let table = match tx.open_table(STEPS) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+        Err(e) => return Err(index_err(e)),
+    };
+    for entry in table.iter().map_err(index_err)? {
+        let (k, v) = entry.map_err(index_err)?;
+        out.insert(k.value(), v.value());
+    }
+    Ok(out)
+}
+
 /// Every registered series, sorted by key. Empty if there is no index yet.
 pub(crate) fn load(dir: &Path) -> Result<Vec<(SeriesKey, u64)>, StoreError> {
     let Some(db) = open(dir, false)? else {
@@ -175,6 +213,17 @@ mod tests {
             [2, 3]
         );
         assert_eq!(load(dir.path()).unwrap(), vec![(c, 3), (a, 1), (b, 2)]);
+    }
+
+    #[test]
+    fn steps_are_recorded_and_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        // An M0 index: series but no steps table.
+        let ids = register(dir.path(), &[SeriesKey::new("l", "a", "v4")]).unwrap();
+        assert!(load_steps(dir.path()).unwrap().is_empty());
+        set_steps(dir.path(), &[(ids[0], 300_000)]).unwrap();
+        set_steps(dir.path(), &[(ids[0], 60_000)]).unwrap();
+        assert_eq!(load_steps(dir.path()).unwrap()[&ids[0]], 60_000);
     }
 
     #[test]

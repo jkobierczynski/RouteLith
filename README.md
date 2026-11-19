@@ -8,7 +8,15 @@ shipped as one self-contained binary.
 **Status:** pre-alpha. M0 (ICMP, scheduler, store, SVG smoke graphs) is done;
 M1 is in progress. `routelith check icmp`, `check tcp`, `check dns` and
 `check http` work on Linux and Windows, and `routelith server` measures all
-four kinds of target.
+four kinds of target. The server also answers HTTP on `127.0.0.1:8080`
+(`listen_ui` in `[server]`; `"off"` turns it off): a web UI with an overview
+matrix and smoke graphs per target, a read-only JSON API under `/api/v1`,
+server-rendered SVG graphs, Prometheus `/metrics` and `/healthz`.
+There is no login yet, so keep it on loopback or behind a proxy that has one.
+Once a minute the server also records a health snapshot of its own machine
+(CPU, NIC errors and drops, default gateways, DNS servers) in
+`data/health/`; the target view shows it beside the graphs, so a slow minute
+can be told apart from a busy or reconfigured host.
 
 ```console
 $ routelith check icmp example.net -c 5 -i 200ms
@@ -35,9 +43,9 @@ default). On Windows it uses the ICMP helper API and needs no privileges.
 | `crates/rl-sched` | Round scheduler, phase spreading, rate limiting |
 | `crates/rl-store` | smokestore: WAL, day segments, codecs |
 | `crates/rl-render` | Smoke-graph algorithm and SVG rendering |
+| `crates/rl-web` | HTTP server: REST API, `/metrics`, the web UI (plain JS in `ui/`) |
 
-Later milestones add `rl-path`, `rl-fed`, `rl-alert`, `rl-out`, `rl-web` and
-`rl-reflector`.
+Later milestones add `rl-path`, `rl-fed`, `rl-alert`, `rl-out` and `rl-reflector`.
 
 ## Building
 

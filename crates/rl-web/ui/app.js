@@ -1,0 +1,702 @@
+// Routelith web UI (architecture doc §20): an overview matrix and a target
+// view of canvas smoke graphs, read from /api/v1. Plain JavaScript with no
+// build step; the server embeds this file. Read-only: nothing here writes.
+//
+// Every value from the API goes into the page through textContent or an
+// attribute, never through innerHTML.
+"use strict";
+
+(function () {
+  const RANGES = ["3h", "30h", "10d"];
+  const RANGE_MS = { "3h": 3 * 3600e3, "30h": 30 * 3600e3, "10d": 240 * 3600e3 };
+  // Loss bands of the median line, as in rl-render (§7.1): upper bound of
+  // the loss ratio, CSS token, legend label.
+  const LOSS = [
+    [0.0, "--loss-0", "0 %"],
+    [0.05, "--loss-5", "≤5 %"],
+    [0.1, "--loss-10", "≤10 %"],
+    [0.2, "--loss-20", "≤20 %"],
+    [1.0, "--loss-max", ">20 %"],
+  ];
+  // Same opacity budget as the SVG graph: the middle pair is this dark.
+  const SMOKE_OPACITY = 0.6;
+  const OVERVIEW_REFRESH_MS = 15e3;
+  const GRAPH_REFRESH_MS = 60e3;
+
+  const app = document.getElementById("app");
+  const crumbs = document.getElementById("crumbs");
+  const status = document.getElementById("status");
+  let series = null; // from /api/v1/series, loaded once
+  let timer = null;
+  let generation = 0; // bumped on navigation; stale fetches are ignored
+  const observers = [];
+
+  // ---------- helpers ----------
+
+  function el(tag, attrs, ...children) {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (v === undefined || v === null || v === false) continue;
+      if (k === "class") e.className = v;
+      else if (k === "text") e.textContent = v;
+      else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+      else e.setAttribute(k, v === true ? "" : String(v));
+    }
+    for (const c of children) {
+      if (c === null || c === undefined || c === false) continue;
+      e.append(c instanceof Node ? c : document.createTextNode(String(c)));
+    }
+    return e;
+  }
+
+  function css(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+
+  function lossToken(loss) {
+    for (const [max, token] of LOSS) if (loss <= max + 1e-9) return token;
+    return LOSS[LOSS.length - 1][1];
+  }
+
+  async function getJson(url) {
+    const r = await fetch(url, { headers: { Accept: "application/json" } });
+    let body = null;
+    try {
+      body = await r.json();
+    } catch (_) {
+      /* not JSON */
+    }
+    if (!r.ok) throw new Error((body && body.error) || r.status + " " + r.statusText);
+    return body;
+  }
+
+  function fmtMs(us) {
+    if (us === undefined || us === null) return "–";
+    const ms = us / 1000;
+    if (ms < 1) return ms.toFixed(3) + " ms";
+    if (ms < 10) return ms.toFixed(2) + " ms";
+    if (ms < 100) return ms.toFixed(1) + " ms";
+    return Math.round(ms) + " ms";
+  }
+
+  function fmtPct(r) {
+    if (r === 0) return "0 %";
+    if (r < 0.001) return "<0.1 %";
+    return (r * 100).toFixed(r < 0.1 ? 1 : 0) + " %";
+  }
+
+  function fmtAge(ms) {
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s < 90) return s + " s";
+    if (s < 5400) return Math.round(s / 60) + " min";
+    if (s < 172800) return Math.round(s / 3600) + " h";
+    return Math.round(s / 86400) + " d";
+  }
+
+  function fmtStep(s) {
+    if (s % 3600 === 0) return s / 3600 + " h";
+    if (s % 60 === 0) return s / 60 + " min";
+    return s + " s";
+  }
+
+  function fmtTime(t, withDate) {
+    const d = new Date(t);
+    const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    if (!withDate) return hm;
+    return d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + hm;
+  }
+
+  // Median of a point's quantiles (ascending, from the store).
+  function medianOf(q) {
+    const k = q.length;
+    if (k === 0) return null;
+    return k % 2 ? q[(k - 1) / 2] : (q[k / 2 - 1] + q[k / 2]) / 2;
+  }
+
+  function setStatus(text) {
+    status.textContent = text;
+  }
+
+  function stop() {
+    generation++;
+    if (timer) clearTimeout(timer);
+    timer = null;
+    while (observers.length) observers.pop().disconnect();
+  }
+
+  // Refresh the current view now and then every `every` ms, one refresh
+  // at a time: the next is scheduled once this one settles (failed or
+  // not), so an older response never lands after a newer one, and a
+  // failure is retried. Nothing runs or reports once the view is left.
+  function poll(gen, refresh, every) {
+    const tick = () => {
+      if (gen !== generation) return;
+      refresh()
+        .then(
+          () => gen === generation && setStatus("updated " + fmtTime(Date.now())),
+          (e) => gen === generation && setStatus("update failed: " + e.message)
+        )
+        .finally(() => {
+          if (gen === generation) timer = setTimeout(tick, every);
+        });
+    };
+    tick();
+  }
+
+  async function loadSeries() {
+    if (!series) {
+      const [s, h] = await Promise.all([getJson("/api/v1/series"), getJson("/healthz")]);
+      series = s.series;
+      document.getElementById("vantage").textContent =
+        "vantage " + h.vantage + " · v" + h.version;
+    }
+    return series;
+  }
+
+  // ---------- routing ----------
+
+  function parseHash() {
+    const h = location.hash.replace(/^#/, "") || "/";
+    const [path, query] = h.split("?");
+    const params = new URLSearchParams(query || "");
+    const m = path.match(/^\/target\/(.+)$/);
+    if (m) {
+      let name;
+      try {
+        name = decodeURIComponent(m[1]);
+      } catch (_) {
+        name = m[1];
+      }
+      const range = RANGES.includes(params.get("range")) ? params.get("range") : "3h";
+      return { view: "target", name, range };
+    }
+    return { view: "overview" };
+  }
+
+  function targetHref(name, range) {
+    return "#/target/" + encodeURIComponent(name) + (range && range !== "3h" ? "?range=" + range : "");
+  }
+
+  async function route() {
+    stop();
+    const r = parseHash();
+    const gen = generation;
+    try {
+      await loadSeries();
+      if (gen !== generation) return;
+      if (r.view === "target") await showTarget(r.name, r.range, gen);
+      else await showOverview(gen);
+    } catch (e) {
+      if (gen !== generation) return;
+      app.replaceChildren(el("p", { class: "note", text: "Could not load: " + e.message }));
+    }
+  }
+
+  // ---------- overview (§20.1) ----------
+
+  function lossLegend() {
+    return el(
+      "div",
+      { class: "legend" },
+      el("span", { text: "Median, coloured by loss:" }),
+      ...LOSS.map(([, token, label]) => {
+        const i = el("i");
+        i.style.background = css(token);
+        return el("span", {}, i, label);
+      }),
+      (() => {
+        const i = el("i");
+        i.style.background = css("--stale");
+        return el("span", {}, i, "no recent round");
+      })()
+    );
+  }
+
+  async function showOverview(gen) {
+    crumbs.replaceChildren(el("span", { text: "Overview" }));
+    document.title = "Routelith";
+    const vantages = [...new Set(series.map((s) => s.vantage))].sort();
+    // One row per target and family, one column per vantage.
+    const rows = new Map();
+    for (const s of series) {
+      const key = s.group + "\u0000" + s.target + "\u0000" + s.family;
+      if (!rows.has(key)) rows.set(key, { group: s.group, target: s.target, family: s.family, probe: s.probe, cells: {} });
+      rows.get(key).cells[s.vantage] = s;
+    }
+    const sorted = [...rows.values()].sort(
+      (a, b) =>
+        a.group.localeCompare(b.group) ||
+        a.target.localeCompare(b.target) ||
+        a.family.localeCompare(b.family)
+    );
+    const cells = new Map(); // series id -> <span>
+    const tbody = el("tbody");
+    let group = null;
+    for (const r of sorted) {
+      if (r.group !== group) {
+        group = r.group;
+        tbody.append(el("tr", {}, el("th", { class: "group", colspan: vantages.length + 1, text: group })));
+      }
+      const tr = el(
+        "tr",
+        {},
+        el(
+          "th",
+          { scope: "row" },
+          el("a", { href: targetHref(r.target), text: r.target }),
+          el("span", { class: "badge", text: r.family }),
+          el("span", { class: "badge", text: r.probe })
+        )
+      );
+      for (const v of vantages) {
+        const s = r.cells[v];
+        const span = el("span", { class: "v", text: s ? "…" : "" });
+        if (s) cells.set(s.id, { span, step_s: s.step_s });
+        tr.append(el("td", { class: "cell" }, span));
+      }
+      tbody.append(tr);
+    }
+    const table = el(
+      "table",
+      { class: "matrix" },
+      el("thead", {}, el("tr", {}, el("th", { text: "Target" }), ...vantages.map((v) => el("th", { class: "cell", text: v })))),
+      tbody
+    );
+    app.replaceChildren(
+      el("h1", { text: "Overview" }),
+      el("p", { class: "muted", text: series.length + " series. Each cell is the newest round's median." }),
+      lossLegend(),
+      el("div", { class: "scroll" }, table)
+    );
+
+    async function refresh() {
+      const data = await getJson("/api/v1/latest");
+      if (gen !== generation) return;
+      const latest = new Map(data.latest.map((l) => [l.series, l]));
+      for (const [id, c] of cells) {
+        const l = latest.get(id);
+        if (!l) {
+          c.span.textContent = "–";
+          c.span.title = "No round since the server started";
+          c.span.style.borderLeftColor = css("--stale");
+          continue;
+        }
+        const loss = l.sent ? (l.sent - Math.min(l.recv, l.sent)) / l.sent : 0;
+        const age = data.now - l.t;
+        const stale = age > 3 * c.step_s * 1000 + 60e3;
+        c.span.textContent = l.recv ? fmtMs(l.median_us) : "lost";
+        c.span.style.borderLeftColor = css(stale ? "--stale" : lossToken(loss));
+        c.span.title =
+          "loss " + fmtPct(loss) + " (" + l.recv + "/" + l.sent + ")" +
+          (l.errors ? ", " + l.errors + " error(s)" : "") +
+          (l.recv ? ", min " + fmtMs(l.min_us) + ", p90 " + fmtMs(l.p90_us) + ", max " + fmtMs(l.max_us) : "") +
+          (l.mos !== undefined ? "\nMOS " + l.mos.toFixed(2) : "") +
+          "\n" + fmtAge(age) + " ago" + (stale ? " (stale)" : "");
+      }
+    }
+    poll(gen, refresh, OVERVIEW_REFRESH_MS);
+  }
+
+  // ---------- target view (§20.2) ----------
+
+  async function showTarget(name, range, gen) {
+    const list = series
+      .filter((s) => s.target === name)
+      .sort((a, b) => a.vantage.localeCompare(b.vantage) || a.family.localeCompare(b.family));
+    crumbs.replaceChildren(el("a", { href: "#/", text: "Overview" }), el("span", { text: "›" }), el("span", { text: name }));
+    document.title = name + " · Routelith";
+    if (!list.length) {
+      app.replaceChildren(el("p", { class: "note", text: "No target named " + name + "." }));
+      return;
+    }
+    const first = list[0];
+    const ranges = el(
+      "div",
+      { class: "ranges", role: "group", "aria-label": "Time range" },
+      ...RANGES.map((r) => el("button", { type: "button", "aria-pressed": r === range ? "true" : "false", text: r, onclick: () => (location.hash = targetHref(name, r)) }))
+    );
+    // This machine's health snapshots (§19), shared by its graphs.
+    const host = { data: null };
+    const hostPanel = el("section", { class: "host", hidden: true });
+    async function loadHost() {
+      const width = Math.max(200, Math.round(app.clientWidth || 800));
+      try {
+        const d = await getJson("/api/v1/health?range=" + range + "&points=" + Math.min(5000, width));
+        if (gen !== generation) return;
+        host.data = d;
+      } catch (_) {
+        host.data = null;
+      }
+      showHost(hostPanel, host.data, list);
+    }
+    const graphs = list.map((s) => makeGraph(s, range, gen, host));
+    app.replaceChildren(
+      el("h1", { text: name }),
+      el(
+        "p",
+        { class: "muted" },
+        "group " + first.group + " · " + first.probe + " · " + (first.url || first.host) + " · every " + fmtStep(first.step_s) + ", " + first.pings + " samples per round"
+      ),
+      ranges,
+      lossLegend(),
+      ...graphs.map((g) => g.root),
+      hostPanel
+    );
+    // A graph that fails keeps its last data (or its error) while the
+    // others show theirs; the next refresh tries it again.
+    async function refresh() {
+      await loadHost();
+      if (gen !== generation) return;
+      const results = await Promise.allSettled(graphs.map((g) => g.load()));
+      const failed = results.find((r) => r.status === "rejected");
+      if (failed) throw failed.reason;
+    }
+    poll(gen, refresh, GRAPH_REFRESH_MS);
+  }
+
+  // Health of a vantage at time t: the bucket holding t and the network
+  // state in force then.
+  function healthAt(h, t) {
+    if (!h) return null;
+    let point = null;
+    for (const p of h.points) {
+      if (t >= p.t && t < p.t + h.width_ms) point = p;
+    }
+    let net = null;
+    for (const n of h.network) {
+      if (n.t <= t) net = n;
+    }
+    if (!net && h.network.length) net = h.network[0];
+    return point || net ? { point, net } : null;
+  }
+
+  function addrs(list) {
+    return list && list.length ? list.join(", ") : "none";
+  }
+
+  function showHost(panel, h, list) {
+    if (!h || !list.some((s) => s.vantage === h.vantage)) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    let cpu = null;
+    let errors = 0;
+    let drops = 0;
+    for (const p of h.points) {
+      if (p.cpu_pct !== undefined) cpu = Math.max(cpu === null ? 0 : cpu, p.cpu_pct);
+      errors += p.nic_errors || 0;
+      drops += p.nic_drops || 0;
+    }
+    const now = h.network.length ? h.network[h.network.length - 1] : null;
+    const items = [
+      el("h2", { text: "This machine (" + h.vantage + ")" }),
+      el(
+        "p",
+        { class: "host-summary" },
+        h.points.length
+          ? (cpu === null ? "CPU not measured yet" : "busiest CPU minute " + cpu.toFixed(0) + " %") + " · NIC errors " + errors + " · drops " + drops +
+            (errors + drops ? " (red ticks along the bottom of the graphs)" : "")
+          : "No health snapshots in this range yet (one is taken each minute)."
+      ),
+    ];
+    if (now) {
+      items.push(el("p", { class: "muted", text: "gateway " + addrs(now.gateways) + " · DNS " + addrs(now.dns) }));
+    }
+    const changes = h.network.slice(1);
+    if (changes.length) {
+      const ul = el("ul", { class: "changes" });
+      let prev = h.network[0];
+      for (const c of changes) {
+        const what = [];
+        if (addrs(prev.gateways) !== addrs(c.gateways)) what.push("gateway " + addrs(prev.gateways) + " → " + addrs(c.gateways));
+        if (addrs(prev.dns) !== addrs(c.dns)) what.push("DNS " + addrs(prev.dns) + " → " + addrs(c.dns));
+        ul.append(el("li", { text: fmtTime(c.t, true) + ": " + what.join(", ") }));
+        prev = c;
+      }
+      items.push(el("p", { class: "muted", text: "Network changes, marked on the graphs:" }), ul);
+    }
+    panel.replaceChildren(...items);
+  }
+
+  function makeGraph(s, range, gen, host) {
+    const canvas = el("canvas", { role: "img", "aria-label": "Smoke graph of " + s.target + " (" + s.family + ") from " + s.vantage });
+    const tip = el("div", { class: "tip", hidden: true });
+    const summary = el("div", { class: "summary", text: "Loading…" });
+    const svg = el("a", { href: "/api/v1/render/" + s.id + ".svg?range=" + range, target: "_blank", rel: "noopener", text: "SVG" });
+    const root = el(
+      "section",
+      { class: "graph", "data-series": s.id },
+      el("div", { class: "head" }, el("strong", { text: s.family + " from " + s.vantage }), el("span", { class: "meta" }, "series " + s.id + " · ", svg)),
+      el("div", { class: "plot" }, canvas, tip),
+      summary
+    );
+    let data = null;
+    let layout = null;
+
+    async function load() {
+      if (gen !== generation) return;
+      const width = Math.max(200, Math.round(canvas.clientWidth || 800));
+      let d;
+      try {
+        d = await getJson("/api/v1/series/" + s.id + "/data?range=" + range + "&points=" + Math.min(5000, width));
+      } catch (e) {
+        if (gen === generation && !data) summary.textContent = "Could not load: " + e.message;
+        throw e;
+      }
+      if (gen !== generation) return;
+      data = d;
+      draw();
+      summarise();
+    }
+
+    function summarise() {
+      const pts = data.points;
+      let sent = 0;
+      let recv = 0;
+      let rounds = 0;
+      const medians = [];
+      const scores = [];
+      for (const p of pts) {
+        if (p.mos !== undefined) scores.push(p.mos);
+        sent += p.sent;
+        recv += p.recv;
+        rounds += p.n;
+        const m = medianOf(p.q);
+        if (m !== null) medians.push(m);
+      }
+      medians.sort((a, b) => a - b);
+      scores.sort((a, b) => a - b);
+      const mos = scores.length ? scores[Math.floor((scores.length - 1) / 2)] : null;
+      const med = medians.length ? medians[Math.floor((medians.length - 1) / 2)] : null;
+      const res =
+        data.resolution !== "raw"
+          ? data.resolution === "r1h" ? "hourly" : "daily"
+          : pts.some((p) => p.n > 1)
+            ? "every round, in " + fmtStep(data.width_ms / 1000) + " columns"
+            : "every round";
+      summary.textContent = pts.length
+        ? "median " + fmtMs(med) + " · loss " + fmtPct(sent ? (sent - recv) / sent : 0) +
+          (mos !== null ? " · MOS " + mos.toFixed(2) : "") + " · " + rounds + " rounds · " + res
+        : "No data in this range yet.";
+      canvas.dataset.points = String(pts.length);
+      canvas.dataset.range = range;
+    }
+
+    function draw() {
+      if (!data) return;
+      const dpr = window.devicePixelRatio || 1;
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      if (!w || !h) return;
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+      const L = 64, R = 12, T = 8, B = 22;
+      const pw = Math.max(10, w - L - R);
+      const ph = Math.max(10, h - T - B);
+      const from = data.from;
+      const to = data.to;
+      const x = (t) => L + ((t - from) / (to - from)) * pw;
+
+      // Y range from the highest p90 (the 18th of 20 quantiles), so a few
+      // outliers are clipped instead of flattening the graph.
+      let top = 0;
+      for (const p of data.points) {
+        if (p.q.length) top = Math.max(top, p.q[Math.floor((p.q.length - 1) * 0.9)]);
+      }
+      top = Math.max(top / 1000, 0.1) * 1.1;
+      const tick = niceStep(top, 4);
+      const yMax = Math.ceil(top / tick) * tick;
+      const y = (ms) => T + ph - (Math.min(ms, yMax) / yMax) * ph;
+      // Columns as drawn, for the hover tip.
+      const cols = [];
+      layout = { L, T, pw, ph, x, from, to, cols };
+
+      ctx.font = "11px system-ui, sans-serif";
+      ctx.fillStyle = css("--muted");
+      ctx.strokeStyle = css("--grid");
+      ctx.lineWidth = 1;
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let v = 0; v <= yMax + tick / 2; v += tick) {
+        const yy = Math.round(y(v)) + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(L, yy);
+        ctx.lineTo(L + pw, yy);
+        ctx.stroke();
+        ctx.fillText(fmtTick(v, tick) + " ms", L - 6, yy);
+      }
+      const span = to - from;
+      const xs = xStep(span, pw);
+      const offset = new Date(to).getTimezoneOffset() * 60e3;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      for (let t = Math.ceil((from - offset) / xs) * xs + offset; t < to; t += xs) {
+        const xx = Math.round(x(t)) + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(xx, T);
+        ctx.lineTo(xx, T + ph);
+        ctx.stroke();
+        ctx.fillText(fmtTime(t, xs >= 86400e3 || span > 86400e3), xx, T + ph + 5);
+      }
+
+      // The frame goes under the columns, so a column at the right edge
+      // (the newest round) stays visible.
+      ctx.strokeStyle = css("--frame");
+      ctx.strokeRect(L + 0.5, T + 0.5, pw - 1, ph - 1);
+
+      // Columns: all-lost bars, smoke pairs from the outside in, then the
+      // median coloured by loss.
+      const wms = data.width_ms;
+      const smoke = css("--smoke");
+      const lost = css("--lost");
+      for (const p of data.points) {
+        let x0 = x(Math.max(p.t, from));
+        const x1 = x(Math.min(p.t + wms, to));
+        const bw = Math.min(pw, Math.max(0.75, x1 - x0));
+        x0 = Math.min(x0, L + pw - bw);
+        cols.push({ x0, x1: x0 + bw, p });
+        const k = p.q.length;
+        if (!k) {
+          if (p.sent > 0) {
+            ctx.fillStyle = lost;
+            ctx.fillRect(x0, T, bw, ph);
+          }
+          continue;
+        }
+        const pairs = Math.floor(k / 2);
+        if (pairs) {
+          ctx.fillStyle = smoke;
+          ctx.globalAlpha = SMOKE_OPACITY / pairs;
+          for (let i = 0; i < pairs; i++) {
+            const y0 = y(p.q[k - 1 - i] / 1000);
+            const y1 = y(p.q[i] / 1000);
+            ctx.fillRect(x0, y0, bw, Math.max(0.5, y1 - y0));
+          }
+          ctx.globalAlpha = 1;
+        }
+        const loss = p.sent ? (p.sent - Math.min(p.recv, p.sent)) / p.sent : 0;
+        ctx.fillStyle = css(lossToken(loss));
+        ctx.fillRect(x0, y(medianOf(p.q) / 1000) - 1, bw, 2);
+      }
+
+      // This machine's health: a tick under minutes with NIC errors or
+      // drops, a dashed line where the gateway or DNS servers changed.
+      const hd = host.data;
+      if (hd && hd.vantage === s.vantage) {
+        ctx.fillStyle = css("--nic");
+        for (const p of hd.points) {
+          if (!((p.nic_errors || 0) + (p.nic_drops || 0)) || p.t + hd.width_ms <= from || p.t >= to) continue;
+          const x0 = x(Math.max(p.t, from));
+          const bw = Math.max(2, x(Math.min(p.t + hd.width_ms, to)) - x0);
+          ctx.fillRect(Math.min(x0, L + pw - bw), T + ph - 4, bw, 4);
+        }
+        ctx.strokeStyle = css("--change");
+        ctx.setLineDash([4, 3]);
+        for (const c of hd.network.slice(1)) {
+          if (c.t < from || c.t >= to) continue;
+          const xx = Math.round(x(c.t)) + 0.5;
+          ctx.beginPath();
+          ctx.moveTo(xx, T);
+          ctx.lineTo(xx, T + ph);
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);
+      }
+    }
+
+    function pointAt(px) {
+      if (!data || !layout) return null;
+      // The drawn column under the pointer, or the nearest within 3 px, so
+      // a column narrower than a pixel (the newest) can still be hovered.
+      let best = null;
+      let dist = 3;
+      for (const c of layout.cols) {
+        const d = px < c.x0 ? c.x0 - px : px > c.x1 ? px - c.x1 : 0;
+        if (d <= dist) {
+          best = c.p;
+          dist = d;
+        }
+      }
+      return best;
+    }
+
+    canvas.addEventListener("mousemove", (ev) => {
+      const r = canvas.getBoundingClientRect();
+      const px = ev.clientX - r.left;
+      const p = pointAt(px);
+      if (!p) {
+        tip.hidden = true;
+        return;
+      }
+      const loss = p.sent ? (p.sent - Math.min(p.recv, p.sent)) / p.sent : 0;
+      const hd = host.data && host.data.vantage === s.vantage ? healthAt(host.data, p.t) : null;
+      const healthLines = [];
+      if (hd && hd.point) {
+        const q = hd.point;
+        healthLines.push(
+          el("div", {
+            class: "tip-host",
+            text: "this machine: CPU " + (q.cpu_pct === undefined ? "–" : q.cpu_pct.toFixed(0) + " %") + " · NIC errors " + (q.nic_errors ?? "–") + " · drops " + (q.nic_drops ?? "–"),
+          })
+        );
+      }
+      if (hd && hd.net) {
+        healthLines.push(el("div", { class: "tip-host", text: "gateway " + addrs(hd.net.gateways) + " · DNS " + addrs(hd.net.dns) }));
+      }
+      tip.replaceChildren(
+        el("div", { text: fmtTime(p.t, true) + (p.n > 1 ? " (" + p.n + " rounds)" : "") }),
+        el("div", { text: p.q.length ? "median " + fmtMs(medianOf(p.q)) + " · " + fmtMs(p.q[0]) + " – " + fmtMs(p.q[p.q.length - 1]) : "all lost" }),
+        el("div", { text: "loss " + fmtPct(loss) + " (" + p.recv + "/" + p.sent + ")" + (p.mos !== undefined ? " · MOS " + p.mos.toFixed(2) : "") }),
+        ...healthLines
+      );
+      tip.hidden = false;
+      const left = Math.min(px + 12, r.width - tip.offsetWidth - 4);
+      tip.style.left = Math.max(0, left) + "px";
+      tip.style.top = ev.clientY - r.top + 12 + "px";
+    });
+    canvas.addEventListener("mouseleave", () => (tip.hidden = true));
+
+    if (window.ResizeObserver) {
+      let lastWidth = 0;
+      const ro = new ResizeObserver(() => {
+        if (canvas.clientWidth !== lastWidth) {
+          lastWidth = canvas.clientWidth;
+          draw();
+        }
+      });
+      ro.observe(canvas);
+      observers.push(ro);
+    }
+    // Removed with the view, so a retired graph is not kept alive.
+    const theme = window.matchMedia("(prefers-color-scheme: dark)");
+    theme.addEventListener("change", draw);
+    observers.push({ disconnect: () => theme.removeEventListener("change", draw) });
+    return { root, load };
+  }
+
+  function niceStep(max, ticks) {
+    const raw = Math.max(max / ticks, 1e-6);
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const n = raw / mag;
+    return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * mag;
+  }
+
+  function fmtTick(v, tick) {
+    const d = tick >= 1 ? 0 : Math.min(3, Math.ceil(-Math.log10(tick) + 1e-9) + (tick * Math.pow(10, Math.ceil(-Math.log10(tick))) % 1 ? 1 : 0));
+    return v.toFixed(d);
+  }
+
+  // Grid spacing for about one line per 100 px.
+  function xStep(span, pw) {
+    const steps = [5, 10, 15, 30, 60, 120, 180, 360, 720, 1440, 2880, 10080].map((m) => m * 60e3);
+    const want = span / Math.max(2, pw / 100);
+    return steps.find((s) => s >= want) || steps[steps.length - 1];
+  }
+
+  window.addEventListener("hashchange", route);
+  route();
+})();
