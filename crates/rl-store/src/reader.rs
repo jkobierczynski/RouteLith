@@ -173,6 +173,34 @@ impl Reader {
             || rollup::last_rolled_day(&self.dir, series)?.is_none())
     }
 
+    /// After a raw read: retention may have deleted the oldest raw day
+    /// between the choice and the listing, leaving no file to miss.
+    fn still_raw(&self, series: u64, from_ms: i64) -> Result<(), StoreError> {
+        if self.raw_complete(series, from_ms)? {
+            Ok(())
+        } else {
+            Err(StoreError::Expired(layout::raw_dir(&self.dir, series)))
+        }
+    }
+
+    /// After a tier read: retention may have deleted the hourly file that
+    /// made the tier the right choice.
+    fn still_tier(
+        &self,
+        series: u64,
+        finest: Tier,
+        chosen: Tier,
+        from_ms: i64,
+    ) -> Result<(), StoreError> {
+        if self.covering_tier(series, finest, from_ms)? == chosen {
+            Ok(())
+        } else {
+            Err(StoreError::Expired(rollup::tier_dir(
+                &self.dir, series, chosen,
+            )))
+        }
+    }
+
     /// Rounds for drawing a smoke graph of `from_ms..=to_ms`: the raw
     /// rounds while they cover the range, else one round per rollup point
     /// (its quantiles as the replies, and as many sent as keeps its loss
@@ -185,10 +213,13 @@ impl Reader {
     ) -> Result<(Resolution, Vec<StoredRound>), StoreError> {
         retry(|| {
             if self.raw_complete(series, from_ms)? {
-                return Ok((Resolution::Raw, self.read(series, from_ms, to_ms)?));
+                let rounds = self.read(series, from_ms, to_ms)?;
+                self.still_raw(series, from_ms)?;
+                return Ok((Resolution::Raw, rounds));
             }
             let tier = self.covering_tier(series, Tier::R1h, from_ms)?;
             let points = self.read_tier_once(series, tier, from_ms, to_ms)?;
+            self.still_tier(series, Tier::R1h, tier, from_ms)?;
             Ok((
                 Resolution::Rollup(tier),
                 points.iter().map(RollupPoint::to_round).collect(),
@@ -214,6 +245,7 @@ impl Reader {
         retry(|| {
             if span / step <= limit && self.raw_complete(series, from_ms)? {
                 let rounds = self.read(series, from_ms, to_ms)?;
+                self.still_raw(series, from_ms)?;
                 return Ok((
                     Resolution::Raw,
                     rounds.iter().map(RollupPoint::from_round).collect(),
@@ -225,10 +257,9 @@ impl Reader {
                 Tier::R1d
             };
             let tier = self.covering_tier(series, finest, from_ms)?;
-            Ok((
-                Resolution::Rollup(tier),
-                self.read_tier_once(series, tier, from_ms, to_ms)?,
-            ))
+            let points = self.read_tier_once(series, tier, from_ms, to_ms)?;
+            self.still_tier(series, finest, tier, from_ms)?;
+            Ok((Resolution::Rollup(tier), points))
         })
     }
 

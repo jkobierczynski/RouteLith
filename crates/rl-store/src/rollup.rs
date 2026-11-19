@@ -27,6 +27,10 @@ use crate::varint::{self, Reader};
 
 /// Quantiles per rollup point (matches the default 20 pings per round).
 pub const QUANTILES: usize = 20;
+/// Most replies a rollup point stands for in a graph
+/// ([`RollupPoint::to_round`]): enough to keep the loss ratio to 0.2 %,
+/// few enough that ten years of daily points stay small.
+pub const GRAPH_SAMPLES: u64 = 500;
 const HOUR_MS: i64 = 3_600_000;
 const MAGIC: &[u8; 8] = b"RLROL\0\0\x01";
 const HEADER_LEN: usize = 8 + 8 + 1 + 4;
@@ -137,20 +141,39 @@ impl RollupPoint {
         out
     }
 
-    /// The point as one round for the smoke graph: its quantiles are the
-    /// replies, and `sent` keeps its loss ratio at that many replies.
+    /// The point as one round for the smoke graph: its quantiles stand
+    /// for the replies, repeated so that sent and received keep their
+    /// ratio (both scaled down together past [`GRAPH_SAMPLES`] replies or
+    /// `u16::MAX` sent).
     pub fn to_round(&self) -> StoredRound {
-        let replies = self.quantiles_us.len() as u64;
-        let sent = if self.received == 0 {
-            u64::from(self.sent.min(1))
+        let sent = u64::from(self.sent);
+        let received = u64::from(self.received.min(self.sent));
+        let scale = received
+            .div_ceil(GRAPH_SAMPLES)
+            .max(sent.div_ceil(u64::from(u16::MAX)))
+            .max(1);
+        // Sent rounds up and replies down, so some loss stays some; no
+        // loss stays none, and some replies stay at least one.
+        let scaled_sent = sent.div_ceil(scale);
+        let replies = if received == sent {
+            scaled_sent
         } else {
-            // ceil(replies × sent / received)
-            (replies * u64::from(self.sent)).div_ceil(u64::from(self.received))
+            (received / scale).max(u64::from(received > 0))
+        };
+        let sent = scaled_sent;
+        let q = &self.quantiles_us;
+        let rtts_us = if q.is_empty() {
+            Vec::new()
+        } else {
+            // Reply k of n takes the quantile at the same rank.
+            (0..replies)
+                .map(|k| q[usize::try_from(k * q.len() as u64 / replies).unwrap_or(0)])
+                .collect()
         };
         StoredRound {
             ts_ms: self.ts_ms,
             sent: u16::try_from(sent).unwrap_or(u16::MAX),
-            rtts_us: self.quantiles_us.clone(),
+            rtts_us,
             errors: crate::round::ErrorCounts::default(),
             resolved: None,
             timing: None,
@@ -529,6 +552,36 @@ mod tests {
         assert!(q.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(quantiles(&[7]), vec![7; QUANTILES]);
         assert!(quantiles(&[]).is_empty());
+    }
+
+    #[test]
+    fn graph_rounds_keep_the_loss_ratio() {
+        let point = |sent, received| RollupPoint {
+            ts_ms: 0,
+            rounds: 288,
+            sent,
+            received,
+            quantiles_us: if received > 0 {
+                (1..=20).collect()
+            } else {
+                Vec::new()
+            },
+        };
+        let r = point(240, 238).to_round();
+        assert_eq!((r.sent, r.rtts_us.len()), (240, 238));
+        assert_eq!((r.rtts_us[0], r.rtts_us[237]), (1, 20));
+        // A day of 1 s rounds: scaled down, ratio kept to the sample.
+        let r = point(1_728_000, 1_700_000).to_round();
+        assert!(r.rtts_us.len() as u64 <= GRAPH_SAMPLES);
+        let loss = 1.0 - r.rtts_us.len() as f64 / f64::from(r.sent);
+        assert!((loss - 28_000.0 / 1_728_000.0).abs() < 0.005, "{loss}");
+        let r = point(5760, 5760).to_round();
+        assert_eq!(r.rtts_us.len(), usize::from(r.sent));
+        let r = point(5760, 0).to_round();
+        assert!(r.sent > 0 && r.rtts_us.is_empty());
+        let r = point(100_000, 1).to_round();
+        assert_eq!(r.rtts_us.len(), 1);
+        assert!(r.sent > 1);
     }
 
     #[test]

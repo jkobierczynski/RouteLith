@@ -175,9 +175,12 @@ fn rollups_serve_reads_after_raw_and_hourly_expiry() {
     assert_eq!(res, Resolution::Rollup(Tier::R1h));
     assert_eq!(rounds.len(), 24);
     assert_eq!(rounds[0].ts_ms, T0);
-    assert_eq!(rounds[0].rtts_us.len(), QUANTILES);
-    // 238 of 240 received: 20 quantiles stand for ceil(20 × 240 / 238).
-    assert_eq!(rounds[0].sent, 21);
+    // 238 of 240 received: the loss ratio is kept exactly, and the
+    // replies span the hour's quantiles.
+    assert_eq!((rounds[0].sent, rounds[0].rtts_us.len()), (240, 238));
+    let q = &reader.read_tier(id, Tier::R1h, T0, T0).unwrap()[0].quantiles_us;
+    assert_eq!(rounds[0].rtts_us.first(), q.first());
+    assert_eq!(rounds[0].rtts_us.last(), q.last());
 
     // Points start inside the range, for stored and on-the-fly points
     // alike: the hour starting before `from` is left out.
