@@ -5,6 +5,7 @@
 //! ├── meta.redb                 series index
 //! ├── wal/00000001.wal          write-ahead log
 //! ├── quarantine/               damaged WAL files recovery set aside
+//! ├── health/<vantage>/2026-11-18.jsonl   health snapshots, one a minute
 //! └── series/<id>/
 //!     ├── raw/
 //!     │   ├── 2026-11-17.seg    sealed day segment

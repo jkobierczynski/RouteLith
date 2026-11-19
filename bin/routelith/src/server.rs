@@ -5,6 +5,7 @@
 //! bounded queue to one store thread, which owns the [`Writer`], fsyncs the
 //! WAL once a second and runs maintenance (checkpoints, day sealing,
 //! rollups). The HTTP side reads the store through its own [`Reader`].
+//! A health thread samples this machine once a minute (see `health`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ use rl_sched::{Completed, FailCause, Job, Outcome, Sink, Snapshot, Stats};
 use rl_store::{
     Appended, ErrorCounts, Reader, SeriesKey, StoredRound, Writer, WriterOptions, WriterStats,
 };
-use rl_web::{AppState, HttpPhases, Latest, LatestRound, MetricsWriter, SeriesInfo};
+use rl_web::{AppState, HttpPhases, Latest, LatestHost, LatestRound, MetricsWriter, SeriesInfo};
 use tokio::sync::watch;
 
 /// Rounds waiting for the store thread before new ones are dropped.
@@ -145,6 +146,7 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
 
     // The HTTP side: bind now, so a port in use stops start-up.
     let latest = Arc::new(Latest::default());
+    let host = Arc::new(LatestHost::default());
     let store_stats = Arc::new(Mutex::new(StoreCounters::default()));
     let stats = Arc::new(Stats::default());
     let web = match cfg.server.listen_ui {
@@ -166,6 +168,8 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
             };
             let state = AppState {
                 reader,
+                data_dir: cfg.server.data_dir.clone(),
+                host: host.clone(),
                 series: series_infos(&plans, &ids, &cfg.server.vantage),
                 latest: latest.clone(),
                 vantage: cfg.server.vantage.clone(),
@@ -197,6 +201,20 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
         r
     });
     let sink: Sink = Arc::new(move |c| tx.try_send(c).is_ok());
+    let (health_stop, health_rx) = mpsc::channel::<()>();
+    let health = match crate::health::spawn(
+        cfg.server.data_dir.clone(),
+        cfg.server.vantage.clone(),
+        host,
+        health_rx,
+        now_ms,
+    ) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("routelith server: warning: no health snapshots: {e}");
+            None
+        }
+    };
 
     let limiter = Arc::new(RateLimiter::new(cfg.server.max_pps));
     let mut probes: HashMap<ProbeConfig, Arc<dyn Probe>> = HashMap::new();
@@ -302,6 +320,12 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
     }
     if panicked > 0 {
         eprintln!("routelith server: {panicked} scheduler task(s) failed");
+    }
+    drop(health_stop);
+    if let Some(h) = health {
+        if h.join().is_err() {
+            eprintln!("routelith server: health thread panicked");
+        }
     }
     let mut web_ok = true;
     if let Some(task) = web {

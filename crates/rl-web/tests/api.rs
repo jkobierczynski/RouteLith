@@ -6,8 +6,13 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use rl_store::{ErrorCounts, Reader, SeriesKey, StoredRound, Writer, WriterOptions};
-use rl_web::{AppState, HttpPhases, Latest, LatestRound, SeriesInfo};
+use rl_store::{
+    ErrorCounts, HealthLog, HealthSample, NicDelta, Reader, SeriesKey, StoredRound, Writer,
+    WriterOptions,
+};
+use rl_web::{
+    AppState, HostHealth, HttpPhases, Latest, LatestHost, LatestRound, NicTotal, SeriesInfo,
+};
 use tower::ServiceExt;
 
 const T0: i64 = 1_800_000_000_000;
@@ -64,8 +69,50 @@ fn fixture() -> Fixture {
             cert_not_after_s: Some(1_900_000_000),
         },
     );
+    // A minute of health snapshots each, with a gateway change at 3 min.
+    let mut log = HealthLog::open(dir.path(), "home", 30).unwrap();
+    let mut newest = HealthSample::default();
+    for i in 0..5 {
+        newest = HealthSample {
+            t: T0 + i * 60_000,
+            interval_ms: if i == 0 { 0 } else { 60_000 },
+            cpu_pct: (i > 0).then_some(10.0 * i as f64),
+            load1: Some(0.5),
+            nic_errors: (i > 0).then_some(0),
+            nic_drops: (i > 0).then_some(if i == 2 { 4 } else { 0 }),
+            nics: if i == 2 {
+                vec![NicDelta {
+                    name: "eth0".into(),
+                    errors: 0,
+                    drops: 4,
+                }]
+            } else {
+                Vec::new()
+            },
+            gateways: vec![
+                if i < 3 { "192.0.2.1" } else { "192.0.2.254" }
+                    .parse()
+                    .unwrap(),
+            ],
+            dns: vec!["192.0.2.53".parse().unwrap()],
+        };
+        log.append(&newest).unwrap();
+    }
+    let host = Arc::new(LatestHost::default());
+    host.record(HostHealth {
+        sample: newest,
+        nics: vec![NicTotal {
+            name: "eth0".into(),
+            rx_errors: 1,
+            tx_errors: 0,
+            rx_drops: 9,
+            tx_drops: 0,
+        }],
+    });
     let state = AppState {
         reader: Arc::new(Reader::open(dir.path()).unwrap()),
+        data_dir: dir.path().to_path_buf(),
+        host,
         series: vec![SeriesInfo {
             id,
             key,
@@ -282,4 +329,54 @@ async fn the_ui_is_served_from_the_binary() {
     assert_eq!(st, StatusCode::NOT_FOUND);
     let (st, _, _) = get(&f.router, "/ui/other.js").await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn health_snapshots_are_summarised_with_network_changes() {
+    let f = fixture();
+    let uri = format!("/api/v1/health?from={T0}&to={}", T0 + 3_600_000);
+    let (st, _, body) = get(&f.router, &uri).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v = json(&body);
+    assert_eq!(v["vantage"], "home");
+    assert_eq!(v["width_ms"].as_i64(), Some(60_000));
+    let points = v["points"].as_array().unwrap();
+    assert_eq!(points.len(), 5);
+    assert!(points[0].get("cpu_pct").is_none());
+    assert_eq!(points[4]["cpu_pct"].as_f64(), Some(40.0));
+    assert_eq!(points[2]["nic_drops"].as_u64(), Some(4));
+    assert_eq!(points[2]["nics"][0]["name"], "eth0");
+    let network = v["network"].as_array().unwrap();
+    assert_eq!(network.len(), 2);
+    assert_eq!(network[0]["gateways"][0], "192.0.2.1");
+    assert_eq!(network[1]["t"].as_i64(), Some(T0 + 3 * 60_000));
+    assert_eq!(network[1]["gateways"][0], "192.0.2.254");
+    assert_eq!(network[1]["dns"][0], "192.0.2.53");
+
+    // A day in few points: buckets of whole minutes.
+    let uri = format!("/api/v1/health?from={T0}&to={}&points=10", T0 + 86_400_000);
+    let v = json(&get(&f.router, &uri).await.2);
+    assert_eq!(v["width_ms"].as_i64(), Some(144 * 60_000));
+    assert_eq!(v["points"].as_array().unwrap().len(), 1);
+    assert_eq!(v["points"][0]["n"].as_u64(), Some(5));
+}
+
+#[tokio::test]
+async fn metrics_show_the_host_health() {
+    let f = fixture();
+    let (_, _, body) = get(&f.router, "/metrics").await;
+    for line in [
+        "routelith_host_cpu_busy_ratio{vantage=\"home\"} 0.4",
+        "routelith_host_load1{vantage=\"home\"} 0.5",
+        "routelith_host_nic_drops_total{vantage=\"home\",interface=\"eth0\",direction=\"rx\"} 9",
+        "routelith_host_nic_errors_total{vantage=\"home\",interface=\"eth0\",direction=\"rx\"} 1",
+        "routelith_host_gateway_info{vantage=\"home\",address=\"192.0.2.254\"} 1",
+        "routelith_host_dns_server_info{vantage=\"home\",address=\"192.0.2.53\"} 1",
+        "# TYPE routelith_host_nic_drops_total counter",
+    ] {
+        assert!(
+            body.lines().any(|l| l == line),
+            "missing {line:?} in\n{body}"
+        );
+    }
 }

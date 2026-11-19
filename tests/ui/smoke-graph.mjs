@@ -1,8 +1,8 @@
 // Browser test of the web UI (architecture doc §21.4): start a real
 // `routelith server` measuring TCP connect time to its own UI port, then
 // check in Chromium that the overview matrix fills in and that the target
-// view's canvas draws a smoke graph, with no script errors or CSP
-// violations.
+// view's canvas draws a smoke graph and shows this machine's health
+// snapshot, with no script errors or CSP violations.
 //
 //   node tests/ui/smoke-graph.mjs target/debug/routelith [screenshot-dir]
 //
@@ -131,6 +131,22 @@ try {
   check(drawn.coloured > 0, "median lines are drawn (" + drawn.coloured + " pixels)");
   const summary = await page.textContent("section.graph .summary");
   check(/^median .* ms · loss 0 % · MOS 4\.\d\d · \d+ rounds · every round/.test(summary), "the summary reads " + JSON.stringify(summary));
+
+  // The health snapshot taken at start-up: the panel and the hover tip.
+  await page.waitForSelector("section.host:not([hidden])");
+  const hostText = await page.textContent("section.host");
+  check(/This machine \(ci\)/.test(hostText) && /CPU|snapshots/.test(hostText), "the health panel reads " + JSON.stringify(hostText));
+  const box = await page.$eval("section.graph canvas", (c) => {
+    const r = c.getBoundingClientRect();
+    return { right: r.left + r.width - 13, y: r.top + r.height / 2 };
+  });
+  // Move in from the right edge until the pointer is over a column.
+  let tipText = "";
+  for (let dx = 0; dx < 300 && !tipText; dx += 1) {
+    await page.mouse.move(box.right - dx, box.y);
+    if (await page.isVisible("section.graph .tip")) tipText = await page.textContent("section.graph .tip");
+  }
+  check(/gateway .* · DNS /.test(tipText), "the hover tip shows the network state (" + JSON.stringify(tipText) + ")");
 
   for (const r of ["30h", "10d"]) {
     await page.click(`.ranges button:text("${r}")`);

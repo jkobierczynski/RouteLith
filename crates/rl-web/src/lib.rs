@@ -10,11 +10,13 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod host;
 mod metrics;
 mod ui;
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -25,6 +27,7 @@ use axum::routing::get;
 use rl_store::{Reader, SeriesKey};
 use tokio::net::TcpListener;
 
+pub use host::{HostHealth, LatestHost, NicTotal};
 pub use metrics::MetricsWriter;
 
 /// A series as the API lists it.
@@ -123,8 +126,12 @@ pub type ExtraMetrics = Arc<dyn Fn(&mut MetricsWriter) + Send + Sync>;
 /// Everything the handlers need.
 pub struct AppState {
     pub reader: Arc<Reader>,
+    /// The store directory, for the health snapshot log.
+    pub data_dir: PathBuf,
     pub series: Vec<SeriesInfo>,
     pub latest: Arc<Latest>,
+    /// This machine's newest health snapshot.
+    pub host: Arc<LatestHost>,
     pub vantage: String,
     pub started: Instant,
     pub extra_metrics: Option<ExtraMetrics>,
@@ -149,6 +156,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/latest", get(api::latest))
         .route("/api/v1/series", get(api::series))
         .route("/api/v1/series/{id}/data", get(api::data))
+        .route("/api/v1/health", get(host::history))
         .route("/api/v1/render/{file}", get(api::render))
         .fallback(api::not_found)
         .layer(axum::middleware::map_response(security_headers))

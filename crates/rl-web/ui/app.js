@@ -298,7 +298,21 @@
       { class: "ranges", role: "group", "aria-label": "Time range" },
       ...RANGES.map((r) => el("button", { type: "button", "aria-pressed": r === range ? "true" : "false", text: r, onclick: () => (location.hash = targetHref(name, r)) }))
     );
-    const graphs = list.map((s) => makeGraph(s, range, gen));
+    // This machine's health snapshots (§19), shared by its graphs.
+    const host = { data: null };
+    const hostPanel = el("section", { class: "host", hidden: true });
+    async function loadHost() {
+      const width = Math.max(200, Math.round(app.clientWidth || 800));
+      try {
+        const d = await getJson("/api/v1/health?range=" + range + "&points=" + Math.min(5000, width));
+        if (gen !== generation) return;
+        host.data = d;
+      } catch (_) {
+        host.data = null;
+      }
+      showHost(hostPanel, host.data, list);
+    }
+    const graphs = list.map((s) => makeGraph(s, range, gen, host));
     app.replaceChildren(
       el("h1", { text: name }),
       el(
@@ -308,19 +322,87 @@
       ),
       ranges,
       lossLegend(),
-      ...graphs.map((g) => g.root)
+      ...graphs.map((g) => g.root),
+      hostPanel
     );
+    await loadHost();
     await Promise.all(graphs.map((g) => g.load()));
     if (gen !== generation) return;
     setStatus("updated " + fmtTime(Date.now()));
     timer = setInterval(() => {
-      Promise.all(graphs.map((g) => g.load()))
+      loadHost()
+        .then(() => Promise.all(graphs.map((g) => g.load())))
         .then(() => setStatus("updated " + fmtTime(Date.now())))
         .catch((e) => setStatus("update failed: " + e.message));
     }, GRAPH_REFRESH_MS);
   }
 
-  function makeGraph(s, range, gen) {
+  // Health of a vantage at time t: the bucket holding t and the network
+  // state in force then.
+  function healthAt(h, t) {
+    if (!h) return null;
+    let point = null;
+    for (const p of h.points) {
+      if (t >= p.t && t < p.t + h.width_ms) point = p;
+    }
+    let net = null;
+    for (const n of h.network) {
+      if (n.t <= t) net = n;
+    }
+    if (!net && h.network.length) net = h.network[0];
+    return point || net ? { point, net } : null;
+  }
+
+  function addrs(list) {
+    return list && list.length ? list.join(", ") : "none";
+  }
+
+  function showHost(panel, h, list) {
+    if (!h || !list.some((s) => s.vantage === h.vantage)) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    let cpu = null;
+    let errors = 0;
+    let drops = 0;
+    for (const p of h.points) {
+      if (p.cpu_pct !== undefined) cpu = Math.max(cpu === null ? 0 : cpu, p.cpu_pct);
+      errors += p.nic_errors;
+      drops += p.nic_drops;
+    }
+    const now = h.network.length ? h.network[h.network.length - 1] : null;
+    const items = [
+      el("h2", { text: "This machine (" + h.vantage + ")" }),
+      el(
+        "p",
+        { class: "host-summary" },
+        h.points.length
+          ? (cpu === null ? "CPU not measured yet" : "busiest CPU minute " + cpu.toFixed(0) + " %") + " · NIC errors " + errors + " · drops " + drops +
+            (errors + drops ? " (red ticks along the bottom of the graphs)" : "")
+          : "No health snapshots in this range yet (one is taken each minute)."
+      ),
+    ];
+    if (now) {
+      items.push(el("p", { class: "muted", text: "gateway " + addrs(now.gateways) + " · DNS " + addrs(now.dns) }));
+    }
+    const changes = h.network.slice(1);
+    if (changes.length) {
+      const ul = el("ul", { class: "changes" });
+      let prev = h.network[0];
+      for (const c of changes) {
+        const what = [];
+        if (addrs(prev.gateways) !== addrs(c.gateways)) what.push("gateway " + addrs(prev.gateways) + " → " + addrs(c.gateways));
+        if (addrs(prev.dns) !== addrs(c.dns)) what.push("DNS " + addrs(prev.dns) + " → " + addrs(c.dns));
+        ul.append(el("li", { text: fmtTime(c.t, true) + ": " + what.join(", ") }));
+        prev = c;
+      }
+      items.push(el("p", { class: "muted", text: "Network changes, marked on the graphs:" }), ul);
+    }
+    panel.replaceChildren(...items);
+  }
+
+  function makeGraph(s, range, gen, host) {
     const canvas = el("canvas", { role: "img", "aria-label": "Smoke graph of " + s.target + " (" + s.family + ") from " + s.vantage });
     const tip = el("div", { class: "tip", hidden: true });
     const summary = el("div", { class: "summary", text: "Loading…" });
@@ -404,7 +486,9 @@
       const tick = niceStep(top, 4);
       const yMax = Math.ceil(top / tick) * tick;
       const y = (ms) => T + ph - (Math.min(ms, yMax) / yMax) * ph;
-      layout = { L, T, pw, ph, x, from, to };
+      // Columns as drawn, for the hover tip.
+      const cols = [];
+      layout = { L, T, pw, ph, x, from, to, cols };
 
       ctx.font = "11px system-ui, sans-serif";
       ctx.fillStyle = css("--muted");
@@ -449,6 +533,7 @@
         const x1 = x(Math.min(p.t + wms, to));
         const bw = Math.min(pw, Math.max(0.75, x1 - x0));
         x0 = Math.min(x0, L + pw - bw);
+        cols.push({ x0, x1: x0 + bw, p });
         const k = p.q.length;
         if (!k) {
           if (p.sent > 0) {
@@ -472,14 +557,44 @@
         ctx.fillStyle = css(lossToken(loss));
         ctx.fillRect(x0, y(medianOf(p.q) / 1000) - 1, bw, 2);
       }
+
+      // This machine's health: a tick under minutes with NIC errors or
+      // drops, a dashed line where the gateway or DNS servers changed.
+      const hd = host.data;
+      if (hd && hd.vantage === s.vantage) {
+        ctx.fillStyle = css("--nic");
+        for (const p of hd.points) {
+          if (!(p.nic_errors + p.nic_drops) || p.t + hd.width_ms <= from || p.t >= to) continue;
+          const x0 = x(Math.max(p.t, from));
+          const bw = Math.max(2, x(Math.min(p.t + hd.width_ms, to)) - x0);
+          ctx.fillRect(Math.min(x0, L + pw - bw), T + ph - 4, bw, 4);
+        }
+        ctx.strokeStyle = css("--change");
+        ctx.setLineDash([4, 3]);
+        for (const c of hd.network.slice(1)) {
+          if (c.t < from || c.t >= to) continue;
+          const xx = Math.round(x(c.t)) + 0.5;
+          ctx.beginPath();
+          ctx.moveTo(xx, T);
+          ctx.lineTo(xx, T + ph);
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);
+      }
     }
 
     function pointAt(px) {
       if (!data || !layout) return null;
-      const t = layout.from + ((px - layout.L) / layout.pw) * (layout.to - layout.from);
+      // The drawn column under the pointer, or the nearest within 3 px, so
+      // a column narrower than a pixel (the newest) can still be hovered.
       let best = null;
-      for (const p of data.points) {
-        if (t >= p.t && t < p.t + data.width_ms) best = p;
+      let dist = 3;
+      for (const c of layout.cols) {
+        const d = px < c.x0 ? c.x0 - px : px > c.x1 ? px - c.x1 : 0;
+        if (d <= dist) {
+          best = c.p;
+          dist = d;
+        }
       }
       return best;
     }
@@ -493,10 +608,25 @@
         return;
       }
       const loss = p.sent ? (p.sent - Math.min(p.recv, p.sent)) / p.sent : 0;
+      const hd = host.data && host.data.vantage === s.vantage ? healthAt(host.data, p.t) : null;
+      const healthLines = [];
+      if (hd && hd.point) {
+        const q = hd.point;
+        healthLines.push(
+          el("div", {
+            class: "tip-host",
+            text: "this machine: CPU " + (q.cpu_pct === undefined ? "–" : q.cpu_pct.toFixed(0) + " %") + " · NIC errors " + q.nic_errors + " · drops " + q.nic_drops,
+          })
+        );
+      }
+      if (hd && hd.net) {
+        healthLines.push(el("div", { class: "tip-host", text: "gateway " + addrs(hd.net.gateways) + " · DNS " + addrs(hd.net.dns) }));
+      }
       tip.replaceChildren(
         el("div", { text: fmtTime(p.t, true) + (p.n > 1 ? " (" + p.n + " rounds)" : "") }),
         el("div", { text: p.q.length ? "median " + fmtMs(medianOf(p.q)) + " · " + fmtMs(p.q[0]) + " – " + fmtMs(p.q[p.q.length - 1]) : "all lost" }),
-        el("div", { text: "loss " + fmtPct(loss) + " (" + p.recv + "/" + p.sent + ")" + (p.mos !== undefined ? " · MOS " + p.mos.toFixed(2) : "") })
+        el("div", { text: "loss " + fmtPct(loss) + " (" + p.recv + "/" + p.sent + ")" + (p.mos !== undefined ? " · MOS " + p.mos.toFixed(2) : "") }),
+        ...healthLines
       );
       tip.hidden = false;
       const left = Math.min(px + 12, r.width - tip.offsetWidth - 4);

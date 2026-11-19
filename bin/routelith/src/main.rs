@@ -6,6 +6,7 @@
 
 mod calibrate;
 mod check;
+mod health;
 mod render;
 mod server;
 mod verify;

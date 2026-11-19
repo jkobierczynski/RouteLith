@@ -13,6 +13,10 @@ four kinds of target. The server also answers HTTP on `127.0.0.1:8080`
 matrix and smoke graphs per target, a read-only JSON API under `/api/v1`,
 server-rendered SVG graphs, Prometheus `/metrics` and `/healthz`.
 There is no login yet, so keep it on loopback or behind a proxy that has one.
+Once a minute the server also records a health snapshot of its own machine
+(CPU, NIC errors and drops, default gateways, DNS servers) in
+`data/health/`; the target view shows it beside the graphs, so a slow minute
+can be told apart from a busy or reconfigured host.
 
 ```console
 $ routelith check icmp example.net -c 5 -i 200ms

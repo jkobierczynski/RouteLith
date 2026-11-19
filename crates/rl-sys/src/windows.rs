@@ -283,3 +283,241 @@ impl RawIcmpSocket {
         (&self.socket).read(buf)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Host health readings (see `crate::host`).
+
+use crate::host::{CpuTimes, HostReading, NicCounters};
+use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, FILETIME, NO_ERROR};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    FreeMibTable, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_FRIENDLY_NAME, GAA_FLAG_SKIP_MULTICAST,
+    GAA_FLAG_SKIP_UNICAST, GetAdaptersAddresses, GetIfTable2, GetIpForwardTable2,
+    IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH, MIB_IF_TABLE2, MIB_IPFORWARD_TABLE2,
+};
+use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+use windows_sys::Win32::Networking::WinSock::{
+    AF_INET, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_INET,
+};
+use windows_sys::Win32::System::Threading::GetSystemTimes;
+
+pub(crate) fn read_host() -> HostReading {
+    HostReading {
+        cpu: cpu_times(),
+        load1: None,
+        nics: nic_counters(),
+        gateways: default_gateways(),
+        dns_servers: dns_servers(),
+    }
+}
+
+fn filetime(f: FILETIME) -> u64 {
+    (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime)
+}
+
+fn cpu_times() -> Option<CpuTimes> {
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut idle, mut kernel, mut user) = (zero, zero, zero);
+    // SAFETY: three valid out-pointers to local FILETIMEs.
+    let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+    if ok == 0 {
+        return None;
+    }
+    // Kernel time includes idle time.
+    let total = filetime(kernel).saturating_add(filetime(user));
+    Some(CpuTimes {
+        busy: total.saturating_sub(filetime(idle)),
+        total,
+    })
+}
+
+/// UTF-16 up to the first NUL.
+fn wide(s: &[u16]) -> String {
+    let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
+    String::from_utf16_lossy(&s[..end])
+}
+
+/// Physical interfaces only: Windows also lists filter, tunnel and other
+/// virtual interfaces that would repeat the same counters.
+fn nic_counters() -> Vec<NicCounters> {
+    const HARDWARE_INTERFACE: u8 = 0x1;
+    const FILTER_INTERFACE: u8 = 0x2;
+    let mut table: *mut MIB_IF_TABLE2 = ptr::null_mut();
+    // SAFETY: valid out-pointer; on success the table is freed below.
+    if unsafe { GetIfTable2(&mut table) } != NO_ERROR || table.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: GetIfTable2 succeeded, so `table` points to a MIB_IF_TABLE2
+    // followed by `NumEntries` rows, valid until FreeMibTable.
+    let rows = unsafe {
+        std::slice::from_raw_parts(
+            (*table).Table.as_ptr(),
+            usize::try_from((*table).NumEntries).unwrap_or(0),
+        )
+    };
+    let nics = rows
+        .iter()
+        .filter(|r| {
+            let flags = r.InterfaceAndOperStatusFlags._bitfield;
+            r.Type != IF_TYPE_SOFTWARE_LOOPBACK
+                && flags & HARDWARE_INTERFACE != 0
+                && flags & FILTER_INTERFACE == 0
+        })
+        .map(|r| NicCounters {
+            name: wide(&r.Alias),
+            rx_errors: r.InErrors,
+            tx_errors: r.OutErrors,
+            rx_drops: r.InDiscards,
+            tx_drops: r.OutDiscards,
+        })
+        .collect();
+    // SAFETY: allocated by GetIfTable2 and not used after this.
+    unsafe { FreeMibTable(table.cast()) };
+    nics
+}
+
+fn inet_addr(a: &SOCKADDR_INET) -> Option<IpAddr> {
+    // SAFETY: every variant starts with the address family, which says
+    // which variant is valid.
+    unsafe {
+        match a.si_family {
+            AF_INET => Some(IpAddr::V4(Ipv4Addr::from(
+                a.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes(),
+            ))),
+            AF_INET6 => Some(IpAddr::V6(Ipv6Addr::from(a.Ipv6.sin6_addr.u.Byte))),
+            _ => None,
+        }
+    }
+}
+
+fn default_gateways() -> Vec<IpAddr> {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = ptr::null_mut();
+    // SAFETY: valid out-pointer; on success the table is freed below.
+    if unsafe { GetIpForwardTable2(AF_UNSPEC, &mut table) } != NO_ERROR || table.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: as in `nic_counters`.
+    let rows = unsafe {
+        std::slice::from_raw_parts(
+            (*table).Table.as_ptr(),
+            usize::try_from((*table).NumEntries).unwrap_or(0),
+        )
+    };
+    let mut gws: Vec<IpAddr> = rows
+        .iter()
+        .filter(|r| r.DestinationPrefix.PrefixLength == 0 && !r.Loopback)
+        .filter_map(|r| inet_addr(&r.NextHop))
+        .filter(|a| !a.is_unspecified())
+        .collect();
+    // SAFETY: allocated by GetIpForwardTable2 and not used after this.
+    unsafe { FreeMibTable(table.cast()) };
+    gws.sort_by_key(IpAddr::is_ipv6);
+    gws
+}
+
+fn sockaddr(p: *const SOCKADDR) -> Option<IpAddr> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: the IP Helper API gives a SOCKADDR_IN or SOCKADDR_IN6 behind
+    // this pointer, as its family says; read_unaligned copes with any
+    // alignment.
+    unsafe {
+        match (*p).sa_family {
+            AF_INET => {
+                let a: SOCKADDR_IN = ptr::read_unaligned(p.cast());
+                Some(IpAddr::V4(Ipv4Addr::from(
+                    a.sin_addr.S_un.S_addr.to_ne_bytes(),
+                )))
+            }
+            AF_INET6 => {
+                let a: SOCKADDR_IN6 = ptr::read_unaligned(p.cast());
+                Some(IpAddr::V6(Ipv6Addr::from(a.sin6_addr.u.Byte)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Windows lists `fec0:0:0:ffff::1` to `::3` on adapters that have no
+/// IPv6 DNS server configured; they are placeholders, not servers.
+fn placeholder_dns(a: &IpAddr) -> bool {
+    match a {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[..4] == [0xfec0, 0, 0, 0xffff] && s[4..7] == [0, 0, 0] && (1..=3).contains(&s[7])
+        }
+        IpAddr::V4(_) => false,
+    }
+}
+
+fn dns_servers() -> Vec<IpAddr> {
+    let flags = GAA_FLAG_SKIP_UNICAST
+        | GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_FRIENDLY_NAME;
+    let mut size: u32 = 16 * 1024;
+    let mut buf: Vec<u64> = Vec::new();
+    for _ in 0..4 {
+        buf = vec![0u64; usize::try_from(size).unwrap_or(0) / 8 + 1];
+        size = u32::try_from(buf.len() * 8).unwrap_or(u32::MAX);
+        // SAFETY: the buffer is `size` bytes, 8-byte aligned, and outlives
+        // every pointer read from it below.
+        let rc = unsafe {
+            GetAdaptersAddresses(
+                u32::from(AF_UNSPEC),
+                flags,
+                ptr::null(),
+                buf.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        match rc {
+            NO_ERROR => break,
+            ERROR_BUFFER_OVERFLOW => {
+                buf.clear();
+                continue;
+            }
+            _ => return Vec::new(),
+        }
+    }
+    if buf.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut adapter: *const IP_ADAPTER_ADDRESSES_LH = buf.as_ptr().cast();
+    while !adapter.is_null() {
+        // SAFETY: a node of the list GetAdaptersAddresses built in `buf`.
+        let a = unsafe { &*adapter };
+        if a.OperStatus == IfOperStatusUp && a.IfType != IF_TYPE_SOFTWARE_LOOPBACK {
+            let mut dns = a.FirstDnsServerAddress;
+            while !dns.is_null() {
+                // SAFETY: a node of the adapter's DNS server list, in `buf`.
+                let d = unsafe { &*dns };
+                if let Some(ip) = sockaddr(d.Address.lpSockaddr) {
+                    if !placeholder_dns(&ip) {
+                        out.push(ip);
+                    }
+                }
+                dns = d.Next;
+            }
+        }
+        adapter = a.Next;
+    }
+    out
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn site_local_dns_placeholders_are_recognised() {
+        assert!(placeholder_dns(&"fec0:0:0:ffff::1".parse().unwrap()));
+        assert!(placeholder_dns(&"fec0:0:0:ffff::3".parse().unwrap()));
+        assert!(!placeholder_dns(&"fec0:0:0:ffff::4".parse().unwrap()));
+        assert!(!placeholder_dns(&"192.0.2.1".parse().unwrap()));
+    }
+}

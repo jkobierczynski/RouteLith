@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+pub mod health;
 mod index;
 pub mod layout;
 mod reader;
@@ -38,6 +39,7 @@ mod writer;
 
 use std::path::PathBuf;
 
+pub use health::{HealthLog, HealthSample, NicDelta, read_health};
 pub use index::SeriesKey;
 pub use reader::{Reader, Resolution, VerifyReport};
 pub use rollup::{QUANTILES, RollupPoint, Tier, quantiles};

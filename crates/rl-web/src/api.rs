@@ -121,14 +121,14 @@ pub(crate) async fn latest(State(s): State<Arc<AppState>>) -> Response {
 pub(crate) struct RangeQuery {
     from: Option<i64>,
     to: Option<i64>,
-    points: Option<u32>,
+    pub(crate) points: Option<u32>,
     /// `3h`, `30h` or `10d`, ending at `to` (instead of `from`).
     range: Option<String>,
 }
 
 impl RangeQuery {
     #[allow(clippy::result_large_err)] // the error is the response itself
-    fn resolve(&self) -> Result<(i64, i64), Response> {
+    pub(crate) fn resolve(&self) -> Result<(i64, i64), Response> {
         let to = self.to.unwrap_or_else(now_ms);
         let from = match (self.from, self.range.as_deref()) {
             (Some(f), None) => f,
@@ -163,7 +163,7 @@ fn range_ms(r: &str) -> Option<i64> {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
