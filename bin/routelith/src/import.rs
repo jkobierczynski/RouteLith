@@ -394,11 +394,14 @@ fn convert(d: &Dump, today: i64) -> Result<Converted, String> {
                 continue;
             };
             let total = f64::from(pdp) * f64::from(sent);
-            let received = if rtts.is_empty() {
-                0
-            } else {
-                (total - f64::from(pdp) * loss).round().max(1.0) as u32
-            };
+            let mut received = (total - f64::from(pdp) * loss).round().max(0.0) as u32;
+            let mut rtts = rtts;
+            if received == 0 || rtts.is_empty() {
+                // All lost (a slot value left by blending is not a reply),
+                // or replies without any RTT to show for them.
+                received = 0;
+                rtts.clear();
+            }
             rows.push((
                 start,
                 w,
@@ -709,6 +712,12 @@ mod tests {
         let p = &c.history.hourly[0];
         assert_eq!((p.sent, p.received), (60, 6));
         assert_eq!(p.quantiles_us, vec![20_000; rl_store::QUANTILES]);
+        // All lost: a slot value left by blending is no reply.
+        let mut all_lost = dump;
+        all_lost.rras[0].rows[0][0] = 5.0;
+        let c = convert(&all_lost, i64::MAX).unwrap();
+        let p = &c.history.hourly[0];
+        assert_eq!((p.sent, p.received, p.quantiles_us.len()), (60, 0, 0));
     }
 
     #[test]
