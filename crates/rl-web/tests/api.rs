@@ -156,6 +156,7 @@ async fn data_returns_raw_points_for_a_short_range() {
     let q = pts[0]["q"].as_array().unwrap();
     assert_eq!(q.first().unwrap().as_u64(), Some(1000));
     assert_eq!(q.last().unwrap().as_u64(), Some(1200));
+    assert!(pts[0]["mos"].as_f64().is_some());
 }
 
 #[tokio::test]
@@ -230,6 +231,8 @@ async fn metrics_show_the_newest_round() {
         format!("routelith_tls_cert_expiry_timestamp_seconds{{{labels}}} 1900000000"),
         "# TYPE routelith_test_total counter".to_string(),
         "routelith_test_total 7".to_string(),
+        // 1.1 ms RTT, 25 % loss: G.711 with PLC loses a lot to loss.
+        format!("routelith_mos_score{{{labels}}} 2.33"),
     ] {
         assert!(body.lines().any(|l| l == line), "missing {line}\n{body}");
     }
@@ -248,6 +251,7 @@ async fn latest_lists_the_newest_rounds() {
     assert_eq!(l["series"].as_u64(), Some(f.id));
     assert_eq!((l["sent"].as_u64(), l["recv"].as_u64()), (Some(4), Some(3)));
     assert_eq!(l["median_us"].as_u64(), Some(1100));
+    assert!(l["mos"].as_f64().unwrap() > 2.0);
 }
 
 #[tokio::test]

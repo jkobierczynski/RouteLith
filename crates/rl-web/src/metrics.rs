@@ -248,6 +248,22 @@ pub(crate) fn render(s: &AppState) -> String {
             );
         }
     }
+    m.family(
+        "routelith_mos_score",
+        "gauge",
+        "Estimated voice quality (ITU-T G.107 E-model, G.711) of the newest round, 1 to 4.5.",
+    );
+    for (i, l) in &rows {
+        if let Some(mos) = crate::latest_mos(l) {
+            emit(
+                &mut m,
+                "routelith_mos_score",
+                i,
+                None,
+                (mos * 100.0).round() / 100.0,
+            );
+        }
+    }
     if let Some(extra) = &s.extra_metrics {
         extra(&mut m);
     }

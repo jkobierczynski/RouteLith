@@ -271,6 +271,7 @@
           "loss " + fmtPct(loss) + " (" + l.recv + "/" + l.sent + ")" +
           (l.errors ? ", " + l.errors + " error(s)" : "") +
           (l.recv ? ", min " + fmtMs(l.min_us) + ", p90 " + fmtMs(l.p90_us) + ", max " + fmtMs(l.max_us) : "") +
+          (l.mos !== undefined ? "\nMOS " + l.mos.toFixed(2) : "") +
           "\n" + fmtAge(age) + " ago" + (stale ? " (stale)" : "");
       }
       setStatus("updated " + fmtTime(Date.now()));
@@ -349,7 +350,9 @@
       let recv = 0;
       let rounds = 0;
       const medians = [];
+      const scores = [];
       for (const p of pts) {
+        if (p.mos !== undefined) scores.push(p.mos);
         sent += p.sent;
         recv += p.recv;
         rounds += p.n;
@@ -357,6 +360,8 @@
         if (m !== null) medians.push(m);
       }
       medians.sort((a, b) => a - b);
+      scores.sort((a, b) => a - b);
+      const mos = scores.length ? scores[Math.floor((scores.length - 1) / 2)] : null;
       const med = medians.length ? medians[Math.floor((medians.length - 1) / 2)] : null;
       const res =
         data.resolution !== "raw"
@@ -365,7 +370,8 @@
             ? "every round, in " + fmtStep(data.width_ms / 1000) + " columns"
             : "every round";
       summary.textContent = pts.length
-        ? "median " + fmtMs(med) + " · loss " + fmtPct(sent ? (sent - recv) / sent : 0) + " · " + rounds + " rounds · " + res
+        ? "median " + fmtMs(med) + " · loss " + fmtPct(sent ? (sent - recv) / sent : 0) +
+          (mos !== null ? " · MOS " + mos.toFixed(2) : "") + " · " + rounds + " rounds · " + res
         : "No data in this range yet.";
       canvas.dataset.points = String(pts.length);
     }
@@ -490,7 +496,7 @@
       tip.replaceChildren(
         el("div", { text: fmtTime(p.t, true) + (p.n > 1 ? " (" + p.n + " rounds)" : "") }),
         el("div", { text: p.q.length ? "median " + fmtMs(medianOf(p.q)) + " · " + fmtMs(p.q[0]) + " – " + fmtMs(p.q[p.q.length - 1]) : "all lost" }),
-        el("div", { text: "loss " + fmtPct(loss) + " (" + p.recv + "/" + p.sent + ")" })
+        el("div", { text: "loss " + fmtPct(loss) + " (" + p.recv + "/" + p.sent + ")" + (p.mos !== undefined ? " · MOS " + p.mos.toFixed(2) : "") })
       );
       tip.hidden = false;
       const left = Math.min(px + 12, r.width - tip.offsetWidth - 4);

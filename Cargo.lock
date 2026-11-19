@@ -1148,6 +1148,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "http-body-util",
+ "rl-core",
  "rl-render",
  "rl-store",
  "serde",
