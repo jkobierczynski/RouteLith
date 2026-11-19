@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::index::{self, SeriesKey};
 use crate::layout::{self, day_of};
+use crate::rollup::{self, RollupPoint, Tier};
 use crate::round::StoredRound;
 use crate::segment::{self, Tail};
 use crate::{StoreError, codec, wal};
@@ -18,7 +19,21 @@ use crate::{StoreError, codec, wal};
 pub struct Reader {
     dir: PathBuf,
     series: Vec<(SeriesKey, u64)>,
+    /// Recorded step per series, milliseconds.
+    steps: BTreeMap<u64, u64>,
 }
+
+/// The resolution a range was read at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    /// One point per stored round.
+    Raw,
+    /// One point per hour or day.
+    Rollup(Tier),
+}
+
+/// Step assumed for a series with none recorded (the config default).
+const DEFAULT_STEP_MS: u64 = 300_000;
 
 /// Result of [`Reader::verify`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -39,6 +54,7 @@ impl Reader {
         Ok(Self {
             dir: dir.to_path_buf(),
             series: index::load(dir)?,
+            steps: index::load_steps(dir)?,
         })
     }
 
@@ -54,6 +70,82 @@ impl Reader {
             .filter(|(k, _)| k.target == target)
             .map(|(k, id)| (k, *id))
             .collect()
+    }
+
+    /// The step (round interval) recorded for a series, in milliseconds.
+    /// `None` for a series written before steps were recorded and not
+    /// measured since.
+    pub fn step_ms(&self, series: u64) -> Option<u64> {
+        self.steps.get(&series).copied()
+    }
+
+    /// Points of one rollup tier with `from_ms <= ts <= to_ms`, oldest
+    /// first. Days not rolled up yet (today, and days awaiting their seal)
+    /// are consolidated from the raw rounds on the fly, so the range has no
+    /// hole at its recent end.
+    pub fn read_tier(
+        &self,
+        series: u64,
+        tier: Tier,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<RollupPoint>, StoreError> {
+        let mut out = rollup::read(&self.dir, series, tier, from_ms, to_ms)?;
+        let rolled_until = rollup::last_rolled_day(&self.dir, series)?
+            .map_or(i64::MIN, |d| (d + 1).saturating_mul(layout::DAY_MS));
+        let raw_from = from_ms.max(rolled_until);
+        if raw_from <= to_ms {
+            // Start at a bucket boundary, so the first bucket is whole.
+            let start = raw_from.div_euclid(tier.width_ms()) * tier.width_ms();
+            let rounds = self.read(series, start, to_ms)?;
+            out.retain(|p| p.ts_ms < start);
+            out.extend(
+                RollupPoint::build(&rounds, tier.width_ms())
+                    .into_iter()
+                    .filter(|p| p.ts_ms >= from_ms.div_euclid(tier.width_ms()) * tier.width_ms()),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Points for drawing `from_ms..=to_ms` about `max_points` wide: the
+    /// finest resolution with at most twice that many points, and not raw
+    /// when the range starts before the oldest raw day still on disk.
+    pub fn read_points(
+        &self,
+        series: u64,
+        from_ms: i64,
+        to_ms: i64,
+        max_points: u32,
+    ) -> Result<(Resolution, Vec<RollupPoint>), StoreError> {
+        let span = to_ms.saturating_sub(from_ms).max(1);
+        let step = i64::try_from(self.step_ms(series).unwrap_or(DEFAULT_STEP_MS))
+            .unwrap_or(i64::MAX)
+            .max(1);
+        let limit = i64::from(max_points.max(1)) * 2;
+        let oldest_raw = layout::list_segments(&self.dir, series)?
+            .first()
+            .map(|s| s.day * layout::DAY_MS);
+        // Raw serves the range if it holds data back to the range's start,
+        // or if there are no rollups to use instead.
+        let raw_complete = oldest_raw.is_some_and(|o| from_ms >= o)
+            || rollup::last_rolled_day(&self.dir, series)?.is_none();
+        if span / step <= limit && raw_complete {
+            let rounds = self.read(series, from_ms, to_ms)?;
+            return Ok((
+                Resolution::Raw,
+                rounds.iter().map(RollupPoint::from_round).collect(),
+            ));
+        }
+        let tier = if span / Tier::R1h.width_ms() <= limit {
+            Tier::R1h
+        } else {
+            Tier::R1d
+        };
+        Ok((
+            Resolution::Rollup(tier),
+            self.read_tier(series, tier, from_ms, to_ms)?,
+        ))
     }
 
     /// Rounds of a series with `from_ms <= ts <= to_ms`, oldest first,

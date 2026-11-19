@@ -5,9 +5,12 @@
 //! ├── meta.redb                 series index
 //! ├── wal/00000001.wal          write-ahead log
 //! ├── quarantine/               damaged WAL files recovery set aside
-//! └── series/<id>/raw/
-//!     ├── 2026-11-17.seg        sealed day segment
-//!     └── 2026-11-18.open       today's open segment
+//! └── series/<id>/
+//!     ├── raw/
+//!     │   ├── 2026-11-17.seg    sealed day segment
+//!     │   └── 2026-11-18.open   today's open segment
+//!     ├── r1h/2026-11.roll      hourly rollups of a month
+//!     └── r1d/2026.roll         daily rollups of a year
 //! ```
 
 use std::path::{Path, PathBuf};

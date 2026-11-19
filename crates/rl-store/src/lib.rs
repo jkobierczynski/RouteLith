@@ -1,8 +1,10 @@
-//! smokestore: WAL, day segments, codecs and (later) rollups.
+//! smokestore: WAL, day segments, codecs and rollups.
 //!
-//! M0 has the raw tier only (architecture doc §6, decision D6): every round
-//! is kept at full resolution in one segment file per series and UTC day,
-//! with a WAL for crash safety and the series index in `meta.redb`.
+//! Every round is kept at full resolution in one segment file per series
+//! and UTC day, with a WAL for crash safety and the series index in
+//! `meta.redb` (architecture doc §6, decision D6). When a day is sealed its
+//! rounds are consolidated into hourly and daily rollup points that keep
+//! the distribution (§6.4), and retention deletes whole files per tier.
 //!
 //! ```no_run
 //! # use rl_store::*;
@@ -27,6 +29,7 @@ mod codec;
 mod index;
 pub mod layout;
 mod reader;
+mod rollup;
 mod round;
 mod segment;
 mod varint;
@@ -36,7 +39,8 @@ mod writer;
 use std::path::PathBuf;
 
 pub use index::SeriesKey;
-pub use reader::{Reader, VerifyReport};
+pub use reader::{Reader, Resolution, VerifyReport};
+pub use rollup::{QUANTILES, RollupPoint, Tier, quantiles};
 pub use round::{ErrorCounts, FLAG_CLOCK_STEP, StoredRound};
 pub use writer::{Appended, Recovery, Writer, WriterOptions, WriterStats};
 
