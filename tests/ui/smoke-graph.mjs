@@ -80,6 +80,13 @@ async function waitFor(fn, what, ms = 15000) {
   }
 }
 
+// page.waitForFunction runs its predicate through eval in the page, which
+// the UI's CSP (no 'unsafe-eval') refuses with some Playwright versions;
+// page.evaluate goes through the debugger protocol and is not affected.
+function waitInPage(page, fn, arg, ms = 30000) {
+  return waitFor(() => page.evaluate(fn, arg), "the page", ms);
+}
+
 let browser;
 try {
   await waitFor(async () => (await fetch(base + "/healthz")).ok, "the server");
@@ -101,7 +108,7 @@ try {
   const resp = await page.goto(base + "/");
   check(resp.ok(), "the page loads");
   check((resp.headers()["content-security-policy"] || "").includes("script-src 'self'"), "the page carries its CSP");
-  await page.waitForFunction(() => [...document.querySelectorAll("td.cell span.v")].every((s) => s.textContent && s.textContent !== "…"));
+  await waitInPage(page, () => [...document.querySelectorAll("td.cell span.v")].every((s) => s.textContent && s.textContent !== "…"));
   const cells = await page.$$eval("td.cell span.v", (s) => s.map((e) => e.textContent));
   check(cells.length === 2, "the matrix has a cell per series (" + cells.join(", ") + ")");
   check(cells.some((c) => / ms$/.test(c)), "the reachable target shows a median");
@@ -109,7 +116,7 @@ try {
   if (shots) await page.screenshot({ path: join(shots, "overview.png") });
 
   await page.click("text=web-ui");
-  await page.waitForFunction(() => {
+  await waitInPage(page, () => {
     const c = document.querySelector("section.graph canvas");
     return c && Number(c.dataset.points) > 0;
   });
@@ -150,11 +157,11 @@ try {
 
   for (const r of ["30h", "10d"]) {
     await page.click(`.ranges button:text("${r}")`);
-    await page.waitForFunction((r) => location.hash.endsWith("range=" + r) && Number(document.querySelector("section.graph canvas")?.dataset.points) > 0, r);
+    await waitInPage(page, (r) => location.hash.endsWith("range=" + r) && Number(document.querySelector("section.graph canvas")?.dataset.points) > 0, r);
   }
   check(true, "the 30h and 10d ranges load");
   await page.click(`.ranges button:text("3h")`);
-  await page.waitForFunction(() => Number(document.querySelector("section.graph canvas")?.dataset.points) > 0);
+  await waitInPage(page, () => Number(document.querySelector("section.graph canvas")?.dataset.points) > 0);
   if (shots) await page.screenshot({ path: join(shots, "target.png") });
 
   check(problems.length === 0, "no script errors or CSP violations" + (problems.length ? ": " + problems.join(" | ") : ""));
