@@ -28,7 +28,7 @@ tempfile = "3"
 thiserror = "2"
 toml = "1.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
-zstd = "0.13"
+zstd = "0.14"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_IO"] }
 
 # Shared lints. `unsafe_code` is not set here because `rl-sys` needs unsafe;
