@@ -71,17 +71,25 @@ impl DnsProbe {
                 cfg.expect_rcode
             )))
         })?;
+        if cfg.expect_answers.is_some() && matches!(qtype, RecordType::DS | RecordType::DNSKEY) {
+            return Err(ProbeError::Io(io::Error::other(format!(
+                "expected answers are not supported for {qtype} queries (their answers are not decoded)"
+            ))));
+        }
         let answers = cfg
             .expect_answers
             .as_ref()
             .map(|a| a.iter().map(|s| normalise(s)).collect());
+        let prepared = Prepared {
+            cfg,
+            qtype,
+            rcode,
+            answers,
+        };
+        // A query name that cannot be sent fails here, not in every sample.
+        build_query(&prepared, 0).map_err(|e| ProbeError::Io(io::Error::other(e)))?;
         Ok(Self {
-            config: Arc::new(Prepared {
-                cfg,
-                qtype,
-                rcode,
-                answers,
-            }),
+            config: Arc::new(prepared),
             limiter: None,
         })
     }
@@ -154,14 +162,21 @@ async fn sample(p: &Prepared, dest: SocketAddr, timeout: Duration) -> Sample {
         Ok(q) => q,
         Err(e) => return Sample::Error(SampleError::SendFailed(e)),
     };
-    let start = Instant::now();
-    let deadline = start + timeout;
+    let deadline = Instant::now() + timeout;
+    // UDP is timed from the send to the answer; TCP from the start of the
+    // handshake, which is part of what a TCP resolver client waits for.
     let exchanged = match p.cfg.transport {
         DnsTransport::Udp => timeout_at(deadline, udp_exchange(dest, &query, id)).await,
-        DnsTransport::Tcp => timeout_at(deadline, tcp_exchange(dest, &query)).await,
+        DnsTransport::Tcp => {
+            timeout_at(deadline, async {
+                let start = Instant::now();
+                let r = tcp_exchange(dest, &query).await?;
+                Ok((r, start.elapsed()))
+            })
+            .await
+        }
     };
-    let rtt = start.elapsed();
-    let response = match exchanged {
+    let (response, rtt) = match exchanged {
         Err(_) => return Sample::Lost,
         Ok(Err(Failure::Local(e))) => return Sample::Error(SampleError::SendFailed(e)),
         Ok(Err(Failure::Remote(e))) => return Sample::Error(SampleError::Other(e)),
@@ -186,7 +201,11 @@ fn local(e: &io::Error) -> Failure {
     Failure::Local(e.to_string())
 }
 
-async fn udp_exchange(dest: SocketAddr, query: &[u8], id: u16) -> Result<Vec<u8>, Failure> {
+async fn udp_exchange(
+    dest: SocketAddr,
+    query: &[u8],
+    id: u16,
+) -> Result<(Vec<u8>, Duration), Failure> {
     let bind: SocketAddr = if dest.is_ipv6() {
         (Ipv6Addr::UNSPECIFIED, 0).into()
     } else {
@@ -194,6 +213,7 @@ async fn udp_exchange(dest: SocketAddr, query: &[u8], id: u16) -> Result<Vec<u8>
     };
     let socket = UdpSocket::bind(bind).await.map_err(|e| local(&e))?;
     socket.connect(dest).await.map_err(|e| local(&e))?;
+    let start = Instant::now();
     socket.send(query).await.map_err(|e| local(&e))?;
     let mut buf = vec![0u8; MAX_UDP];
     loop {
@@ -207,8 +227,9 @@ async fn udp_exchange(dest: SocketAddr, query: &[u8], id: u16) -> Result<Vec<u8>
         };
         // A stray or spoofed datagram with another id is ignored.
         if n >= 2 && u16::from_be_bytes([buf[0], buf[1]]) == id {
+            let rtt = start.elapsed();
             buf.truncate(n);
-            return Ok(buf);
+            return Ok((buf, rtt));
         }
     }
 }
@@ -418,6 +439,18 @@ mod tests {
             }
         });
         (port, rx)
+    }
+
+    #[test]
+    fn unusable_settings_fail_when_the_probe_is_made() {
+        let e = DnsProbe::new(cfg("exa mple.com")).unwrap_err();
+        assert!(e.to_string().contains("bad query name"), "{e}");
+        let mut c = cfg("example.com");
+        c.qtype = "DS".into();
+        c.expect_answers = Some(vec!["12345 13 2 abcd".into()]);
+        assert!(DnsProbe::new(c).is_err());
+        DnsProbe::new(cfg(".")).unwrap();
+        DnsProbe::new(cfg("{rand}.example.com")).unwrap();
     }
 
     #[tokio::test]
