@@ -320,7 +320,7 @@ fn threshold(st: &mut RuleState, t: &Threshold, r: &RoundValues) -> Option<Chang
 
 fn describe(cmps: &[rl_core::alert::Comparison], m: Metric) -> String {
     cmps.iter()
-        .map(|c| format!("{} {}", c.op.as_str(), m.format(c.limit)))
+        .map(|c| format!("{} {}", c.op.as_str(), m.format_limit(c.limit)))
         .collect::<Vec<_>>()
         .join(" and ")
 }

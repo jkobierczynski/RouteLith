@@ -1089,6 +1089,7 @@ dependencies = [
 name = "rl-core"
 version = "0.0.0"
 dependencies = [
+ "proptest",
  "serde",
  "thiserror",
  "toml",

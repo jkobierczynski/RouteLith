@@ -103,6 +103,17 @@ impl Metric {
             Unit::Plain | Unit::Count => trim(v),
         }
     }
+
+    /// A configured limit with its unit, without rounding it away: a
+    /// rule's text must show the value it is evaluated against.
+    pub fn format_limit(self, v: f64) -> String {
+        let s = exact(v);
+        match self.unit() {
+            Unit::Time => format!("{s}ms"),
+            Unit::Percent => format!("{s}%"),
+            Unit::Plain | Unit::Count => s,
+        }
+    }
 }
 
 impl fmt::Display for Metric {
@@ -118,7 +129,7 @@ impl AlertRule {
             RuleKind::Threshold(t) => {
                 let cmps = |c: &[Comparison]| {
                     c.iter()
-                        .map(|c| format!("{} {}", c.op.as_str(), t.metric.format(c.limit)))
+                        .map(|c| format!("{} {}", c.op.as_str(), t.metric.format_limit(c.limit)))
                         .collect::<Vec<_>>()
                         .join(" and ")
                 };
@@ -152,10 +163,10 @@ impl AlertRule {
                     .iter()
                     .map(|i| match i {
                         PatternItem::Compare(c) if p.kind == PatternType::Loss => {
-                            format!("{}{}%", c.op.as_str(), trim(c.limit))
+                            format!("{}{}%", c.op.as_str(), exact(c.limit))
                         }
                         PatternItem::Compare(c) | PatternItem::Count(c) => {
-                            format!("{}{}", c.op.as_str(), trim(c.limit))
+                            format!("{}{}", c.op.as_str(), exact(c.limit))
                         }
                         PatternItem::Unknown => "U".to_string(),
                         PatternItem::Any(n) => format!("*{n}*"),
@@ -179,6 +190,11 @@ impl AlertRule {
 fn trim(v: f64) -> String {
     let s = format!("{v:.3}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// A number as written: Rust's shortest form that reads back the same.
+fn exact(v: f64) -> String {
+    format!("{v}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -357,6 +373,10 @@ fn comparison(s: &str, unit: Unit, what: &str) -> Result<Comparison, String> {
             return Err(format!("{what}: {rest:?} takes a plain number, no unit"));
         }
     };
+    // A huge value can overflow when converted to ms.
+    if !limit.is_finite() {
+        return Err(format!("{what}: {rest:?} is too large"));
+    }
     Ok(Comparison { op, limit })
 }
 
@@ -406,7 +426,13 @@ pub const MAX_ANY: u32 = 1_000;
 pub fn parse_pattern_item(s: &str, kind: PatternType) -> Result<PatternItem, String> {
     let t = s.trim();
     if t == "U" {
-        return Ok(PatternItem::Unknown);
+        // Every round has a loss value; only the median can be missing.
+        return match kind {
+            PatternType::Rtt => Ok(PatternItem::Unknown),
+            PatternType::Loss => Err(format!(
+                "pattern item {s:?}: U (no reply) applies to rtt patterns only"
+            )),
+        };
     }
     if let Some(n) = t.strip_prefix('*').and_then(|r| r.strip_suffix('*')) {
         return match n.parse::<u32>() {
@@ -470,23 +496,43 @@ impl Pattern {
     /// Whether the pattern matches the newest rounds of `history` (oldest
     /// first): the last item is the newest round, each `*N*` takes 0 to N
     /// rounds, and older rounds before the first item do not matter.
+    ///
+    /// Items are taken newest first, keeping the set of history lengths
+    /// still to match (`reach[k]`: `history[..k]` is left), so the work is
+    /// items × history × wildcard width at most, not one try per way the
+    /// wildcards could split the rounds.
     pub fn matches(&self, history: &[PatternValue]) -> bool {
-        fn go(items: &[PatternItem], kind: PatternType, hist: &[PatternValue]) -> bool {
-            let Some((last, rest)) = items.split_last() else {
-                return true;
-            };
-            match last {
-                PatternItem::Any(n) => {
-                    let most = (*n as usize).min(hist.len());
-                    (0..=most).any(|j| go(rest, kind, &hist[..hist.len() - j]))
+        let n = history.len();
+        let mut reach = vec![false; n + 1];
+        reach[n] = true;
+        for item in self.items.iter().rev() {
+            let mut next = vec![false; n + 1];
+            match item {
+                PatternItem::Any(m) => {
+                    // From k, any of k, k-1, …, k-m (not below 0).
+                    let m = *m as usize;
+                    let mut until: Option<usize> = None;
+                    for k in (0..=n).rev() {
+                        if reach[k] {
+                            until = Some(k);
+                        }
+                        next[k] = until.is_some_and(|u| u - k <= m);
+                    }
                 }
-                item => match hist.split_last() {
-                    Some((v, older)) => item.matches(kind, v) && go(rest, kind, older),
-                    None => false,
-                },
+                item => {
+                    for k in 1..=n {
+                        if reach[k] && item.matches(self.kind, &history[k - 1]) {
+                            next[k - 1] = true;
+                        }
+                    }
+                }
             }
+            if !next.contains(&true) {
+                return false;
+            }
+            reach = next;
         }
-        go(&self.items, self.kind, history)
+        true
     }
 }
 
@@ -542,6 +588,7 @@ mod tests {
             ("> 120%", Metric::Loss),
             ("< 3.6ms", Metric::Mos),
             ("> -1ms", Metric::Median),
+            (&format!("> 1{}s", "0".repeat(306)), Metric::Median),
             ("> baseline_p50_7d * 2", Metric::Median),
             ("> 20ms and ", Metric::Median),
             ("", Metric::Median),
@@ -584,6 +631,7 @@ mod tests {
             parse_pattern_item(">50ms", PatternType::Rtt)
         );
         assert_eq!(parse_pattern_item("U", PatternType::Rtt), Ok(P::Unknown));
+        assert!(parse_pattern_item("U", PatternType::Loss).is_err());
         assert_eq!(
             parse_pattern_item("*12*", PatternType::Loss),
             Ok(P::Any(12))
@@ -618,6 +666,65 @@ mod tests {
         assert_eq!(p.window(), 5);
     }
 
+    /// The plain recursive definition the matcher must agree with.
+    fn reference(items: &[PatternItem], kind: PatternType, hist: &[PatternValue]) -> bool {
+        let Some((last, rest)) = items.split_last() else {
+            return true;
+        };
+        match last {
+            PatternItem::Any(n) => {
+                let most = (*n as usize).min(hist.len());
+                (0..=most).any(|j| reference(rest, kind, &hist[..hist.len() - j]))
+            }
+            item => match hist.split_last() {
+                Some((v, older)) => item.matches(kind, v) && reference(rest, kind, older),
+                None => false,
+            },
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn matching_agrees_with_the_recursive_definition(
+            items in proptest::collection::vec(0u8..5, 1..7),
+            losses in proptest::collection::vec(0u8..3, 0..14),
+        ) {
+            let items: Vec<String> = items
+                .iter()
+                .map(|i| match i {
+                    0 => "==0%".to_string(),
+                    1 => ">0%".to_string(),
+                    2 => ">=50%".to_string(),
+                    3 => "*1*".to_string(),
+                    _ => "*3*".to_string(),
+                })
+                .collect();
+            let Ok(p) = parse_pattern(&items, PatternType::Loss) else {
+                return Ok(());
+            };
+            let hist: Vec<PatternValue> = losses
+                .iter()
+                .map(|&l| v(f64::from(l) * 50.0, Some(1.0)))
+                .collect();
+            proptest::prop_assert_eq!(p.matches(&hist), reference(&p.items, p.kind, &hist));
+        }
+    }
+
+    #[test]
+    fn many_wildcards_stay_cheap() {
+        // Eight wildcard pairs over clean rounds: exponential if every
+        // split of the rounds were tried.
+        let mut items = vec![">0%"];
+        for _ in 0..8 {
+            items.extend(["*12*", "==0%"]);
+        }
+        let p = pat(PatternType::Loss, &items);
+        let clean = vec![v(0.0, Some(1.0)); p.window()];
+        let started = std::time::Instant::now();
+        assert!(!p.matches(&clean));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
     #[test]
     fn rtt_patterns_use_the_median_and_u() {
         // SmokePing's "rttdetect": 3 rounds below 10 ms, then 3 above 100.
@@ -633,8 +740,6 @@ mod tests {
         let u = pat(PatternType::Rtt, &["U"]);
         assert!(u.matches(&[dead]));
         assert!(!u.matches(&[fast]));
-        // U never matches a loss value.
-        assert!(!pat(PatternType::Loss, &["U"]).matches(&[dead]));
     }
 
     #[test]

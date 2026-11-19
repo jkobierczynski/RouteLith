@@ -25,9 +25,10 @@ hysteresis (`metric = "median"`, `condition = "> 20ms"`, `for = "3 rounds"`,
 `clear = "< 15ms"`) and SmokePing patterns (`type = "loss"`,
 `pattern = [">0%", "*3*", ">0%"]`). Raised and cleared alerts, address
 changes and server starts and stops go to an event log in `data/events/`
-(kept 400 days); the overview lists the alerts raised now, the target view
-the target's events, and `/api/v1/alerts`, `/api/v1/events` and `/metrics`
-serve them. Sending them to syslog, the Event Log, webhooks and e-mail comes
+(kept 400 days). The overview lists the alerts raised now and the target view
+the target's events; `/api/v1/alerts` lists the alerts raised now,
+`/api/v1/events` the event history, and `/metrics` has a gauge per raised
+alert plus raise and clear counters. Sending them to syslog, the Event Log, webhooks and e-mail comes
 next.
 
 ```console
