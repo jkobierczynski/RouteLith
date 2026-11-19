@@ -9,8 +9,9 @@ shipped as one self-contained binary.
 M1 is in progress. `routelith check icmp`, `check tcp`, `check dns` and
 `check http` work on Linux and Windows, and `routelith server` measures all
 four kinds of target. The server also answers HTTP on `127.0.0.1:8080`
-(`listen_ui` in `[server]`; `"off"` turns it off): a read-only JSON API under
-`/api/v1`, server-rendered SVG graphs, Prometheus `/metrics` and `/healthz`.
+(`listen_ui` in `[server]`; `"off"` turns it off): a web UI with an overview
+matrix and smoke graphs per target, a read-only JSON API under `/api/v1`,
+server-rendered SVG graphs, Prometheus `/metrics` and `/healthz`.
 There is no login yet, so keep it on loopback or behind a proxy that has one.
 
 ```console
@@ -38,7 +39,7 @@ default). On Windows it uses the ICMP helper API and needs no privileges.
 | `crates/rl-sched` | Round scheduler, phase spreading, rate limiting |
 | `crates/rl-store` | smokestore: WAL, day segments, codecs |
 | `crates/rl-render` | Smoke-graph algorithm and SVG rendering |
-| `crates/rl-web` | HTTP server: REST API, `/metrics`, web UI files |
+| `crates/rl-web` | HTTP server: REST API, `/metrics`, the web UI (plain JS in `ui/`) |
 
 Later milestones add `rl-path`, `rl-fed`, `rl-alert`, `rl-out` and `rl-reflector`.
 
