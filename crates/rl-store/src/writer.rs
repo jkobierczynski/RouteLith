@@ -150,6 +150,64 @@ fn damaged_sealed(path: &Path, reason: impl std::fmt::Display) -> StoreError {
     }
 }
 
+/// History brought in from another tool (a SmokePing import, §21.5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportedHistory {
+    /// Hourly points, oldest first.
+    pub hourly: Vec<RollupPoint>,
+    /// Daily points, oldest first. Every day with hourly points needs one,
+    /// as a daily point marks its day as rolled up.
+    pub daily: Vec<RollupPoint>,
+    /// Raw rounds, oldest first, all on days after the last rollup point.
+    pub rounds: Vec<StoredRound>,
+}
+
+/// What [`Writer::import`] stored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    pub hourly: usize,
+    pub daily: usize,
+    pub rounds: usize,
+}
+
+/// Why imported history cannot be stored as it is, if it cannot.
+fn check_import(h: &ImportedHistory) -> Result<(), &'static str> {
+    let day = |ts: i64| ts.div_euclid(layout::DAY_MS);
+    for (points, tier) in [(&h.hourly, Tier::R1h), (&h.daily, Tier::R1d)] {
+        if !points.windows(2).all(|w| w[0].ts_ms < w[1].ts_ms) {
+            return Err("imported points are not in time order");
+        }
+        if !points
+            .iter()
+            .all(|p| p.is_valid() && p.ts_ms.rem_euclid(tier.width_ms()) == 0)
+        {
+            return Err("an imported point is malformed or not on its hour or day");
+        }
+        if !points
+            .iter()
+            .all(|p| (layout::MIN_DAY..=layout::MAX_DAY).contains(&day(p.ts_ms)))
+        {
+            return Err("timestamp outside the years 0000 to 9999");
+        }
+    }
+    let daily: BTreeSet<i64> = h.daily.iter().map(|p| day(p.ts_ms)).collect();
+    if !h.hourly.iter().all(|p| daily.contains(&day(p.ts_ms))) {
+        return Err("a day with imported hourly points has no daily point");
+    }
+    if !h.rounds.windows(2).all(|w| w[0].ts_ms < w[1].ts_ms) {
+        return Err("imported rounds are not in time order");
+    }
+    for r in &h.rounds {
+        r.check()?;
+    }
+    if let (Some(last), Some(first)) = (daily.last(), h.rounds.first()) {
+        if day(first.ts_ms) <= *last {
+            return Err("imported rounds must start on a day after the last rollup point");
+        }
+    }
+    Ok(())
+}
+
 /// Blocks are written early once they hold this many RTT samples, which
 /// keeps a block's uncompressed payload far below the reader's limit.
 const BLOCK_MAX_SAMPLES: usize = 1 << 20;
@@ -510,6 +568,63 @@ impl Writer {
             return Err(StoreError::Stopped(msg.clone()));
         }
         index::set_steps(&self.dir, steps)
+    }
+
+    /// Store imported history in a series that holds nothing yet: the
+    /// rollup points are written (and synced) at once, the rounds are
+    /// appended like live ones. Refused with [`StoreError::NotEmpty`] if
+    /// the series has any data, so an import never mixes with rounds
+    /// already measured or with an earlier import.
+    pub fn import(
+        &mut self,
+        series: u64,
+        history: &ImportedHistory,
+    ) -> Result<ImportReport, StoreError> {
+        if let Some(msg) = &self.failed {
+            return Err(StoreError::Stopped(msg.clone()));
+        }
+        check_import(history).map_err(StoreError::InvalidRound)?;
+        let busy = self.series.get(&series).is_some_and(|s| {
+            s.last_ts.is_some() || s.open_day.is_some() || s.sealed_through.is_some()
+        });
+        let mut on_disk = !layout::list_segments(&self.dir, series)?.is_empty();
+        for tier in Tier::ALL {
+            on_disk |= rollup::has_files(&self.dir, series, tier)?;
+        }
+        if busy || on_disk {
+            return Err(StoreError::NotEmpty(series));
+        }
+        self.guard(|w| {
+            let day = |p: &RollupPoint| p.ts_ms.div_euclid(layout::DAY_MS);
+            let mut last = None;
+            let (mut h, mut d) = (0, 0);
+            while d < history.daily.len() {
+                let today = day(&history.daily[d]);
+                let h_end = h + history.hourly[h..]
+                    .iter()
+                    .take_while(|p| day(p) == today)
+                    .count();
+                let d_end = d + history.daily[d..]
+                    .iter()
+                    .take_while(|p| day(p) == today)
+                    .count();
+                // r1h first: an r1d point marks the day as rolled up.
+                rollup::append_day(&w.dir, series, Tier::R1h, today, &history.hourly[h..h_end])?;
+                rollup::append_day(&w.dir, series, Tier::R1d, today, &history.daily[d..d_end])?;
+                (h, d, last) = (h_end, d_end, Some(today));
+            }
+            // Rounds on these days would be dropped by the next roll-up.
+            let s = w.series.entry(series).or_default();
+            s.sealed_through = s.sealed_through.max(last);
+            for r in &history.rounds {
+                w.ingest(series, r.clone(), true)?;
+            }
+            Ok(ImportReport {
+                hourly: history.hourly.len(),
+                daily: history.daily.len(),
+                rounds: history.rounds.len(),
+            })
+        })
     }
 
     pub fn stats(&self) -> WriterStats {
@@ -919,5 +1034,136 @@ mod tests {
             next_wal_seq(Path::new("d"), Some(u64::MAX)),
             Err(StoreError::Corrupt { .. })
         ));
+    }
+
+    use crate::{ErrorCounts, Reader};
+
+    fn point(ts_ms: i64, rounds: u32, base_us: u32) -> RollupPoint {
+        let samples: Vec<u32> = (0..rounds * 20).map(|i| base_us + i).collect();
+        RollupPoint {
+            ts_ms,
+            rounds,
+            sent: rounds * 20,
+            received: rounds * 20,
+            quantiles_us: rollup::quantiles(&samples),
+        }
+    }
+
+    #[test]
+    fn imported_history_reads_back_through_every_tier() {
+        const DAY: i64 = layout::DAY_MS;
+        const HOUR: i64 = 3_600_000;
+        let d0 = 20_000 * DAY;
+        let hourly: Vec<_> = (0..48).map(|h| point(d0 + h * HOUR, 12, 10_000)).collect();
+        let daily = vec![
+            RollupPoint::merge(&hourly[..24], d0),
+            RollupPoint::merge(&hourly[24..], d0 + DAY),
+        ];
+        let rounds: Vec<StoredRound> = (0..10)
+            .map(|i| StoredRound {
+                ts_ms: d0 + 2 * DAY + i * 300_000,
+                sent: 20,
+                rtts_us: vec![12_000; 19],
+                errors: ErrorCounts::default(),
+                resolved: None,
+                timing: None,
+                flags: 0,
+            })
+            .collect();
+        let history = ImportedHistory {
+            hourly: hourly.clone(),
+            daily: daily.clone(),
+            rounds: rounds.clone(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let now = d0 + 4 * DAY;
+        let (mut w, _) = Writer::open(dir.path(), WriterOptions::default(), now).unwrap();
+        let id = w
+            .register(&[SeriesKey::new("smokeping", "gw", "v4")])
+            .unwrap()[0];
+        let got = w.import(id, &history).unwrap();
+        assert_eq!((got.hourly, got.daily, got.rounds), (48, 2, 10));
+        // A second import, or one into a series with rounds, is refused.
+        assert!(matches!(
+            w.import(id, &history),
+            Err(StoreError::NotEmpty(_))
+        ));
+        w.maintain(now).unwrap();
+        w.close().unwrap();
+
+        let r = Reader::open(dir.path()).unwrap();
+        assert_eq!(
+            r.read_tier(id, Tier::R1h, d0, d0 + 2 * DAY - 1).unwrap(),
+            hourly
+        );
+        let days = r.read_tier(id, Tier::R1d, d0, d0 + 3 * DAY - 1).unwrap();
+        assert_eq!(days[..2], daily);
+        // The imported rounds were sealed and rolled up like live ones.
+        assert_eq!(days.len(), 3);
+        assert_eq!(days[2].received, 190);
+        assert_eq!(r.read(id, d0, now).unwrap().len(), 10);
+
+        // Still refused after a restart.
+        let (mut w, _) = Writer::open(dir.path(), WriterOptions::default(), now).unwrap();
+        assert!(matches!(
+            w.import(id, &history),
+            Err(StoreError::NotEmpty(_))
+        ));
+        w.close().unwrap();
+    }
+
+    #[test]
+    fn malformed_imports_are_refused() {
+        const DAY: i64 = layout::DAY_MS;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut w, _) = Writer::open(dir.path(), WriterOptions::default(), 0).unwrap();
+        let id = w
+            .register(&[SeriesKey::new("smokeping", "gw", "v4")])
+            .unwrap()[0];
+        let cases = [
+            // Hourly points without their day's point.
+            ImportedHistory {
+                hourly: vec![point(DAY, 1, 5)],
+                ..Default::default()
+            },
+            // Not on an hour.
+            ImportedHistory {
+                hourly: vec![point(DAY + 1, 1, 5)],
+                daily: vec![point(DAY, 1, 5)],
+                ..Default::default()
+            },
+            // Rounds on a day already rolled up.
+            ImportedHistory {
+                daily: vec![point(DAY, 1, 5)],
+                rounds: vec![StoredRound {
+                    ts_ms: DAY + 5,
+                    sent: 1,
+                    rtts_us: vec![1],
+                    errors: ErrorCounts::default(),
+                    resolved: None,
+                    timing: None,
+                    flags: 0,
+                }],
+                ..Default::default()
+            },
+            // Out of order.
+            ImportedHistory {
+                daily: vec![point(2 * DAY, 1, 5), point(DAY, 1, 5)],
+                ..Default::default()
+            },
+        ];
+        for h in cases {
+            assert!(
+                matches!(w.import(id, &h), Err(StoreError::InvalidRound(_))),
+                "{h:?}"
+            );
+        }
+        // Nothing was written, so a good import still works.
+        let ok = ImportedHistory {
+            daily: vec![point(DAY, 1, 5)],
+            ..Default::default()
+        };
+        assert_eq!(w.import(id, &ok).unwrap().daily, 1);
+        w.close().unwrap();
     }
 }

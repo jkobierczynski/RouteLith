@@ -46,7 +46,9 @@ pub use index::SeriesKey;
 pub use reader::{GraphRounds, Reader, Resolution, VerifyReport};
 pub use rollup::{GRAPH_SAMPLES, QUANTILES, RollupPoint, Tier, quantiles};
 pub use round::{ErrorCounts, FLAG_CLOCK_STEP, StoredRound};
-pub use writer::{Appended, Recovery, Writer, WriterOptions, WriterStats};
+pub use writer::{
+    Appended, ImportReport, ImportedHistory, Recovery, Writer, WriterOptions, WriterStats,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -73,4 +75,7 @@ pub enum StoreError {
     /// hold less history than before.
     #[error("{} changed during the read", .0.display())]
     Expired(PathBuf),
+    /// [`Writer::import`] into a series that already holds data.
+    #[error("series {0} already holds data; history is imported only into an empty series")]
+    NotEmpty(u64),
 }
