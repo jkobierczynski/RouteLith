@@ -1,6 +1,6 @@
 //! The `routelith` binary: one executable, several modes (architecture doc §3).
 //!
-//! `server`, `check icmp|tcp|dns|http`,
+//! `server`, `service install|uninstall`, `check icmp|tcp|dns|http`,
 //! `ctl calibrate`, `ctl verify` and `ctl render` work.
 #![forbid(unsafe_code)]
 
@@ -9,6 +9,7 @@ mod check;
 mod health;
 mod render;
 mod server;
+mod service;
 mod verify;
 
 use std::process::ExitCode;
@@ -25,12 +26,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the scheduler and store in the foreground (M0: no UI or API yet).
+    /// Run the scheduler, store, web UI and API in the foreground.
     Server(server::ServerArgs),
     /// One-shot measurement for debugging and scripting.
     Check {
         #[command(subcommand)]
         probe: CheckProbe,
+    },
+    /// Install, remove or run the server as a Windows Service.
+    Service {
+        #[command(subcommand)]
+        action: service::ServiceAction,
     },
     /// Administration: verify configuration, render graphs.
     Ctl {
@@ -84,6 +90,7 @@ fn main() -> ExitCode {
             action: CtlAction::Verify(args),
         } => run(verify::run(args)),
         Command::Server(args) => run(server::run(args)),
+        Command::Service { action } => service::run(action),
         Command::Ctl {
             action: CtlAction::Render(args),
         } => render::run(&args),

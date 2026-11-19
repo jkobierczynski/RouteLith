@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  Routelith MSI (WiX Toolset 3, built with cargo-wix; architecture doc §21.3).
+
+  Installs routelith.exe under Program Files\Routelith\bin (added to PATH),
+  a starter configuration in %ProgramData%\Routelith\routelith.toml, and the
+  "Routelith" Windows Service. The service runs as NT AUTHORITY\LocalService,
+  starts with Windows, and is restarted after a failure (5 s, 30 s, then
+  60 s; the count resets after a day). The configuration, data and log in
+  %ProgramData%\Routelith are kept on uninstall and upgrade.
+
+  Build: cargo wix -p routelith (needs the WiX Toolset 3; the WixUtilExtension
+  arguments come from [package.metadata.wix] in Cargo.toml).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+  <Product Id="*"
+           Name="Routelith"
+           UpgradeCode="18C07FED-7DFC-48FD-B495-A1CC478FDF55"
+           Manufacturer="Routelith contributors"
+           Language="1033"
+           Codepage="1252"
+           Version="$(var.Version)">
+
+    <Package Id="*"
+             Description="Routelith network latency monitor"
+             Manufacturer="Routelith contributors"
+             InstallerVersion="500"
+             Languages="1033"
+             Compressed="yes"
+             InstallScope="perMachine"
+             SummaryCodepage="1252"/>
+
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
+
+    <Media Id="1" Cabinet="media1.cab" EmbedCab="yes"/>
+
+    <Property Id="ARPHELPLINK" Value="https://github.com/jkobierczynski/RouteLith"/>
+    <Property Id="ARPURLINFOABOUT" Value="http://127.0.0.1:8080/"/>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="APPLICATIONFOLDER" Name="Routelith">
+          <Component Id="License" Guid="*">
+            <File Id="LicenseFile" Name="LICENSE.txt" DiskId="1"
+                  Source="$(sys.SOURCEFILEDIR)..\..\..\LICENSE" KeyPath="yes"/>
+          </Component>
+          <Directory Id="Bin" Name="bin">
+            <Component Id="Binary" Guid="*">
+              <File Id="RoutelithExe" Name="routelith.exe" DiskId="1"
+                    Source="$(var.CargoTargetBinDir)\routelith.exe" KeyPath="yes"/>
+              <ServiceInstall Id="RoutelithService"
+                              Name="Routelith"
+                              DisplayName="Routelith network monitor"
+                              Description="Measures network latency and loss; see http://127.0.0.1:8080/"
+                              Type="ownProcess"
+                              Start="auto"
+                              ErrorControl="normal"
+                              Account="NT AUTHORITY\LocalService"
+                              Arguments="service run --config &quot;[DATAFOLDER]routelith.toml&quot; --log &quot;[DATAFOLDER]routelith.log&quot;"
+                              Vital="yes">
+                <ServiceConfig FailureActionsWhen="failedToStopOrReturnedError"
+                               OnInstall="yes" OnReinstall="yes"/>
+                <ServiceConfigFailureActions OnInstall="yes" OnReinstall="yes" ResetPeriod="86400">
+                  <Failure Action="restartService" Delay="5000"/>
+                  <Failure Action="restartService" Delay="30000"/>
+                  <Failure Action="restartService" Delay="60000"/>
+                </ServiceConfigFailureActions>
+              </ServiceInstall>
+              <ServiceControl Id="RoutelithServiceControl" Name="Routelith"
+                              Start="install" Stop="both" Remove="uninstall" Wait="yes"/>
+            </Component>
+            <Component Id="Path" Guid="737CE5E5-5D8D-4C11-9D4E-881A039AB142" KeyPath="yes">
+              <Environment Id="PATH" Name="PATH" Value="[Bin]" Permanent="no"
+                           Part="last" Action="set" System="yes"/>
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+
+      <Directory Id="CommonAppDataFolder">
+        <Directory Id="DATAFOLDER" Name="Routelith">
+          <!-- The service account writes its data and log here. -->
+          <Component Id="DataFolder" Guid="F49C4B03-8D2A-4726-A087-EDA0C9A157DE"
+                     Permanent="yes" KeyPath="yes">
+            <CreateFolder>
+              <util:PermissionEx User="LocalService" Domain="NT AUTHORITY"
+                                 GenericRead="yes" GenericWrite="yes"
+                                 GenericExecute="yes" Delete="yes"/>
+            </CreateFolder>
+          </Component>
+          <!-- Never replaced or removed: the user edits it. -->
+          <Component Id="Config" Guid="97437402-B28A-46B1-8B67-BB276A7BD1C6"
+                     Permanent="yes" NeverOverwrite="yes">
+            <File Id="ConfigFile" Name="routelith.toml" DiskId="1"
+                  Source="$(sys.SOURCEFILEDIR)routelith.toml" KeyPath="yes"/>
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Main" Title="Routelith" Level="1">
+      <ComponentRef Id="Binary"/>
+      <ComponentRef Id="Path"/>
+      <ComponentRef Id="License"/>
+      <ComponentRef Id="DataFolder"/>
+      <ComponentRef Id="Config"/>
+    </Feature>
+  </Product>
+</Wix>

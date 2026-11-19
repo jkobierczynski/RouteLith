@@ -32,11 +32,30 @@ On Linux, ICMP runs without root through ping sockets; the user's group must
 be inside `net.ipv4.ping_group_range` (most distributions allow every group by
 default). On Windows it uses the ICMP helper API and needs no privileges.
 
+## Running as a service
+
+**Linux (systemd):** `packaging/linux/routelith.service` runs
+`routelith server --config /etc/routelith/routelith.toml` as a transient
+user (`DynamicUser=yes`) that can write only `/var/lib/routelith`, so set
+`data_dir = "/var/lib/routelith"`. Installation steps are at the top of the
+unit file. ICMP needs no capabilities; see `60-routelith-ping.conf` if your
+system keeps `net.ipv4.ping_group_range` closed.
+
+**Windows:** the MSI (`cargo wix -p routelith`, WiX Toolset 3) installs
+`routelith.exe` in `Program Files\Routelith\bin`, a starter configuration in
+`C:\ProgramData\Routelith\routelith.toml`, and the `Routelith` service, which
+runs as `LocalService`, starts with Windows and is restarted after a
+failure. Its log is `C:\ProgramData\Routelith\routelith.log`. Without the MSI,
+`routelith service install --config <file>` (as Administrator) registers the
+same service and `routelith service uninstall` removes it. The MSI is not
+signed yet.
+
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `bin/routelith` | The single binary and its subcommands |
+| `bin/routelith` | The single binary and its subcommands; `wix/` builds the MSI |
+| `packaging/linux` | systemd unit and an optional sysctl drop-in |
 | `crates/rl-core` | Domain types: targets, rounds, samples, config schema |
 | `crates/rl-sys` | All `unsafe` and OS FFI (the only crate allowed `unsafe`) |
 | `crates/rl-probe` | The `Probe` trait and probe implementations |

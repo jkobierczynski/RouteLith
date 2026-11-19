@@ -1,0 +1,34 @@
+# Routelith configuration installed by the MSI. The Windows Service reads
+# this file; after editing it, check it and restart the service:
+#   routelith ctl verify "C:\ProgramData\Routelith\routelith.toml"
+#   Restart-Service Routelith
+# Graphs: http://127.0.0.1:8080/  Log: C:\ProgramData\Routelith\routelith.log
+# The full set of options is in examples/routelith.toml in the source.
+
+[server]
+# Single quotes: a literal string, so backslashes are kept as they are.
+data_dir = 'C:\ProgramData\Routelith\data'
+# listen_ui = "127.0.0.1:8080"   # "off" disables the web UI and API
+
+[defaults]
+step  = "300s"   # one round per step; must divide a day
+pings = 20       # samples per round
+
+# Only this machine is measured until you add your own targets, for
+# example your gateway, a DNS server or a website:
+#
+#   [[group.target]]
+#   name = "gateway"
+#   host = "192.168.1.1"
+#
+#   [[group.target]]
+#   name  = "web"
+#   probe = "http"
+#   url   = "https://www.example.org/"
+
+[[group]]
+name = "Local"
+
+  [[group.target]]
+  name = "loopback"
+  host = "127.0.0.1"

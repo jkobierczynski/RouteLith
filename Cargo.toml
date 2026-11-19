@@ -44,7 +44,8 @@ toml = "1.2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 zstd = "0.14"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_Threading"] }
+windows-service = "0.8.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_Console", "Win32_System_IO", "Win32_System_Threading"] }
 
 # Shared lints. `unsafe_code` is not set here because `rl-sys` needs unsafe;
 # every other crate forbids it with `#![forbid(unsafe_code)]` in its lib.rs/main.rs.

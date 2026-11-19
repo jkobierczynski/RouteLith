@@ -108,6 +108,123 @@ jobs:
             *) echo "::error::calibration could not measure (exit $status)"; exit 1 ;;
           esac
 
+  # The packaged services start and stop cleanly (architecture doc §21.4):
+  # the systemd unit as a dynamic user, and the MSI's Windows Service.
+  systemd:
+    name: systemd unit (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p routelith
+      - name: Install the unit
+        run: |
+          sudo install -m 0755 target/release/routelith /usr/bin/routelith
+          sudo install -m 0644 packaging/linux/routelith.service /etc/systemd/system/
+          sudo install -m 0644 packaging/linux/60-routelith-ping.conf /etc/sysctl.d/
+          sudo sysctl --system > /dev/null
+          sudo install -d /etc/routelith
+          sudo tee /etc/routelith/routelith.toml > /dev/null <<'TOML'
+          [server]
+          data_dir = "/var/lib/routelith"
+          [defaults]
+          step = "60s"
+          pings = 5
+          [[group]]
+          name = "ci"
+            [[group.target]]
+            name = "loopback"
+            host = "127.0.0.1"
+            [[group.target]]
+            name = "ui"
+            host = "127.0.0.1"
+            probe = "tcp"
+            port = 8080
+          TOML
+          systemd-analyze verify /etc/systemd/system/routelith.service
+          sudo systemctl daemon-reload
+      - name: Start, measure, stop
+        run: |
+          sudo systemctl start routelith
+          pid=$(systemctl show -p MainPID --value routelith)
+          user=$(ps -o user= -p "$pid")
+          echo "running as $user (pid $pid)"
+          [ "$(id -u "$user")" -ge 61184 ] || { echo "::error::not a dynamic user"; exit 1; }
+          # Both series report a round within two steps.
+          for i in $(seq 150); do
+            n=$(curl -fsS http://127.0.0.1:8080/api/v1/latest | jq '[.latest[] | select(.recv > 0)] | length') || n=0
+            [ "$n" -ge 2 ] && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/api/v1/latest | jq .
+          [ "$n" -ge 2 ] || { echo "::error::no rounds from both targets"; exit 1; }
+          sudo ls -l /var/lib/private/routelith
+          sudo systemctl stop routelith
+          result=$(systemctl show -p Result --value routelith)
+          status=$(systemctl show -p ExecMainStatus --value routelith)
+          [ "$result" = success ] && [ "$status" = 0 ] || { echo "::error::stopped with $result, exit $status"; exit 1; }
+      - name: Journal
+        if: always()
+        run: sudo journalctl -u routelith --no-pager
+
+  msi:
+    name: MSI and Windows Service (windows-2022)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-wix --version 0.3.9 --locked
+      - name: Build the MSI
+        run: cargo wix -p routelith --nocapture --output target\wix\routelith.msi
+      - name: Install, check the service, uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Msi($verb, $log) {
+            $p = Start-Process msiexec -Wait -PassThru -ArgumentList $verb, 'target\wix\routelith.msi', '/qn', '/l*v', $log
+            if ($p.ExitCode -ne 0) { Get-Content $log -Tail 100; throw "msiexec $verb exited with $($p.ExitCode)" }
+          }
+          Msi '/i' 'install.log'
+          $svc = Get-CimInstance Win32_Service -Filter "Name='Routelith'"
+          "state $($svc.State), account $($svc.StartName), command $($svc.PathName)"
+          if ($svc.State -ne 'Running') { throw 'the service is not running' }
+          if ($svc.StartName -ne 'NT AUTHORITY\LocalService') { throw 'wrong service account' }
+          sc.exe qfailure Routelith
+          $ok = $false
+          foreach ($i in 1..60) {
+            try { Invoke-RestMethod http://127.0.0.1:8080/healthz | Out-Null; $ok = $true; break } catch { Start-Sleep 1 }
+          }
+          Get-Content C:\ProgramData\Routelith\routelith.log
+          if (-not $ok) { throw 'the web UI did not answer' }
+          if (-not (Test-Path C:\ProgramData\Routelith\data)) { throw 'no data directory' }
+          Msi '/x' 'uninstall.log'
+          if (Get-Service Routelith -ErrorAction SilentlyContinue) { throw 'the service is still installed' }
+          if (-not (Test-Path C:\ProgramData\Routelith\routelith.toml)) { throw 'the configuration was removed' }
+      - name: routelith service install / uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "$PWD\target\release\routelith.exe"
+          New-Item -ItemType Directory -Force C:\rl | Out-Null
+          Set-Content C:\rl\routelith.toml "[server]`ndata_dir = 'C:\rl\data'`n[[group]]`nname = 'ci'`n  [[group.target]]`n  name = 'loopback'`n  host = '127.0.0.1'`n"
+          & $exe service install --config C:\rl\routelith.toml
+          if ($LASTEXITCODE -ne 0) { throw "install exited with $LASTEXITCODE" }
+          Start-Sleep 3
+          if ((Get-Service Routelith).Status -ne 'Running') { Get-Content C:\rl\routelith.log; throw 'not running' }
+          & $exe service uninstall
+          if ($LASTEXITCODE -ne 0) { throw "uninstall exited with $LASTEXITCODE" }
+          Get-Content C:\rl\routelith.log
+          if (Get-Service Routelith -ErrorAction SilentlyContinue) { throw 'the service is still installed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: routelith-msi
+          path: |
+            target/wix/routelith.msi
+            *.log
+
   # macOS is best effort (architecture doc D4): compile only.
   # The web UI in Chromium against a running server: the overview matrix
   # fills in and the canvas draws a smoke graph (architecture doc §21.4).

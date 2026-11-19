@@ -12,3 +12,6 @@ pub mod linux;
 
 #[cfg(windows)]
 pub mod windows;
+
+#[cfg(windows)]
+pub mod service;
