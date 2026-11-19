@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Accuracy lab for `routelith check icmp` (architecture doc §17 and §21.2).
+# Accuracy lab for `routelith check icmp` and `check tcp` (architecture doc
+# §17, §21.2 and §21.4).
 #
 # Builds two network namespaces joined by a veth pair, then uses tc netem on
 # the far side to add a known delay and a known loss rate, and checks that
 # Routelith measures them within the M0 tolerances:
 #   - delay: median within ±0.1 ms of (baseline + 10 ms) over 1,000 samples
 #   - loss:  5 % ± 1.5 points over 2,000 samples
+#   - tcp:   connect-time median within ±0.2 ms of the ICMP median under the
+#            same netem delay, over 500 samples (needs python3 for the
+#            listener; TCP_TOL_MS overrides the tolerance)
 #
 # If iputils ping is installed, the delay step also runs ping concurrently
 # with Routelith and checks that Routelith's median is no later than ping's
@@ -27,13 +31,18 @@ DELAY_MS=10
 DELAY_TOL_MS=${DELAY_TOL_MS:-0.1}
 LOSS_PCT=5
 LOSS_TOL_PCT=1.5
-if ! [[ $DELAY_TOL_MS =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-    echo "DELAY_TOL_MS must be a non-negative number of milliseconds (got '$DELAY_TOL_MS')" >&2
-    exit 2
-fi
+TCP_PORT=7777
+TCP_TOL_MS=${TCP_TOL_MS:-0.2}
+for tol in "$DELAY_TOL_MS" "$TCP_TOL_MS"; do
+    if ! [[ $tol =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "DELAY_TOL_MS and TCP_TOL_MS must be non-negative numbers of milliseconds (got '$tol')" >&2
+        exit 2
+    fi
+done
 
 cleanup() {
     if [[ -n ${ping_pid:-} ]]; then kill "$ping_pid" 2>/dev/null || true; fi
+    if [[ -n ${srv_pid:-} ]]; then kill "$srv_pid" 2>/dev/null || true; fi
     if [[ -n ${ping_out:-} ]]; then rm -f "$ping_out"; fi
     ip netns del "$A" 2>/dev/null || true
     ip netns del "$B" 2>/dev/null || true
@@ -150,6 +159,36 @@ if [[ -n $ref ]]; then
 elif command -v ping >/dev/null; then
     echo "FAIL  vsping: ping produced no replies"
     failures=$((failures + 1))
+fi
+
+echo "== tcp connect time under the same ${DELAY_MS}ms delay, 500 samples"
+if command -v python3 >/dev/null; then
+    # Accept and close at once; the probe resets each connection itself.
+    ip netns exec "$B" python3 -c '
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", '"$TCP_PORT"'))
+s.listen(4096)
+while True:
+    c, _ = s.accept()
+    c.close()
+' &
+    srv_pid=$!
+    sleep 0.5
+    out=$(ip netns exec "$A" "$BIN" check tcp "$ADDR_B" -p "$TCP_PORT" -q -W 1s -c 500 -i 5ms) || true
+    echo "$out"
+    kill "$srv_pid" 2>/dev/null || true
+    srv_pid=
+    tcp=$(median_ms <<<"$out")
+    if [[ $tcp =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        check tcp "$tcp" "$delayed" "$TCP_TOL_MS"
+    else
+        echo "FAIL  tcp measurement produced no median (got '${tcp}')"
+        failures=$((failures + 1))
+    fi
+else
+    echo "SKIP  tcp: python3 is not installed (needed for the listener)"
 fi
 
 echo "== netem loss ${LOSS_PCT}% on B's egress, 2000 samples"

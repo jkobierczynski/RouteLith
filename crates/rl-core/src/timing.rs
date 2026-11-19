@@ -14,6 +14,9 @@ pub enum TimingBackend {
     LinuxMonotonic,
     /// Windows `IcmpSendEcho2Ex` / `Icmp6SendEcho2`, timed with QPC around the call.
     WindowsIcmpApi,
+    /// Monotonic clock read in user space around a socket operation
+    /// (TCP connect, DNS query, HTTP phases). Includes scheduler wake-up delay.
+    Monotonic,
 }
 
 impl TimingBackend {
@@ -23,6 +26,7 @@ impl TimingBackend {
             Self::LinuxKernelTimestamp => 1,
             Self::LinuxMonotonic => 2,
             Self::WindowsIcmpApi => 3,
+            Self::Monotonic => 4,
         }
     }
 
@@ -32,6 +36,7 @@ impl TimingBackend {
             1 => Some(Self::LinuxKernelTimestamp),
             2 => Some(Self::LinuxMonotonic),
             3 => Some(Self::WindowsIcmpApi),
+            4 => Some(Self::Monotonic),
             _ => None,
         }
     }
@@ -42,6 +47,7 @@ impl TimingBackend {
             Self::LinuxKernelTimestamp => "kernel timestamps (ping socket)",
             Self::LinuxMonotonic => "user-space monotonic clock (ping socket)",
             Self::WindowsIcmpApi => "Windows ICMP API, QPC-timed",
+            Self::Monotonic => "user-space monotonic clock",
         }
     }
 }
@@ -64,6 +70,8 @@ impl TimingSource {
             TimingBackend::LinuxKernelTimestamp => 50,
             TimingBackend::LinuxMonotonic => 100,
             TimingBackend::WindowsIcmpApi => 500,
+            // §10.3 puts socket-timed probes at ±0.1 to 1 ms.
+            TimingBackend::Monotonic => 200,
         };
         Self {
             backend,

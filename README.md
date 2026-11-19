@@ -5,8 +5,9 @@ SmokePing-style latency distributions ("smoke" graphs) with PingPlotter-style
 hop-by-hop path tracing, measured from federated agents on Linux and Windows,
 shipped as one self-contained binary.
 
-**Status:** pre-alpha, milestone M0 in progress. `routelith check icmp`
-works on Linux and Windows; the scheduler, storage and smoke graphs are next.
+**Status:** pre-alpha. M0 (ICMP, scheduler, store, SVG smoke graphs) is done;
+M1 is in progress. `routelith check icmp` and `routelith check tcp` work on
+Linux and Windows, and `routelith server` measures both kinds of target.
 
 ```console
 $ routelith check icmp example.net -c 5 -i 200ms

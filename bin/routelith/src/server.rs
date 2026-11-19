@@ -13,8 +13,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Args;
-use rl_core::config::{self, Config, Family};
-use rl_probe::{IcmpConfig, IcmpProbe, Probe, RateLimiter};
+use rl_core::config::{self, Config, Family, ProbeConfig};
+use rl_probe::{IcmpConfig, IcmpProbe, Probe, RateLimiter, TcpConfig, TcpProbe};
 use rl_sched::{Completed, FailCause, Job, Outcome, Sink, Snapshot, Stats};
 use rl_store::{Appended, ErrorCounts, SeriesKey, StoredRound, Writer, WriterOptions};
 use tokio::sync::watch;
@@ -47,12 +47,17 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
         eprintln!("routelith server: no targets to measure");
         return ExitCode::from(1);
     }
-    // A v4 or v6 series needs its family; prefer-v6 can use either.
-    let prefer = plans.iter().any(|p| p.family == Family::PreferV6);
+    // An ICMP series needs an ICMP socket of its family; prefer-v6 can use
+    // either. Other probes use ordinary sockets.
+    let icmp = |p: &&SeriesPlan| matches!(p.probe, ProbeConfig::Icmp { .. });
+    let prefer = plans
+        .iter()
+        .filter(icmp)
+        .any(|p| p.family == Family::PreferV6);
     let mut usable = [true; 2];
     for v6 in [false, true] {
         let own = if v6 { Family::V6 } else { Family::V4 };
-        let required = plans.iter().any(|p| p.family == own);
+        let required = plans.iter().filter(icmp).any(|p| p.family == own);
         if !required && !prefer {
             continue;
         }
@@ -141,24 +146,18 @@ pub(crate) async fn run(args: ServerArgs) -> ExitCode {
     let sink: Sink = Arc::new(move |c| tx.try_send(c).is_ok());
 
     let limiter = Arc::new(RateLimiter::new(cfg.server.max_pps));
-    let mut probes: HashMap<u16, Arc<dyn Probe>> = HashMap::new();
+    let mut probes: HashMap<ProbeConfig, Arc<dyn Probe>> = HashMap::new();
     let stats = Arc::new(Stats::default());
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut jobs = tokio::task::JoinSet::new();
     for (plan, series) in plans.into_iter().zip(ids) {
         let probe = probes
-            .entry(plan.payload_size)
-            .or_insert_with(|| {
-                Arc::new(
-                    IcmpProbe::new(IcmpConfig {
-                        payload_size: plan.payload_size,
-                    })
-                    .with_rate_limiter(limiter.clone()),
-                )
-            })
+            .entry(plan.probe)
+            .or_insert_with(|| make_probe(plan.probe, &limiter))
             .clone();
         let job = Job {
-            v6_usable: usable[1],
+            // Only ICMP depends on this process's socket permissions.
+            v6_usable: usable[1] || !matches!(plan.probe, ProbeConfig::Icmp { .. }),
             series,
             vantage: cfg.server.vantage.clone(),
             target: plan.target,
@@ -296,7 +295,20 @@ struct SeriesPlan {
     host: String,
     family: Family,
     schedule: rl_core::config::Schedule,
-    payload_size: u16,
+    probe: ProbeConfig,
+}
+
+/// One probe instance per distinct probe configuration, all sharing the
+/// packets-per-second ceiling.
+fn make_probe(cfg: ProbeConfig, limiter: &Arc<RateLimiter>) -> Arc<dyn Probe> {
+    match cfg {
+        ProbeConfig::Tcp { port, mode } => {
+            Arc::new(TcpProbe::new(TcpConfig { port, mode }).with_rate_limiter(limiter.clone()))
+        }
+        ProbeConfig::Icmp { payload_size } => {
+            Arc::new(IcmpProbe::new(IcmpConfig { payload_size }).with_rate_limiter(limiter.clone()))
+        }
+    }
 }
 
 /// Targets as series: a `both` target measures v4 and v6 separately.
@@ -315,7 +327,7 @@ fn series_plans(cfg: &Config) -> Vec<SeriesPlan> {
                 host: t.host.clone(),
                 family,
                 schedule: t.schedule,
-                payload_size: t.payload_size,
+                probe: t.probe,
             });
         }
     }

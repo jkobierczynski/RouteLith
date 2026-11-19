@@ -69,6 +69,10 @@ pub enum SampleError {
     Unreachable { code: u8 },
     #[error("TTL expired in transit")]
     TimeExceeded,
+    /// The host answered with a refusal (TCP RST): reachable, but the port
+    /// is closed. The time until the refusal is kept (§4.3).
+    #[error("connection refused after {:.3} ms", f64::from(*rtt_us) / 1000.0)]
+    Refused { rtt_us: u32 },
     /// The request never left this host (socket error, resource limit).
     #[error("send failed: {0}")]
     SendFailed(String),

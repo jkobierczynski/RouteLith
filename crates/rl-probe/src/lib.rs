@@ -1,12 +1,13 @@
 //! The Probe trait and its ICMP, TCP, UDP, DNS and HTTP implementations.
 //!
-//! M0 has ICMP only: Linux ping sockets and the Windows ICMP API.
+//! ICMP (Linux ping sockets, the Windows ICMP API) and TCP connect time so far.
 #![forbid(unsafe_code)]
 
 pub mod calibration;
 pub mod icmp;
 pub mod packet;
 pub mod rate;
+pub mod tcp;
 
 use std::future::Future;
 use std::io;
@@ -16,6 +17,7 @@ use rl_core::{ResolvedTarget, RoundPlan, RoundResult};
 
 pub use icmp::{IcmpConfig, IcmpProbe, check_permission};
 pub use rate::RateLimiter;
+pub use tcp::{TcpConfig, TcpProbe};
 
 /// A boxed, `Send` future, so `Probe` stays object-safe.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -25,6 +27,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[non_exhaustive]
 pub enum ProbeKind {
     Icmp,
+    Tcp,
 }
 
 /// One measurement method (architecture doc §4.1).
