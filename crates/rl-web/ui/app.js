@@ -385,8 +385,8 @@
     let drops = 0;
     for (const p of h.points) {
       if (p.cpu_pct !== undefined) cpu = Math.max(cpu === null ? 0 : cpu, p.cpu_pct);
-      errors += p.nic_errors;
-      drops += p.nic_drops;
+      errors += p.nic_errors || 0;
+      drops += p.nic_drops || 0;
     }
     const now = h.network.length ? h.network[h.network.length - 1] : null;
     const items = [
@@ -589,7 +589,7 @@
       if (hd && hd.vantage === s.vantage) {
         ctx.fillStyle = css("--nic");
         for (const p of hd.points) {
-          if (!(p.nic_errors + p.nic_drops) || p.t + hd.width_ms <= from || p.t >= to) continue;
+          if (!((p.nic_errors || 0) + (p.nic_drops || 0)) || p.t + hd.width_ms <= from || p.t >= to) continue;
           const x0 = x(Math.max(p.t, from));
           const bw = Math.max(2, x(Math.min(p.t + hd.width_ms, to)) - x0);
           ctx.fillRect(Math.min(x0, L + pw - bw), T + ph - 4, bw, 4);
@@ -640,7 +640,7 @@
         healthLines.push(
           el("div", {
             class: "tip-host",
-            text: "this machine: CPU " + (q.cpu_pct === undefined ? "–" : q.cpu_pct.toFixed(0) + " %") + " · NIC errors " + q.nic_errors + " · drops " + q.nic_drops,
+            text: "this machine: CPU " + (q.cpu_pct === undefined ? "–" : q.cpu_pct.toFixed(0) + " %") + " · NIC errors " + (q.nic_errors ?? "–") + " · drops " + (q.nic_drops ?? "–"),
           })
         );
       }

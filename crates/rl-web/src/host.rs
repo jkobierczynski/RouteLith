@@ -142,9 +142,12 @@ pub(crate) struct HealthPoint {
     /// Highest load average.
     #[serde(skip_serializing_if = "Option::is_none")]
     load1: Option<f64>,
-    /// NIC errors and drops summed over the bucket.
-    nic_errors: u64,
-    nic_drops: u64,
+    /// NIC errors and drops summed over the bucket; left out when no
+    /// sample in it could read the counters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nic_errors: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nic_drops: Option<u64>,
     /// Interfaces with errors or drops in the bucket.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     nics: Vec<NicDelta>,
@@ -183,8 +186,8 @@ pub(crate) fn summarise(
                 n: 0,
                 cpu_pct: None,
                 load1: None,
-                nic_errors: 0,
-                nic_drops: 0,
+                nic_errors: None,
+                nic_drops: None,
                 nics: Vec::new(),
             });
         }
@@ -194,8 +197,12 @@ pub(crate) fn summarise(
         p.n += 1;
         p.cpu_pct = max_opt(p.cpu_pct, s.cpu_pct);
         p.load1 = max_opt(p.load1, s.load1);
-        p.nic_errors += s.nic_errors.unwrap_or(0);
-        p.nic_drops += s.nic_drops.unwrap_or(0);
+        let add = |sum: Option<u64>, v: Option<u64>| match (sum, v) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
+        p.nic_errors = add(p.nic_errors, s.nic_errors);
+        p.nic_drops = add(p.nic_drops, s.nic_drops);
         for d in &s.nics {
             let e = nics.entry(d.name.clone()).or_insert_with(|| NicDelta {
                 name: d.name.clone(),
@@ -300,12 +307,20 @@ mod tests {
         assert_eq!(points.len(), 2);
         assert_eq!((points[0].t, points[0].n), (0, 2));
         assert_eq!(points[0].cpu_pct, Some(50.0));
-        assert_eq!(points[0].nic_errors, 2);
+        assert_eq!(points[0].nic_errors, Some(2));
         assert_eq!(points[0].nics.len(), 1);
         assert_eq!(
             (points[1].t, points[1].n, points[1].nic_errors),
-            (3 * m, 2, 1)
+            (3 * m, 2, Some(1))
         );
+        // A bucket whose samples could not read the counters has no total;
+        // one that read zero has zero.
+        let mut unread = sample(m, 10.0, 0, "192.0.2.1");
+        unread.nic_errors = None;
+        unread.nic_drops = None;
+        let (points, _) = summarise(&[unread, sample(4 * m, 5.0, 0, "192.0.2.1")], 0, 3 * m);
+        assert_eq!((points[0].nic_errors, points[0].nic_drops), (None, None));
+        assert_eq!(points[1].nic_errors, Some(0));
         // The change at 3 min is kept even though it is inside a bucket.
         assert_eq!(network.len(), 2);
         assert_eq!(network[1].t, 3 * m);

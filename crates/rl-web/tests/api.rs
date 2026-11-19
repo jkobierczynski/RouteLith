@@ -76,6 +76,7 @@ fn fixture() -> Fixture {
         newest = HealthSample {
             t: T0 + i * 60_000,
             interval_ms: if i == 0 { 0 } else { 60_000 },
+            nic_interval_ms: None,
             cpu_pct: (i > 0).then_some(10.0 * i as f64),
             load1: Some(0.5),
             nic_errors: (i > 0).then_some(0),
