@@ -65,7 +65,13 @@ pub struct ServerConfig {
     pub vantage: String,
     /// Packets-per-second ceiling for the whole agent (§5.2).
     pub max_pps: u32,
+    /// Address of the web UI, API and /metrics; `None` when turned off
+    /// with `listen_ui = "off"`. Default 127.0.0.1:8080 (§21.3 E9).
+    pub listen_ui: Option<std::net::SocketAddr>,
 }
+
+/// Where the web UI listens unless `listen_ui` says otherwise.
+pub const DEFAULT_LISTEN_UI: &str = "127.0.0.1:8080";
 
 /// One target, with every setting resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -743,21 +749,44 @@ impl Validator<'_> {
             },
             None => DEFAULT_MAX_PPS,
         };
-        for (key, value) in [
-            ("listen_ui", &raw.listen_ui),
-            ("listen_agents", &raw.listen_agents),
-        ] {
-            if let Some(v) = value {
-                self.warning(
-                    &v.span(),
-                    format!("{key} is ignored until M1 (no web UI or agents yet)"),
-                );
-            }
+        if let Some(v) = &raw.listen_agents {
+            self.warning(
+                &v.span(),
+                "listen_agents is ignored until agents arrive (milestone M3)",
+            );
         }
+        let listen_ui = match &raw.listen_ui {
+            None => DEFAULT_LISTEN_UI.parse().ok(),
+            Some(v) if v.get_ref().trim() == "off" => None,
+            Some(v) => match v.get_ref().trim().parse::<std::net::SocketAddr>() {
+                Ok(a) => {
+                    if !a.ip().is_loopback() {
+                        self.warning(
+                            &v.span(),
+                            format!(
+                                "listen_ui {a} is reachable from other hosts, and the web UI has \
+                                 no login yet: anyone who can connect sees every target and graph"
+                            ),
+                        );
+                    }
+                    Some(a)
+                }
+                Err(_) => {
+                    self.error(
+                        &v.span(),
+                        "listen_ui must be an address and port such as \"127.0.0.1:8080\" \
+                         or \"[::1]:8080\", or \"off\"",
+                    );
+                    ok = false;
+                    None
+                }
+            },
+        };
         ok.then(|| ServerConfig {
             data_dir: PathBuf::from(data_dir),
             vantage,
             max_pps,
+            listen_ui,
         })
     }
 
