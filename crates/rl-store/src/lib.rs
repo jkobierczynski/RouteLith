@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+pub mod events;
 pub mod health;
 mod index;
 pub mod layout;
@@ -39,6 +40,7 @@ mod writer;
 
 use std::path::PathBuf;
 
+pub use events::{EVENT_DAYS, Event, EventKind, EventLog, read_events};
 pub use health::{HealthLog, HealthSample, NicDelta, read_health};
 pub use index::SeriesKey;
 pub use reader::{GraphRounds, Reader, Resolution, VerifyReport};

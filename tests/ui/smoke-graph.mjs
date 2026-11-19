@@ -2,7 +2,8 @@
 // `routelith server` measuring TCP connect time to its own UI port, then
 // check in Chromium that the overview matrix fills in and that the target
 // view's canvas draws a smoke graph and shows this machine's health
-// snapshot, with no script errors or CSP violations.
+// snapshot, that the closed port's loss alert is listed on the overview and
+// in its events, with no script errors or CSP violations.
 //
 //   node tests/ui/smoke-graph.mjs target/debug/routelith [screenshot-dir]
 //
@@ -30,6 +31,12 @@ data_dir = ${JSON.stringify(join(dir, "data"))}
 vantage = "ci"
 listen_ui = "127.0.0.1:${port}"
 
+[[alert]]
+name = "down"
+metric = "loss"
+condition = ">= 100%"
+for = "2 rounds"
+
 [[group]]
 name = "local"
 
@@ -48,6 +55,7 @@ name = "closed-port"
 host = "127.0.0.1"
 probe = "tcp"
 port = 9
+alerts = ["down"]
 step = "2s"
 pings = 2
 spread = "500ms"
@@ -123,7 +131,20 @@ try {
   check(cells.length === 2, "the matrix has a cell per series (" + cells.join(", ") + ")");
   check(cells.some((c) => / ms$/.test(c)), "the reachable target shows a median");
   check(cells.includes("lost"), "the closed port shows as lost");
+  // The loss alert: listed above the matrix, its cell outlined.
+  await page.waitForSelector("section.alerts:not([hidden])");
+  const alertText = await page.textContent("section.alerts");
+  check(/1 alert raised/.test(alertText) && /closed-port/.test(alertText) && /down/.test(alertText), "the alert panel reads " + JSON.stringify(alertText));
+  check((await page.$$("td.cell span.v.alerting")).length === 1, "the alerting cell is outlined");
   if (shots) await page.screenshot({ path: join(shots, "overview.png") });
+
+  // The closed port's events: its alert raised.
+  await page.click("section.alerts a");
+  await page.waitForSelector("section.events:not([hidden])");
+  const eventText = await page.textContent("section.events");
+  check(/down raised: loss 100% >= 100% for 2 rounds/.test(eventText), "the events read " + JSON.stringify(eventText));
+  await page.goto(base + "/");
+  await page.waitForSelector("text=web-ui");
 
   await page.click("text=web-ui");
   await waitInPage(page, () => {

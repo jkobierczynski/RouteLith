@@ -4,6 +4,7 @@
 //! `ctl calibrate`, `ctl verify` and `ctl render` work.
 #![forbid(unsafe_code)]
 
+mod alerting;
 mod calibrate;
 mod check;
 mod health;

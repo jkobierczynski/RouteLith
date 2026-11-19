@@ -1,5 +1,6 @@
-// Routelith web UI (architecture doc §20): an overview matrix and a target
-// view of canvas smoke graphs, read from /api/v1. Plain JavaScript with no
+// Routelith web UI (architecture doc §20): an overview matrix with the
+// alerts raised now, and a target view of canvas smoke graphs with the
+// target's events, read from /api/v1. Plain JavaScript with no
 // build step; the server embeds this file. Read-only: nothing here writes.
 //
 // Every value from the API goes into the page through textContent or an
@@ -262,22 +263,31 @@
       el("thead", {}, el("tr", {}, el("th", { text: "Target" }), ...vantages.map((v) => el("th", { class: "cell", text: v })))),
       tbody
     );
+    const alertPanel = el("section", { class: "alerts", hidden: true });
     app.replaceChildren(
       el("h1", { text: "Overview" }),
       el("p", { class: "muted", text: series.length + " series. Each cell is the newest round's median." }),
+      alertPanel,
       lossLegend(),
       el("div", { class: "scroll" }, table)
     );
 
     async function refresh() {
-      const data = await getJson("/api/v1/latest");
+      const [data, alerts] = await Promise.all([getJson("/api/v1/latest"), getJson("/api/v1/alerts")]);
       if (gen !== generation) return;
+      showAlerts(alertPanel, alerts);
+      const alerting = new Map();
+      for (const a of alerts.active) {
+        if (!alerting.has(a.series)) alerting.set(a.series, []);
+        alerting.get(a.series).push(a.rule);
+      }
       const latest = new Map(data.latest.map((l) => [l.series, l]));
       for (const [id, c] of cells) {
         const l = latest.get(id);
         if (!l) {
           c.span.textContent = "–";
           c.span.title = "No round since the server started";
+          c.span.classList.toggle("alerting", alerting.has(id));
           c.span.style.borderLeftColor = css("--stale");
           continue;
         }
@@ -286,7 +296,10 @@
         const stale = age > 3 * c.step_s * 1000 + 60e3;
         c.span.textContent = l.recv ? fmtMs(l.median_us) : "lost";
         c.span.style.borderLeftColor = css(stale ? "--stale" : lossToken(loss));
+        const rules = alerting.get(id);
+        c.span.classList.toggle("alerting", !!rules);
         c.span.title =
+          (rules ? "Alert: " + rules.join(", ") + "\n" : "") +
           "loss " + fmtPct(loss) + " (" + l.recv + "/" + l.sent + ")" +
           (l.errors ? ", " + l.errors + " error(s)" : "") +
           (l.recv ? ", min " + fmtMs(l.min_us) + ", p90 " + fmtMs(l.p90_us) + ", max " + fmtMs(l.max_us) : "") +
@@ -295,6 +308,71 @@
       }
     }
     poll(gen, refresh, OVERVIEW_REFRESH_MS);
+  }
+
+  // ---------- alerts (§12) ----------
+
+  // A rule's value as the API gives it: ms, percent or MOS.
+  function fmtValue(rule, v, rules) {
+    if (v === undefined || v === null) return "";
+    const r = rules.find((x) => x.name === rule);
+    const s = r ? r.summary : "";
+    if (/^(loss|loss pattern)/.test(s)) return v + " %";
+    if (/^mos /.test(s)) return "MOS " + v;
+    return v + " ms";
+  }
+
+  function showAlerts(panel, data) {
+    const list = data.active;
+    panel.hidden = list.length === 0;
+    if (!list.length) return;
+    panel.replaceChildren(
+      el("h2", { text: list.length === 1 ? "1 alert raised" : list.length + " alerts raised" }),
+      el(
+        "ul",
+        {},
+        ...list.map((a) => {
+          const summary = (data.rules.find((r) => r.name === a.rule) || {}).summary;
+          return el(
+            "li",
+            {},
+            el("a", { href: targetHref(a.target), text: a.target }),
+            el("span", { class: "badge", text: a.family }),
+            " ",
+            el("strong", { text: a.rule, title: summary || "" }),
+            el("span", {
+              class: "muted",
+              text:
+                " since " + fmtTime(a.since, data.now - a.since > 20 * 3600e3) +
+                " (" + fmtAge(data.now - a.since) + ")" +
+                (a.value !== undefined ? ", " + fmtValue(a.rule, a.value, data.rules) : ""),
+            })
+          );
+        })
+      )
+    );
+  }
+
+  // Events of one target in the shown range, newest first.
+  function showEvents(panel, events, name, from, to) {
+    const mine = events.filter((e) => e.target === name && e.t >= from && e.t <= to);
+    panel.hidden = mine.length === 0;
+    if (!mine.length) return;
+    panel.replaceChildren(
+      el("h2", { text: "Events" }),
+      el(
+        "ul",
+        { class: "changes" },
+        ...mine.slice(0, 50).map((e) =>
+          el(
+            "li",
+            { class: "event-" + e.kind },
+            el("span", { class: "muted", text: fmtTime(e.t, to - from > 20 * 3600e3) + " " }),
+            e.message
+          )
+        )
+      )
+    );
   }
 
   // ---------- target view (§20.2) ----------
@@ -330,6 +408,18 @@
       showHost(hostPanel, host.data, list);
     }
     const graphs = list.map((s) => makeGraph(s, range, gen, host));
+    const eventPanel = el("section", { class: "events", hidden: true });
+    async function loadEvents() {
+      const to = Date.now();
+      const from = to - RANGE_MS[range];
+      try {
+        const d = await getJson("/api/v1/events?from=" + Math.floor(from) + "&to=" + (to + 1) + "&limit=5000");
+        if (gen !== generation) return;
+        showEvents(eventPanel, d.events, name, from, to);
+      } catch (_) {
+        eventPanel.hidden = true;
+      }
+    }
     app.replaceChildren(
       el("h1", { text: name }),
       el(
@@ -340,12 +430,13 @@
       ranges,
       lossLegend(),
       ...graphs.map((g) => g.root),
+      eventPanel,
       hostPanel
     );
     // A graph that fails keeps its last data (or its error) while the
     // others show theirs; the next refresh tries it again.
     async function refresh() {
-      await loadHost();
+      await Promise.all([loadHost(), loadEvents()]);
       if (gen !== generation) return;
       const results = await Promise.allSettled(graphs.map((g) => g.load()));
       const failed = results.find((r) => r.status === "rejected");

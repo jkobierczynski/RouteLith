@@ -267,6 +267,7 @@ pub(crate) fn render(s: &AppState) -> String {
     if let Some(h) = s.host.get() {
         crate::host::metrics(&mut m, &s.vantage, &h);
     }
+    crate::alerts::metrics(s, &mut m);
     if let Some(extra) = &s.extra_metrics {
         extra(&mut m);
     }

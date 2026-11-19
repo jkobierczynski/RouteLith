@@ -69,7 +69,7 @@ pub fn health_dir(dir: &Path, vantage: &str) -> PathBuf {
     dir.join("health").join(vantage)
 }
 
-fn day_path(dir: &Path, day: i64) -> PathBuf {
+pub(crate) fn day_path(dir: &Path, day: i64) -> PathBuf {
     dir.join(format!("{}.jsonl", date(day)))
 }
 
@@ -88,7 +88,7 @@ fn check_vantage(vantage: &str) -> Result<(), StoreError> {
 }
 
 /// Day files in a health directory, oldest first.
-fn list_days(dir: &Path) -> std::io::Result<Vec<i64>> {
+pub(crate) fn list_days(dir: &Path) -> std::io::Result<Vec<i64>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -202,7 +202,7 @@ impl HealthLog {
     }
 }
 
-fn ends_with_newline(f: &mut File) -> std::io::Result<bool> {
+pub(crate) fn ends_with_newline(f: &mut File) -> std::io::Result<bool> {
     let len = f.seek(SeekFrom::End(0))?;
     if len == 0 {
         return Ok(true);

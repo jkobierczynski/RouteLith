@@ -31,6 +31,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use toml::Spanned;
 
+use crate::alert::{self, AlertRule, Metric, PatternType, RuleKind, Threshold};
 use crate::duration;
 
 /// Seconds in a day; steps must divide it so rounds stay aligned to UTC days.
@@ -56,6 +57,8 @@ pub struct Config {
     pub server: ServerConfig,
     /// Targets measured from this vantage, in file order.
     pub targets: Vec<TargetConfig>,
+    /// Alert rules, in file order (§21.5 F1).
+    pub alerts: Vec<crate::alert::AlertRule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +88,8 @@ pub struct TargetConfig {
     pub schedule: Schedule,
     /// What is measured and the probe's own settings.
     pub probe: ProbeConfig,
+    /// Names of the alert rules that apply, from the `alerts` setting.
+    pub alerts: Vec<String>,
     /// 1-based line of the target's table, for messages.
     pub line: usize,
 }
@@ -446,6 +451,7 @@ pub fn parse(src: &str) -> Parsed {
         line_starts: line_starts(src),
         diagnostics: Vec::new(),
         errors: 0,
+        alert_names: HashMap::new(),
     };
     let config = match toml::from_str::<RawConfig>(src) {
         Ok(raw) => v.config(raw),
@@ -476,6 +482,24 @@ struct RawConfig {
     defaults: Option<RawDefaults>,
     #[serde(default, rename = "group")]
     groups: Vec<Spanned<RawGroup>>,
+    #[serde(default, rename = "alert")]
+    alerts: Vec<Spanned<RawAlert>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAlert {
+    name: Spanned<String>,
+    // Threshold rules.
+    metric: Option<Spanned<String>>,
+    condition: Option<Spanned<String>>,
+    #[serde(rename = "for")]
+    for_: Option<Spanned<toml::Value>>,
+    clear: Option<Spanned<String>>,
+    // SmokePing pattern rules.
+    #[serde(rename = "type")]
+    type_: Option<Spanned<String>>,
+    pattern: Option<Spanned<Vec<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -499,6 +523,7 @@ struct Settings {
     timeout: Option<Spanned<String>>,
     size: Option<Spanned<i64>>,
     family: Option<Spanned<String>>,
+    alerts: Option<Spanned<Vec<String>>>,
 }
 
 impl Settings {
@@ -511,6 +536,7 @@ impl Settings {
             timeout: self.timeout.or_else(|| parent.timeout.clone()),
             size: self.size.or_else(|| parent.size.clone()),
             family: self.family.or_else(|| parent.family.clone()),
+            alerts: self.alerts.or_else(|| parent.alerts.clone()),
         }
     }
 }
@@ -527,6 +553,7 @@ macro_rules! settings_struct {
             timeout: Option<Spanned<String>>,
             size: Option<Spanned<i64>>,
             family: Option<Spanned<String>>,
+            alerts: Option<Spanned<Vec<String>>>,
         }
 
         impl $name {
@@ -538,6 +565,7 @@ macro_rules! settings_struct {
                     timeout: self.timeout.clone(),
                     size: self.size.clone(),
                     family: self.family.clone(),
+                    alerts: self.alerts.clone(),
                 }
             }
         }
@@ -586,6 +614,8 @@ struct Validator<'a> {
     line_starts: Vec<usize>,
     diagnostics: Vec<Diagnostic>,
     errors: usize,
+    /// Alert rule names, and whether a target uses them.
+    alert_names: HashMap<String, bool>,
 }
 
 impl Validator<'_> {
@@ -629,6 +659,7 @@ impl Validator<'_> {
         let vantage = server
             .as_ref()
             .map_or_else(|| DEFAULT_VANTAGE.to_string(), |s| s.vantage.clone());
+        let alerts = self.alerts(&raw.alerts);
         self.check_layer(&defaults);
 
         let mut targets = Vec::new();
@@ -712,7 +743,201 @@ impl Validator<'_> {
                 ),
             );
         }
-        Some(Config { server, targets })
+        let mut unused: Vec<_> = raw
+            .alerts
+            .iter()
+            .filter(|a| self.alert_names.get(a.get_ref().name.get_ref()) == Some(&false))
+            .map(|a| (a.get_ref().name.span(), a.get_ref().name.get_ref().clone()))
+            .collect();
+        unused.dedup_by(|a, b| a.1 == b.1);
+        for (span, name) in unused {
+            self.warning(
+                &span,
+                format!("alert {name:?} is not used by any target (add it to a target's alerts)"),
+            );
+        }
+        Some(Config {
+            server,
+            targets,
+            alerts,
+        })
+    }
+
+    /// The `[[alert]]` tables (§21.5 F1–F3). Names are recorded even for a
+    /// rule with errors, so targets naming it get no second error.
+    fn alerts(&mut self, raw: &[Spanned<RawAlert>]) -> Vec<AlertRule> {
+        let mut out = Vec::new();
+        let mut first_line: HashMap<String, usize> = HashMap::new();
+        for a in raw {
+            let line = self.position(a.span().start).0;
+            let a = a.get_ref();
+            let name = a.name.get_ref().clone();
+            if !valid_name(&name) {
+                self.error(&a.name.span(), name_rule("alert name"));
+                continue;
+            }
+            if let Some(first) = first_line.get(&name) {
+                self.error(
+                    &a.name.span(),
+                    format!("duplicate alert name {name:?} (first defined on line {first})"),
+                );
+                continue;
+            }
+            first_line.insert(name.clone(), line);
+            self.alert_names.insert(name.clone(), false);
+            if let Some(kind) = self.alert_kind(a) {
+                out.push(AlertRule { name, kind, line });
+            }
+        }
+        out
+    }
+
+    fn alert_kind(&mut self, a: &RawAlert) -> Option<RuleKind> {
+        let name = a.name.get_ref();
+        if let Some(pattern) = &a.pattern {
+            for (key, span) in [
+                ("metric", a.metric.as_ref().map(Spanned::span)),
+                ("condition", a.condition.as_ref().map(Spanned::span)),
+                ("for", a.for_.as_ref().map(Spanned::span)),
+                ("clear", a.clear.as_ref().map(Spanned::span)),
+            ] {
+                if let Some(span) = span {
+                    self.error(
+                        &span,
+                        format!(
+                            "{key} does not apply to a pattern rule; a pattern raises the alert \
+                             while it matches"
+                        ),
+                    );
+                }
+            }
+            let kind = match a.type_.as_ref().map(|t| (t, t.get_ref().as_str())) {
+                Some((_, "loss")) => PatternType::Loss,
+                Some((_, "rtt")) => PatternType::Rtt,
+                Some((t, other)) => {
+                    self.error(
+                        &t.span(),
+                        format!("unknown alert type {other:?}; use \"loss\" or \"rtt\""),
+                    );
+                    return None;
+                }
+                None => {
+                    self.error(
+                        &a.name.span(),
+                        format!(
+                            "alert {name:?} has a pattern and needs type = \"loss\" or \"rtt\""
+                        ),
+                    );
+                    return None;
+                }
+            };
+            return match alert::parse_pattern(pattern.get_ref(), kind) {
+                Ok(p) => Some(RuleKind::Pattern(p)),
+                Err(e) => {
+                    self.error(&pattern.span(), e);
+                    None
+                }
+            };
+        }
+        if let Some(t) = &a.type_ {
+            self.error(
+                &t.span(),
+                "type applies to pattern rules only; a threshold rule names a metric",
+            );
+        }
+        let Some(metric_raw) = &a.metric else {
+            self.error(
+                &a.name.span(),
+                format!("alert {name:?} needs either metric and condition, or type and pattern"),
+            );
+            return None;
+        };
+        let Some(metric) = Metric::parse(metric_raw.get_ref()) else {
+            let names: Vec<&str> = Metric::ALL.iter().map(|m| m.as_str()).collect();
+            self.error(
+                &metric_raw.span(),
+                format!(
+                    "unknown metric {:?}; use one of {}",
+                    metric_raw.get_ref(),
+                    names.join(", ")
+                ),
+            );
+            return None;
+        };
+        let condition = match &a.condition {
+            None => {
+                self.error(&a.name.span(), format!("alert {name:?} needs a condition"));
+                None
+            }
+            Some(c) => match alert::parse_condition(c.get_ref(), metric) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    self.error(&c.span(), e);
+                    None
+                }
+            },
+        };
+        let for_rounds = match &a.for_ {
+            None => Some(1),
+            Some(v) => {
+                let text = match v.get_ref() {
+                    toml::Value::String(s) => Ok(s.clone()),
+                    toml::Value::Integer(i) => Ok(i.to_string()),
+                    _ => Err(()),
+                };
+                match text
+                    .map_err(|()| "for must be a number of rounds, as in \"3 rounds\"".to_string())
+                    .and_then(|t| alert::parse_rounds(&t).map_err(|e| format!("for: {e}")))
+                {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        self.error(&v.span(), e);
+                        None
+                    }
+                }
+            }
+        };
+        let clear = match &a.clear {
+            None => Some((None, None)),
+            Some(c) => match alert::parse_clear(c.get_ref(), metric) {
+                Ok((cmps, n)) => Some((Some(cmps), n)),
+                Err(e) => {
+                    self.error(&c.span(), e);
+                    None
+                }
+            },
+        };
+        let (condition, for_rounds, (clear, clear_rounds)) = (condition?, for_rounds?, clear?);
+        Some(RuleKind::Threshold(Threshold {
+            metric,
+            condition,
+            for_rounds,
+            clear,
+            clear_rounds: clear_rounds.unwrap_or(for_rounds),
+        }))
+    }
+
+    /// Check an `alerts` setting's names against the rules, and mark them used.
+    fn alert_refs(&mut self, v: Option<&Spanned<Vec<String>>>) -> Vec<String> {
+        let Some(v) = v else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for name in v.get_ref() {
+            match self.alert_names.get_mut(name) {
+                Some(used) => {
+                    *used = true;
+                    if !out.contains(name) {
+                        out.push(name.clone());
+                    }
+                }
+                None => {
+                    let msg = format!("unknown alert {name:?}; define it in an [[alert]] table");
+                    self.error(&v.span(), msg);
+                }
+            }
+        }
+        out
     }
 
     fn server(&mut self, raw: RawServer) -> Option<ServerConfig> {
@@ -911,6 +1136,7 @@ impl Validator<'_> {
             }
         }
 
+        let alerts = self.alert_refs(s.alerts.as_ref());
         let step = self.step(s.step.as_ref());
         let pings = self.pings(s.pings.as_ref());
         let timeout = self.timeout(s.timeout.as_ref());
@@ -973,6 +1199,7 @@ impl Validator<'_> {
                     payload_size: size?,
                 },
             },
+            alerts,
             line: self.position(span.start).0,
         })
     }
@@ -1508,6 +1735,144 @@ name = "Core"
             .filter(|d| d.severity == Severity::Error)
             .map(|d| d.to_string())
             .collect()
+    }
+
+    const ALERTS: &str = r#"
+[server]
+data_dir = "/tmp/rl"
+
+[defaults]
+alerts = ["loss-burst"]
+
+[[alert]]
+name    = "loss-burst"
+type    = "loss"
+pattern = [">0%", "*3*", ">0%"]
+
+[[alert]]
+name      = "slow"
+metric    = "median"
+condition = "> 20ms"
+for       = "3 rounds"
+clear     = "< 15ms"
+
+[[group]]
+name = "Core"
+
+  [[group.target]]
+  name = "a"
+  host = "10.0.0.1"
+
+  [[group.target]]
+  name   = "b"
+  host   = "10.0.0.2"
+  alerts = ["loss-burst", "slow"]
+"#;
+
+    #[test]
+    fn alert_rules_parse_and_cascade() {
+        use crate::alert::{Op, PatternItem};
+        let p = parse(ALERTS);
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let c = p.config.unwrap();
+        assert_eq!(c.alerts.len(), 2);
+        assert_eq!(c.alerts[0].name, "loss-burst");
+        assert_eq!(c.alerts[0].line, 8);
+        match &c.alerts[0].kind {
+            RuleKind::Pattern(p) => {
+                assert_eq!(p.kind, PatternType::Loss);
+                assert_eq!(p.items[1], PatternItem::Any(3));
+            }
+            k => panic!("{k:?}"),
+        }
+        match &c.alerts[1].kind {
+            RuleKind::Threshold(t) => {
+                assert_eq!(t.metric, Metric::Median);
+                assert_eq!((t.condition[0].op, t.condition[0].limit), (Op::Gt, 20.0));
+                assert_eq!((t.for_rounds, t.clear_rounds), (3, 3));
+                assert_eq!(t.clear.as_ref().unwrap()[0].limit, 15.0);
+            }
+            k => panic!("{k:?}"),
+        }
+        assert_eq!(c.targets[0].alerts, ["loss-burst"]);
+        assert_eq!(c.targets[1].alerts, ["loss-burst", "slow"]);
+    }
+
+    #[test]
+    fn alert_mistakes_are_reported() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "alerts = [\"loss-burst\"]",
+                "alerts = [\"nope\"]",
+                "unknown alert \"nope\"",
+            ),
+            (
+                "type    = \"loss\"",
+                "type    = \"jitter\"",
+                "unknown alert type",
+            ),
+            (
+                "type    = \"loss\"\n",
+                "",
+                "needs type = \"loss\" or \"rtt\"",
+            ),
+            (
+                "metric    = \"median\"",
+                "metric    = \"avg\"",
+                "unknown metric \"avg\"",
+            ),
+            (
+                "condition = \"> 20ms\"",
+                "condition = \"> 20\"",
+                "needs a time unit",
+            ),
+            (
+                "for       = \"3 rounds\"",
+                "for       = \"3 minutes\"",
+                "number of rounds",
+            ),
+            (
+                "clear     = \"< 15ms\"",
+                "clear     = \"< 15%\"",
+                "needs a time unit",
+            ),
+            (
+                "pattern = [\">0%\", \"*3*\", \">0%\"]",
+                "pattern = [\"*3*\"]",
+                "not a wildcard",
+            ),
+            (
+                "pattern = [\">0%\", \"*3*\", \">0%\"]",
+                "pattern = [\">0%\"]\nfor = 2",
+                "for does not apply to a pattern rule",
+            ),
+            (
+                "name      = \"slow\"",
+                "name      = \"loss-burst\"",
+                "duplicate alert name",
+            ),
+        ];
+        for (from, to, want) in cases {
+            assert!(ALERTS.contains(from), "{from}");
+            let src = ALERTS.replacen(from, to, 1);
+            let errs = errors(&src);
+            assert!(
+                errs.iter().any(|e| e.contains(want)),
+                "{to:?}: want {want:?} in {errs:?}"
+            );
+        }
+        // A rule no target uses is only a warning.
+        let src = ALERTS.replace(", \"slow\"]", "]");
+        let p = parse(&src);
+        assert!(p.config.is_some());
+        assert!(
+            p.diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Warning
+                    && d.message.contains("\"slow\" is not used")),
+            "{:?}",
+            p.diagnostics
+        );
     }
 
     #[test]
@@ -2259,6 +2624,7 @@ name = "G"
                 line_starts: line_starts(src),
                 diagnostics: Vec::new(),
                 errors: 0,
+                alert_names: HashMap::new(),
             }
             .position(offset)
         };

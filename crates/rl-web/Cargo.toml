@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 axum.workspace = true
+rl-alert.workspace = true
 rl-core.workspace = true
 rl-render.workspace = true
 rl-store.workspace = true

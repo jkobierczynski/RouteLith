@@ -20,6 +20,7 @@
   --loss-max: #d7191c;
   --nic: #d7191c;
   --change: #0f8b8d;
+  --alert: #d7191c;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -43,6 +44,7 @@
     --loss-max: #f05555;
     --nic: #f05555;
     --change: #3cc7c9;
+    --alert: #f05555;
     color-scheme: dark;
   }
 }
@@ -161,3 +163,15 @@ table.matrix { border-collapse: collapse; min-width: 100%; }
 .host p { margin: 4px 0; font-size: 13px; }
 .host .changes { margin: 4px 0 0; padding-left: 18px; font-size: 13px; }
 .tip-host { color: var(--muted); }
+
+/* Alerts raised now (overview) and a target's events. */
+.alerts { margin: 12px 0; padding: 10px 16px; border: 1px solid var(--alert); border-left-width: 6px; border-radius: 6px; }
+.alerts h2 { font-size: 14px; margin: 0 0 6px; color: var(--alert); }
+.alerts ul { margin: 0; padding-left: 18px; }
+.alerts li { margin: 2px 0; overflow-wrap: anywhere; }
+.matrix td.cell span.v.alerting { outline: 2px solid var(--alert); outline-offset: 1px; }
+.events { margin: 16px 0; padding: 12px 16px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.events h2 { font-size: 14px; margin: 0 0 6px; }
+.events ul { margin: 4px 0 0; padding-left: 18px; font-size: 13px; }
+.events li { overflow-wrap: anywhere; }
+.events .event-alert_raised { color: var(--alert); }

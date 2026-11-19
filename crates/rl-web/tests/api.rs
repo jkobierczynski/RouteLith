@@ -7,11 +7,12 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use rl_store::{
-    ErrorCounts, HealthLog, HealthSample, NicDelta, Reader, SeriesKey, StoredRound, Writer,
-    WriterOptions,
+    ErrorCounts, Event, EventKind, EventLog, HealthLog, HealthSample, NicDelta, Reader, SeriesKey,
+    StoredRound, Writer, WriterOptions,
 };
 use rl_web::{
-    AppState, HostHealth, HttpPhases, Latest, LatestHost, LatestRound, NicTotal, SeriesInfo,
+    AlertBoard, AppState, HostHealth, HttpPhases, Latest, LatestHost, LatestRound, NicTotal,
+    RuleInfo, SeriesInfo,
 };
 use tower::ServiceExt;
 
@@ -99,6 +100,34 @@ fn fixture() -> Fixture {
         };
         log.append(&newest).unwrap();
     }
+    // One alert raised and cleared, one raised now.
+    let mut events = EventLog::open(dir.path(), 400).unwrap();
+    for (i, kind) in [
+        EventKind::AlertRaised,
+        EventKind::AlertCleared,
+        EventKind::AlertRaised,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut e = Event::new(T0 + i as i64 * STEP_MS, kind, "home", format!("event {i}"));
+        e.series = Some(id);
+        e.rule = Some("slow".into());
+        events.append(&e).unwrap();
+    }
+    let alerts = Arc::new(AlertBoard::new(vec![RuleInfo {
+        name: "slow".into(),
+        kind: "threshold".into(),
+        summary: "median > 20ms".into(),
+        series: vec![id],
+    }]));
+    alerts.set_active(vec![rl_alert::ActiveAlert {
+        series: id,
+        rule: "slow".into(),
+        since_ms: T0 + 2 * STEP_MS,
+        value: Some(31.25),
+    }]);
+    alerts.count(true);
     let host = Arc::new(LatestHost::default());
     host.record(HostHealth {
         sample: newest,
@@ -131,6 +160,7 @@ fn fixture() -> Fixture {
             m.family("routelith_test_total", "counter", "A test counter.");
             m.sample("routelith_test_total", &[], 7.0);
         })),
+        alerts,
     };
     Fixture {
         _dir: dir,
@@ -418,4 +448,53 @@ async fn metrics_show_the_host_health() {
             "missing {line:?} in\n{body}"
         );
     }
+}
+
+#[tokio::test]
+async fn alerts_and_events() {
+    let f = fixture();
+    let (st, _, body) = get(&f.router, "/api/v1/alerts").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v = json(&body);
+    let a = &v["active"][0];
+    assert_eq!(a["target"], "gw \"main\"");
+    assert_eq!(a["rule"], "slow");
+    assert_eq!(a["since"].as_i64(), Some(T0 + 2 * STEP_MS));
+    assert_eq!(a["value"].as_f64(), Some(31.25));
+    assert_eq!(v["rules"][0]["summary"], "median > 20ms");
+
+    let uri = format!("/api/v1/events?from={T0}&to={}", T0 + 86_400_000);
+    let (st, _, body) = get(&f.router, &uri).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v = json(&body);
+    let msgs: Vec<_> = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["message"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(msgs, ["event 2", "event 1", "event 0"], "newest first");
+    assert_eq!(v["events"][0]["kind"], "alert_raised");
+    assert_eq!(v["truncated"], false);
+
+    let (_, _, body) = get(&f.router, &format!("{uri}&limit=1")).await;
+    let v = json(&body);
+    assert_eq!(v["events"].as_array().unwrap().len(), 1);
+    assert_eq!(v["truncated"], true);
+
+    for bad in ["/api/v1/events?from=x", "/api/v1/events?from=10&to=5"] {
+        let (st, _, body) = get(&f.router, bad).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        assert!(json(&body)["error"].is_string());
+    }
+
+    let (_, _, body) = get(&f.router, "/metrics").await;
+    assert!(
+        body.contains(
+            "routelith_alert_active{vantage=\"home\",target=\"gw \\\"main\\\"\",family=\"v4\",rule=\"slow\"} 1"
+        ),
+        "{body}"
+    );
+    assert!(body.contains("routelith_alerts_raised_total 1"));
+    assert!(body.contains("routelith_alerts_cleared_total 0"));
 }

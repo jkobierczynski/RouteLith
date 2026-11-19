@@ -5,8 +5,9 @@ SmokePing-style latency distributions ("smoke" graphs) with PingPlotter-style
 hop-by-hop path tracing, measured from federated agents on Linux and Windows,
 shipped as one self-contained binary.
 
-**Status:** pre-alpha. M0 (ICMP, scheduler, store, SVG smoke graphs) is done;
-M1 is in progress. `routelith check icmp`, `check tcp`, `check dns` and
+**Status:** pre-alpha. M0 (ICMP, scheduler, store, SVG smoke graphs) and M1
+(TCP/DNS/HTTP, rollups, web UI, services) are done; M2 (alerts, outputs,
+reports) is in progress. `routelith check icmp`, `check tcp`, `check dns` and
 `check http` work on Linux and Windows, and `routelith server` measures all
 four kinds of target. The server also answers HTTP on `127.0.0.1:8080`
 (`listen_ui` in `[server]`; `"off"` turns it off): a web UI with an overview
@@ -17,6 +18,17 @@ Once a minute the server also records a health snapshot of its own machine
 (CPU, NIC errors and drops, default gateways, DNS servers) in
 `data/health/`; the target view shows it beside the graphs, so a slow minute
 can be told apart from a busy or reconfigured host.
+
+Alert rules are `[[alert]]` tables that targets name in an `alerts` setting
+(which cascades from `[defaults]` and groups like `step`): thresholds with
+hysteresis (`metric = "median"`, `condition = "> 20ms"`, `for = "3 rounds"`,
+`clear = "< 15ms"`) and SmokePing patterns (`type = "loss"`,
+`pattern = [">0%", "*3*", ">0%"]`). Raised and cleared alerts, address
+changes and server starts and stops go to an event log in `data/events/`
+(kept 400 days); the overview lists the alerts raised now, the target view
+the target's events, and `/api/v1/alerts`, `/api/v1/events` and `/metrics`
+serve them. Sending them to syslog, the Event Log, webhooks and e-mail comes
+next.
 
 ```console
 $ routelith check icmp example.net -c 5 -i 200ms
@@ -65,11 +77,12 @@ not signed yet.
 | `crates/rl-sys` | All `unsafe` and OS FFI (the only crate allowed `unsafe`) |
 | `crates/rl-probe` | The `Probe` trait and probe implementations |
 | `crates/rl-sched` | Round scheduler, phase spreading, rate limiting |
-| `crates/rl-store` | smokestore: WAL, day segments, codecs |
+| `crates/rl-store` | smokestore: WAL, day segments, codecs, rollups, health and event logs |
 | `crates/rl-render` | Smoke-graph algorithm and SVG rendering |
+| `crates/rl-alert` | Alert engine: thresholds with hysteresis, SmokePing patterns |
 | `crates/rl-web` | HTTP server: REST API, `/metrics`, the web UI (plain JS in `ui/`) |
 
-Later milestones add `rl-path`, `rl-fed`, `rl-alert`, `rl-out` and `rl-reflector`.
+Later milestones add `rl-path`, `rl-fed`, `rl-out` and `rl-reflector`.
 
 ## Building
 

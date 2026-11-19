@@ -14,13 +14,38 @@ pings   = 20       # samples per round
 # timeout = "2s"   # per-sample timeout
 # size    = 56     # ICMP payload bytes
 # family  = "v4"   # v4, v6, both (two series) or prefer-v6
+# alerts  = ["down", "slow"]  # alert rules (below) that apply
 # Each target measures ICMP echo unless it sets probe = "tcp" (connect time to
 # its port; mode = "banner" times the server's first byte instead) or
 # probe = "dns" (one query per sample to server; see the dns-quad9-query target)
 # or probe = "http" (one request per sample to url; see the web target).
 
+# Alert rules. A target uses a rule when its alerts setting (in [defaults],
+# a group or the target) names it. Raised and cleared alerts are written to
+# data/events/ and shown in the web UI.
+[[alert]]
+name      = "down"
+metric    = "loss"          # median, min, max, p90 (ms), loss (%) or mos
+condition = ">= 100%"
+for       = "2 rounds"      # rounds in a row before it is raised
+
+[[alert]]
+name      = "slow"
+metric    = "median"
+condition = "> 50ms"        # comparisons joined by "and"
+for       = "3 rounds"
+clear     = "< 30ms for 3 rounds"   # default: the condition not met for as long
+
+# SmokePing-style pattern: loss, then up to 3 rounds of anything, then loss
+# again; raised while it matches.
+[[alert]]
+name    = "loss-burst"
+type    = "loss"            # loss (% or count of lost samples) or rtt (median, ms)
+pattern = [">0%", "*3*", ">0%"]
+
 [[group]]
 name = "Core"
+alerts = ["down", "loss-burst"]
 
   [[group.target]]
   name = "gateway"
@@ -39,6 +64,7 @@ pings = 10
   [[group.target]]
   name = "cloudflare"
   host = "1.1.1.1"
+  alerts = ["down", "slow"]
 
   [[group.target]]
   name  = "cloudflare-https"
