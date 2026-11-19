@@ -128,9 +128,6 @@ mod windows {
             Some(l) => std::path::absolute(l)?,
             None => config.with_file_name("routelith.log"),
         };
-        // The service account must be able to read the configuration and
-        // write its data and log.
-        grant(&config, "RX")?;
         // The service starts in System32, so a relative data_dir would
         // name a different folder there than the one granted here.
         let data_dir = PathBuf::from(&cfg.server.data_dir);
@@ -141,6 +138,9 @@ mod windows {
                 data_dir.display()
             )));
         }
+        // The service account must be able to read the configuration and
+        // write its data and log.
+        grant(&config, "RX")?;
         std::fs::create_dir_all(&data_dir)?;
         grant(&data_dir, "(OI)(CI)M")?;
         if let Some(dir) = log.parent() {
