@@ -114,6 +114,9 @@ pub struct HealthLog {
     expired_at: Option<i64>,
     /// Files deleted by retention.
     pub expired_files: u64,
+    /// A day file was created and its directory entry is not yet synced
+    /// (an append failed after creating it).
+    dir_unsynced: bool,
 }
 
 impl HealthLog {
@@ -133,6 +136,7 @@ impl HealthLog {
             keep_days,
             expired_at: None,
             expired_files: 0,
+            dir_unsynced: false,
         })
     }
 
@@ -144,6 +148,7 @@ impl HealthLog {
         }
         let path = day_path(&self.dir, day);
         let new = !path.exists();
+        self.dir_unsynced |= new;
         let mut f = OpenOptions::new()
             .read(true)
             .append(true)
@@ -159,8 +164,9 @@ impl HealthLog {
         line.push(b'\n');
         f.write_all(&line)?;
         f.sync_data()?;
-        if new {
+        if self.dir_unsynced {
             layout::sync_dir(&self.dir)?;
+            self.dir_unsynced = false;
         }
         if self.expired_at != Some(day) {
             self.expire(day)?;
@@ -172,7 +178,7 @@ impl HealthLog {
     fn expire(&mut self, today: i64) -> Result<(), StoreError> {
         let mut removed = false;
         for day in list_days(&self.dir)? {
-            if day < today - self.keep_days {
+            if day < today.saturating_sub(self.keep_days) {
                 std::fs::remove_file(day_path(&self.dir, day))?;
                 self.expired_files += 1;
                 removed = true;

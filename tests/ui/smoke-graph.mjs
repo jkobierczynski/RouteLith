@@ -56,6 +56,10 @@ timeout = "500ms"
 );
 
 const server = spawn(bin, ["server", "-c", cfg, "--stats-interval", "0"], { stdio: ["ignore", "inherit", "inherit"] });
+// A binary that cannot start reports through `error`, not `exit`: fail the
+// run through the normal path, so the fixture is still removed.
+let spawnError = null;
+server.once("error", (e) => (spawnError = e));
 let failed = false;
 function check(cond, msg) {
   if (!cond) {
@@ -69,6 +73,7 @@ function check(cond, msg) {
 async function waitFor(fn, what, ms = 15000) {
   const end = Date.now() + ms;
   for (;;) {
+    if (spawnError) throw new Error("the server did not start: " + spawnError.message);
     try {
       const v = await fn();
       if (v) return v;
@@ -108,7 +113,12 @@ try {
   const resp = await page.goto(base + "/");
   check(resp.ok(), "the page loads");
   check((resp.headers()["content-security-policy"] || "").includes("script-src 'self'"), "the page carries its CSP");
-  await waitInPage(page, () => [...document.querySelectorAll("td.cell span.v")].every((s) => s.textContent && s.textContent !== "…"));
+  // Both cells, filled: an empty list would pass `every` before the first
+  // response arrives.
+  await waitInPage(page, () => {
+    const cells = [...document.querySelectorAll("td.cell span.v")];
+    return cells.length === 2 && cells.every((s) => s.textContent && s.textContent !== "…");
+  });
   const cells = await page.$$eval("td.cell span.v", (s) => s.map((e) => e.textContent));
   check(cells.length === 2, "the matrix has a cell per series (" + cells.join(", ") + ")");
   check(cells.some((c) => / ms$/.test(c)), "the reachable target shows a median");
@@ -155,13 +165,18 @@ try {
   }
   check(/gateway .* · DNS /.test(tipText), "the hover tip shows the network state (" + JSON.stringify(tipText) + ")");
 
+  // Each range's own graph, not the previous canvas still on screen.
+  const rendered = (r) => {
+    const c = document.querySelector("section.graph canvas");
+    return c?.dataset.range === r && Number(c.dataset.points) > 0;
+  };
   for (const r of ["30h", "10d"]) {
     await page.click(`.ranges button:text("${r}")`);
-    await waitInPage(page, (r) => location.hash.endsWith("range=" + r) && Number(document.querySelector("section.graph canvas")?.dataset.points) > 0, r);
+    await waitInPage(page, rendered, r);
   }
   check(true, "the 30h and 10d ranges load");
   await page.click(`.ranges button:text("3h")`);
-  await waitInPage(page, () => Number(document.querySelector("section.graph canvas")?.dataset.points) > 0);
+  await waitInPage(page, rendered, "3h");
   if (shots) await page.screenshot({ path: join(shots, "target.png") });
 
   check(problems.length === 0, "no script errors or CSP violations" + (problems.length ? ": " + problems.join(" | ") : ""));
@@ -170,7 +185,8 @@ try {
   console.error("FAIL: " + e.message);
 } finally {
   if (browser) await browser.close();
-  if (server.exitCode === null && server.signalCode === null) {
+  // Without a pid it never started, and no `exit` will come.
+  if (server.pid !== undefined && server.exitCode === null && server.signalCode === null) {
     const exited = new Promise((r) => server.once("exit", r));
     server.kill("SIGINT");
     await exited;

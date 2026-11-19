@@ -278,25 +278,34 @@ impl Reader {
         let step = i64::try_from(self.step_ms(series).unwrap_or(DEFAULT_STEP_MS))
             .unwrap_or(i64::MAX)
             .max(1);
-        let limit = i64::from(max_points.max(1)) * 2;
+        let n = i64::from(max_points.max(1));
+        let limit = n * 2;
+        // Ceiling division of positive values, without the overflow of
+        // `(a + b - 1) / b`.
+        let ceil_div = |a: i64, b: i64| a / b + i64::from(a % b != 0);
         retry(|| {
             if self.raw_complete(series, from_ms)? {
                 let rounds_in_span = span / step;
                 if rounds_in_span <= limit {
                     let rounds = self.read(series, from_ms, to_ms)?;
                     self.still_raw(series, from_ms)?;
-                    return Ok((
-                        Resolution::Raw,
-                        rounds.iter().map(RollupPoint::from_round).collect(),
-                    ));
+                    // The recorded step is the current one: older rounds
+                    // may be denser. Too many go into buckets below.
+                    if rounds.len() as u64 <= limit.unsigned_abs() {
+                        return Ok((
+                            Resolution::Raw,
+                            rounds.iter().map(RollupPoint::from_round).collect(),
+                        ));
+                    }
                 }
-                // About `max_points` buckets of whole steps.
-                let per_bucket = (rounds_in_span + i64::from(max_points.max(1)) - 1)
-                    / i64::from(max_points.max(1));
-                let width = step.saturating_mul(per_bucket);
+                // About `max_points` buckets of whole steps, and never
+                // more than that whatever the rounds' real spacing.
+                let width = step
+                    .saturating_mul(ceil_div(rounds_in_span, n))
+                    .max(ceil_div(span, n));
                 if width < Tier::R1h.width_ms() {
                     // Whole buckets: start at a boundary before `from_ms`.
-                    let start = from_ms.div_euclid(width) * width;
+                    let start = from_ms.saturating_sub(from_ms.rem_euclid(width));
                     let rounds = self.read(series, start, to_ms)?;
                     self.still_raw(series, from_ms)?;
                     return Ok((

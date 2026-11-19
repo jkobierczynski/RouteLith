@@ -140,6 +140,14 @@ fn ranges_pick_their_resolution() {
     assert_eq!(pts.len(), 72);
     assert_eq!((pts[0].ts_ms, pts[0].rounds, pts[0].sent), (T0, 4, 80));
     assert_eq!(pts[1].ts_ms, T0 + 4 * STEP_MS);
+
+    // The step went up to 10 min, but these rounds are 5 min apart: the
+    // 3 h estimate of 17 rounds fits 10 points, the 36 read do not, and
+    // go into 20 min buckets instead.
+    w.set_steps(&[(id, 600_000)]).unwrap();
+    let r = Reader::open(dir.path()).unwrap();
+    let (res, pts) = r.read_points(id, T0, T0 + 3 * HOUR_MS - 1, 10).unwrap();
+    assert_eq!((res, pts.len()), (Resolution::Buckets(1_200_000), 9));
     drop(w);
 }
 

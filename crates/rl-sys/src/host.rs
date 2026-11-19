@@ -36,8 +36,9 @@ pub struct HostReading {
     pub cpu: Option<CpuTimes>,
     /// One-minute load average (Linux only).
     pub load1: Option<f64>,
-    /// Interfaces other than loopback, sorted by name.
-    pub nics: Vec<NicCounters>,
+    /// Interfaces other than loopback, sorted by name; `None` when the
+    /// counters could not be read (not the same as no interfaces).
+    pub nics: Option<Vec<NicCounters>>,
     /// Next hops of the default routes, IPv4 first, without duplicates.
     pub gateways: Vec<IpAddr>,
     /// Configured DNS servers in resolver order, without duplicates.
@@ -52,7 +53,9 @@ pub fn read() -> HostReading {
     let mut r = crate::windows::read_host();
     #[cfg(not(any(target_os = "linux", windows)))]
     let mut r = HostReading::default();
-    r.nics.sort_by(|a, b| a.name.cmp(&b.name));
+    if let Some(nics) = &mut r.nics {
+        nics.sort_by(|a, b| a.name.cmp(&b.name));
+    }
     dedup(&mut r.gateways);
     dedup(&mut r.dns_servers);
     r
@@ -87,7 +90,10 @@ fn read_linux() -> HostReading {
         .unwrap_or_default();
     // A local stub resolver (systemd-resolved's 127.0.0.53) hides the
     // servers actually used; resolved lists them in its own file.
-    if !dns_servers.is_empty() && dns_servers.iter().all(IpAddr::is_loopback) {
+    // Only that address: another local resolver (127.0.0.1, say) is
+    // reported as configured.
+    let stub = IpAddr::from([127, 0, 0, 53]);
+    if !dns_servers.is_empty() && dns_servers.iter().all(|ip| *ip == stub) {
         if let Some(upstream) = file("/run/systemd/resolve/resolv.conf")
             .map(|s| parse_resolv_conf(&s))
             .filter(|v| !v.is_empty())
@@ -98,9 +104,7 @@ fn read_linux() -> HostReading {
     HostReading {
         cpu: file("/proc/stat").as_deref().and_then(parse_proc_stat),
         load1: file("/proc/loadavg").as_deref().and_then(parse_loadavg),
-        nics: file("/proc/net/dev")
-            .map(|s| parse_net_dev(&s))
-            .unwrap_or_default(),
+        nics: file("/proc/net/dev").map(|s| parse_net_dev(&s)),
         gateways,
         dns_servers,
     }

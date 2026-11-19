@@ -6,6 +6,8 @@
   --line: #e2e4e8;
   --panel: #f6f7f9;
   --accent: #2b6cd4;
+  /* Text on the accent: 4.5:1 or more in both themes. */
+  --on-accent: #ffffff;
   --grid: #e6e7ea;
   --frame: #8a8f98;
   --smoke: #000000;
@@ -28,6 +30,7 @@
     --line: #2c3036;
     --panel: #1d2024;
     --accent: #6ea2ff;
+    --on-accent: #0b1220;
     --grid: #2a2e34;
     --frame: #6b717a;
     --smoke: #ffffff;
@@ -122,7 +125,7 @@ table.matrix { border-collapse: collapse; min-width: 100%; }
   color: var(--fg);
   cursor: pointer;
 }
-.ranges button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+.ranges button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .graph { margin: 16px 0 24px; }
 .graph .head { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
 .graph .head strong { font-size: 14px; }
@@ -137,7 +140,12 @@ table.matrix { border-collapse: collapse; min-width: 100%; }
   border-radius: 4px;
   background: var(--bg);
   font-size: 12px;
-  white-space: nowrap;
+  /* As wide as its text, but never wider than the plot: long gateway
+     and DNS lists wrap. */
+  width: max-content;
+  max-width: calc(100% - 8px);
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
 }
 .tip[hidden] { display: none; }
