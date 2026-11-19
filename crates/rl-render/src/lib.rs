@@ -641,13 +641,21 @@ mod tests {
         let rtts = [1_000u32, 3_000];
         let width = f64::from(Graph::DEFAULT_WIDTH);
         for (from_ms, to_ms) in [(i64::MIN, i64::MAX), (-1, i64::MAX)] {
-            let rounds: Vec<Round<'_>> = [from_ms, 0, to_ms]
-                .map(|ts_ms| Round {
+            // From -1, a round at -1 would share the zero round's column:
+            // leave it out, so the left column is the zero round alone.
+            let times: &[i64] = if from_ms == i64::MIN {
+                &[i64::MIN, 0, i64::MAX]
+            } else {
+                &[0, i64::MAX]
+            };
+            let rounds: Vec<Round<'_>> = times
+                .iter()
+                .map(|&ts_ms| Round {
                     ts_ms,
                     sent: 2,
                     rtts_us: &rtts,
                 })
-                .to_vec();
+                .collect();
             let g = Graph {
                 title: "t",
                 from_ms,
