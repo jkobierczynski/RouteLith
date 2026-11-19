@@ -502,6 +502,13 @@ impl Pattern {
     /// items × history × wildcard width at most, not one try per way the
     /// wildcards could split the rounds.
     pub fn matches(&self, history: &[PatternValue]) -> bool {
+        self.matches_counting(history, &mut 0)
+    }
+
+    /// [`matches`](Self::matches), adding the positions it visits to
+    /// `steps`: at most `(history.len() + 1)` per item, whatever the
+    /// wildcards.
+    fn matches_counting(&self, history: &[PatternValue], steps: &mut u64) -> bool {
         let n = history.len();
         let mut reach = vec![false; n + 1];
         reach[n] = true;
@@ -513,6 +520,7 @@ impl Pattern {
                     let m = *m as usize;
                     let mut until: Option<usize> = None;
                     for k in (0..=n).rev() {
+                        *steps += 1;
                         if reach[k] {
                             until = Some(k);
                         }
@@ -521,6 +529,7 @@ impl Pattern {
                 }
                 item => {
                     for k in 1..=n {
+                        *steps += 1;
                         if reach[k] && item.matches(self.kind, &history[k - 1]) {
                             next[k - 1] = true;
                         }
@@ -720,9 +729,11 @@ mod tests {
         }
         let p = pat(PatternType::Loss, &items);
         let clean = vec![v(0.0, Some(1.0)); p.window()];
-        let started = std::time::Instant::now();
-        assert!(!p.matches(&clean));
-        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        let mut steps = 0;
+        assert!(!p.matches_counting(&clean, &mut steps));
+        // Linear: at most one visit per history position and item.
+        let bound = (clean.len() as u64 + 1) * items.len() as u64;
+        assert!(steps <= bound, "{steps} steps > {bound}");
     }
 
     #[test]

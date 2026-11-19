@@ -373,7 +373,20 @@
         )
       ),
       ...(mine.length > 50 || data.truncated
-        ? [el("p", { class: "muted", text: "Only the newest " + Math.min(50, mine.length) + " events are shown; /api/v1/events has them all." })]
+        ? [
+            el(
+              "p",
+              { class: "muted" },
+              "Only the newest 50 events are shown. ",
+              el("a", {
+                href:
+                  "/api/v1/events?target=" + encodeURIComponent(name) +
+                  "&from=" + Math.floor(from) + "&to=" + (Math.floor(to) + 1) + "&limit=5000",
+                text: "Up to 5000 of this range",
+              }),
+              " are in the API; for more, ask for a shorter range."
+            ),
+          ]
         : [])
     );
   }
