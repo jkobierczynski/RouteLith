@@ -236,3 +236,46 @@ async fn metrics_show_the_newest_round() {
     // No TLS phase for plain HTTP.
     assert!(!body.contains("phase=\"tls\""));
 }
+
+#[tokio::test]
+async fn latest_lists_the_newest_rounds() {
+    let f = fixture();
+    let (st, _, body) = get(&f.router, "/api/v1/latest").await;
+    assert_eq!(st, StatusCode::OK);
+    let v = json(&body);
+    assert!(v["now"].as_i64().unwrap() > 1_700_000_000_000);
+    let l = &v["latest"][0];
+    assert_eq!(l["series"].as_u64(), Some(f.id));
+    assert_eq!((l["sent"].as_u64(), l["recv"].as_u64()), (Some(4), Some(3)));
+    assert_eq!(l["median_us"].as_u64(), Some(1100));
+}
+
+#[tokio::test]
+async fn the_ui_is_served_from_the_binary() {
+    let f = fixture();
+    let (st, h, body) = get(&f.router, "/").await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(h["content-type"].to_str().unwrap().starts_with("text/html"));
+    let csp = h["content-security-policy"].to_str().unwrap();
+    assert!(
+        csp.contains("script-src 'self'") && !csp.contains("unsafe"),
+        "{csp}"
+    );
+    assert!(body.contains("/ui/app.js") && body.contains("/ui/style.css"));
+    for (path, ty) in [
+        ("/ui/app.js", "text/javascript"),
+        ("/ui/style.css", "text/css"),
+    ] {
+        let (st, h, body) = get(&f.router, path).await;
+        assert_eq!(st, StatusCode::OK, "{path}");
+        assert!(
+            h["content-type"].to_str().unwrap().starts_with(ty),
+            "{path}"
+        );
+        assert!(!body.is_empty());
+    }
+    let (st, _, _) = get(&f.router, "/ui/../Cargo.toml").await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, _) = get(&f.router, "/ui/other.js").await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

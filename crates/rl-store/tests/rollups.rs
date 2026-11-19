@@ -130,8 +130,15 @@ fn ranges_pick_their_resolution() {
     let (res, _) = r.read_points(id, T0, T0 + 10 * DAY_MS, 100).unwrap();
     assert_eq!(res, Resolution::Rollup(Tier::R1d));
     // 30 h at 50 points: hourly.
-    let (res, pts) = r.read_points(id, T0, T0 + 30 * HOUR_MS, 50).unwrap();
+    let (res, pts) = r.read_points(id, T0, T0 + 30 * HOUR_MS, 30).unwrap();
     assert_eq!(res, Resolution::Rollup(Tier::R1h));
     assert_eq!(pts.len(), 24);
+    // 30 h at 100 points: 360 rounds is too many to draw singly, but
+    // buckets of 4 rounds (20 min) are finer than hours.
+    let (res, pts) = r.read_points(id, T0, T0 + 30 * HOUR_MS, 100).unwrap();
+    assert_eq!(res, Resolution::Buckets(4 * STEP_MS));
+    assert_eq!(pts.len(), 72);
+    assert_eq!((pts[0].ts_ms, pts[0].rounds, pts[0].sent), (T0, 4, 80));
+    assert_eq!(pts[1].ts_ms, T0 + 4 * STEP_MS);
     drop(w);
 }

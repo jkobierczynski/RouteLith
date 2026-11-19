@@ -109,6 +109,23 @@ jobs:
           esac
 
   # macOS is best effort (architecture doc D4): compile only.
+  # The web UI in Chromium against a running server: the overview matrix
+  # fills in and the canvas draws a smoke graph (architecture doc §21.4).
+  ui-browser:
+    name: web UI (Chromium)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cargo build --locked -p routelith
+      - run: npm install --no-save --no-package-lock playwright@1.49.1
+      - run: npx playwright install --with-deps chromium
+      - run: node tests/ui/smoke-graph.mjs target/debug/routelith
+
   check-macos:
     name: check (macos-latest)
     runs-on: macos-latest

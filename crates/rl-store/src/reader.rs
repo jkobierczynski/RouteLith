@@ -28,6 +28,10 @@ pub struct Reader {
 pub enum Resolution {
     /// One point per stored round.
     Raw,
+    /// Raw rounds consolidated on the fly into buckets of this many
+    /// milliseconds (a whole number of steps, under an hour): for ranges
+    /// with too many rounds to draw one by one but too few hours for r1h.
+    Buckets(i64),
     /// One point per hour or day.
     Rollup(Tier),
 }
@@ -110,7 +114,8 @@ impl Reader {
 
     /// Points for drawing `from_ms..=to_ms` about `max_points` wide: the
     /// finest resolution with at most twice that many points, and not raw
-    /// when the range starts before the oldest raw day still on disk.
+    /// (or raw buckets) when the range starts before the oldest raw day
+    /// still on disk.
     pub fn read_points(
         &self,
         series: u64,
@@ -130,12 +135,28 @@ impl Reader {
         // or if there are no rollups to use instead.
         let raw_complete = oldest_raw.is_some_and(|o| from_ms >= o)
             || rollup::last_rolled_day(&self.dir, series)?.is_none();
-        if span / step <= limit && raw_complete {
-            let rounds = self.read(series, from_ms, to_ms)?;
-            return Ok((
-                Resolution::Raw,
-                rounds.iter().map(RollupPoint::from_round).collect(),
-            ));
+        if raw_complete {
+            let rounds_in_span = span / step;
+            if rounds_in_span <= limit {
+                let rounds = self.read(series, from_ms, to_ms)?;
+                return Ok((
+                    Resolution::Raw,
+                    rounds.iter().map(RollupPoint::from_round).collect(),
+                ));
+            }
+            // About `max_points` buckets of whole steps.
+            let per_bucket =
+                (rounds_in_span + i64::from(max_points.max(1)) - 1) / i64::from(max_points.max(1));
+            let width = step.saturating_mul(per_bucket);
+            if width < Tier::R1h.width_ms() {
+                // Whole buckets: start at a boundary before `from_ms`.
+                let start = from_ms.div_euclid(width) * width;
+                let rounds = self.read(series, start, to_ms)?;
+                return Ok((
+                    Resolution::Buckets(width),
+                    RollupPoint::build(&rounds, width),
+                ));
+            }
         }
         let tier = if span / Tier::R1h.width_ms() <= limit {
             Tier::R1h

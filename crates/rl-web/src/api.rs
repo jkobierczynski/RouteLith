@@ -69,6 +69,48 @@ pub(crate) async fn series(State(s): State<Arc<AppState>>) -> Response {
     Json(serde_json::json!({ "series": list })).into_response()
 }
 
+#[derive(Serialize)]
+struct LatestJson {
+    series: u64,
+    /// Round start, Unix milliseconds.
+    t: i64,
+    sent: u32,
+    recv: u32,
+    errors: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_us: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    median_us: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p90_us: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_us: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cert_not_after_s: Option<i64>,
+}
+
+/// The newest round of every series that has one, for the overview.
+pub(crate) async fn latest(State(s): State<Arc<AppState>>) -> Response {
+    let snap = s.latest.snapshot();
+    let mut list: Vec<LatestJson> = snap
+        .into_iter()
+        .map(|(id, l)| LatestJson {
+            series: id,
+            t: l.ts_ms,
+            sent: l.sent,
+            recv: l.received,
+            errors: l.errors,
+            min_us: l.min_us,
+            median_us: l.median_us,
+            p90_us: l.p90_us,
+            max_us: l.max_us,
+            cert_not_after_s: l.cert_not_after_s,
+        })
+        .collect();
+    list.sort_by_key(|l| l.series);
+    Json(serde_json::json!({ "now": now_ms(), "latest": list })).into_response()
+}
+
 /// `from` and `to` are Unix milliseconds; `to` defaults to now and `from`
 /// to three hours before `to`.
 #[derive(Debug, Deserialize)]
@@ -168,6 +210,8 @@ pub(crate) async fn data(
     };
     let (resolution, width_ms) = match res {
         Resolution::Raw => ("raw", i64::try_from(info.step_ms).unwrap_or(i64::MAX)),
+        // Several raw rounds per point (`n`), consolidated exactly.
+        Resolution::Buckets(w) => ("raw", w),
         Resolution::Rollup(t @ Tier::R1h) => ("r1h", t.width_ms()),
         Resolution::Rollup(t) => ("r1d", t.width_ms()),
     };

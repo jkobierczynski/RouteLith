@@ -1,6 +1,6 @@
-//! The server's HTTP side (architecture doc §11.1, §13.2, §21.3 E6–E9):
+//! The server's HTTP side (architecture doc §11.1, §13.2, §20, §21.3 E6–E9):
 //! the REST API under `/api/v1`, Prometheus `/metrics`, `/healthz`, and
-//! the web UI's static files.
+//! the web UI, whose few static files are compiled into the binary.
 //!
 //! It runs inside `routelith server` and reads the store directly, so it
 //! shows exactly what the server stored. Everything is read-only: nothing
@@ -11,6 +11,7 @@
 
 mod api;
 mod metrics;
+mod ui;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -113,6 +114,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(api::health))
         .route("/metrics", get(metrics::handler))
+        .route("/", get(ui::index))
+        .route("/ui/{file}", get(ui::asset))
+        .route("/api/v1/latest", get(api::latest))
         .route("/api/v1/series", get(api::series))
         .route("/api/v1/series/{id}/data", get(api::data))
         .route("/api/v1/render/{file}", get(api::render))
