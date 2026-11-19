@@ -177,6 +177,34 @@ async fn bad_requests_are_json_errors() {
             StatusCode::BAD_REQUEST,
         ),
         ("/api/v1/render/abc.svg".to_string(), StatusCode::NOT_FOUND),
+        ("/api/v1/series/abc/data".to_string(), StatusCode::NOT_FOUND),
+        (
+            format!("/api/v1/series/{}/data?points=abc", f.id),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/api/v1/series/{}/data?from=abc", f.id),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/api/v1/render/{}.svg?from=abc", f.id),
+            StatusCode::BAD_REQUEST,
+        ),
+        // Past the years the store holds (and the renderer's tick loop).
+        (
+            format!(
+                "/api/v1/render/{}.svg?range=3h&to=9223372036854775807",
+                f.id
+            ),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!(
+                "/api/v1/series/{}/data?from=-9223372036854775808&to=0",
+                f.id
+            ),
+            StatusCode::BAD_REQUEST,
+        ),
         ("/nope".to_string(), StatusCode::NOT_FOUND),
     ] {
         let (st, h, body) = get(&f.router, &uri).await;
