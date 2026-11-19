@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
+use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -16,6 +17,9 @@ use crate::{AppState, error};
 const HOUR_MS: i64 = 3_600_000;
 /// Longest range one request may ask for (the r1d retention).
 const MAX_SPAN_MS: i64 = 3653 * 24 * HOUR_MS;
+/// Times the store can hold: 0000-01-01T00:00:00Z to 9999-12-31T23:59:59.999Z.
+const MIN_MS: i64 = -62_167_219_200_000;
+const MAX_MS: i64 = 253_402_300_799_999;
 const DEFAULT_POINTS: u32 = 800;
 const MAX_POINTS: u32 = 5000;
 
@@ -84,6 +88,13 @@ impl RangeQuery {
     #[allow(clippy::result_large_err)] // the error is the response itself
     fn resolve(&self) -> Result<(i64, i64), Response> {
         let to = self.to.unwrap_or_else(now_ms);
+        let in_store = |t: i64| (MIN_MS..=MAX_MS).contains(&t);
+        if !in_store(to) || self.from.is_some_and(|f| !in_store(f)) {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "from and to must be within the years 0000 to 9999",
+            ));
+        }
         let from = match (self.from, self.range.as_deref()) {
             (Some(f), None) => f,
             (None, None) => to - 3 * HOUR_MS,
@@ -147,9 +158,15 @@ struct PointJson<'a> {
 /// and `points` (§13.2).
 pub(crate) async fn data(
     State(s): State<Arc<AppState>>,
-    Path(id): Path<u64>,
-    Query(q): Query<RangeQuery>,
+    id: Result<Path<u64>, PathRejection>,
+    q: Result<Query<RangeQuery>, QueryRejection>,
 ) -> Response {
+    let (Path(id), Query(q)) = match (id, q) {
+        (Ok(id), Ok(q)) => (id, q),
+        // A malformed id names no series.
+        (Err(e), _) => return error(StatusCode::NOT_FOUND, e.body_text()),
+        (_, Err(e)) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
     let info = match find(&s, id) {
         Ok(i) => i.clone(),
         Err(r) => return r,
@@ -195,9 +212,14 @@ pub(crate) async fn data(
 /// `GET /api/v1/render/{id}.svg`: the server-rendered smoke graph (§7.2).
 pub(crate) async fn render(
     State(s): State<Arc<AppState>>,
-    Path(file): Path<String>,
-    Query(q): Query<RangeQuery>,
+    file: Result<Path<String>, PathRejection>,
+    q: Result<Query<RangeQuery>, QueryRejection>,
 ) -> Response {
+    let (Path(file), Query(q)) = match (file, q) {
+        (Ok(f), Ok(q)) => (f, q),
+        (Err(e), _) => return error(StatusCode::NOT_FOUND, e.body_text()),
+        (_, Err(e)) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
     let Some(id) = file
         .strip_suffix(".svg")
         .and_then(|i| i.parse::<u64>().ok())
@@ -214,9 +236,9 @@ pub(crate) async fn render(
     };
     let reader = Arc::clone(&s.reader);
     let svg = tokio::task::spawn_blocking(move || {
-        // Raw rounds past their retention are gone; the graph shows what
-        // is left, like `ctl render`.
-        let rounds = reader.read(id, from, to)?;
+        // Raw rounds while retention keeps them, else rollups, like
+        // `ctl render`.
+        let (resolution, rounds) = reader.read_graph(id, from, to)?;
         let view: Vec<Round<'_>> = rounds
             .iter()
             .map(|r| Round {
@@ -235,7 +257,10 @@ pub(crate) async fn render(
                 title: &title,
                 from_ms: from,
                 to_ms: to,
-                step_ms: i64::try_from(info.step_ms).ok(),
+                step_ms: match resolution {
+                    Resolution::Rollup(tier) => Some(tier.width_ms()),
+                    Resolution::Raw => i64::try_from(info.step_ms).ok(),
+                },
                 width: Graph::DEFAULT_WIDTH,
                 height: Graph::DEFAULT_HEIGHT,
             },

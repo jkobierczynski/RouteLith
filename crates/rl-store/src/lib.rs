@@ -64,4 +64,8 @@ pub enum StoreError {
     /// An earlier write failed; reopen the directory to recover.
     #[error("store stopped after an earlier error ({0}); restart to recover")]
     Stopped(String),
+    /// Retention deleted a segment while it was being read; reading again
+    /// finds its day in the rollups.
+    #[error("{} was deleted by retention during the read", .0.display())]
+    Expired(PathBuf),
 }

@@ -34,6 +34,8 @@ pub enum Resolution {
 
 /// Step assumed for a series with none recorded (the config default).
 const DEFAULT_STEP_MS: u64 = 300_000;
+/// Attempts at a read that retention or a roll-up changes under it.
+const ATTEMPTS: usize = 5;
 
 /// Result of [`Reader::verify`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -46,6 +48,18 @@ pub struct VerifyReport {
     pub torn_open: usize,
     /// Checksum or decoding failures.
     pub problems: Vec<String>,
+}
+
+/// Run a read again while retention or a roll-up changes the files under
+/// it (each change is quick, and happens about once a day).
+fn retry<T>(mut f: impl FnMut() -> Result<T, StoreError>) -> Result<T, StoreError> {
+    let mut n = 0;
+    loop {
+        match f() {
+            Err(StoreError::Expired(_)) if n + 1 < ATTEMPTS => n += 1,
+            r => return r,
+        }
+    }
 }
 
 impl Reader {
@@ -90,22 +104,96 @@ impl Reader {
         from_ms: i64,
         to_ms: i64,
     ) -> Result<Vec<RollupPoint>, StoreError> {
+        retry(|| self.read_tier_once(series, tier, from_ms, to_ms))
+    }
+
+    fn read_tier_once(
+        &self,
+        series: u64,
+        tier: Tier,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<RollupPoint>, StoreError> {
+        // The points and the boundary of what they cover must be read
+        // together: a day rolled up in between would be in neither.
+        let before = rollup::last_rolled_day(&self.dir, series)?;
         let mut out = rollup::read(&self.dir, series, tier, from_ms, to_ms)?;
-        let rolled_until = rollup::last_rolled_day(&self.dir, series)?
-            .map_or(i64::MIN, |d| (d + 1).saturating_mul(layout::DAY_MS));
+        let last = rollup::last_rolled_day(&self.dir, series)?;
+        if last != before {
+            return Err(StoreError::Expired(rollup::tier_dir(
+                &self.dir, series, tier,
+            )));
+        }
+        let rolled_until = last.map_or(i64::MIN, |d| (d + 1).saturating_mul(layout::DAY_MS));
         let raw_from = from_ms.max(rolled_until);
         if raw_from <= to_ms {
             // Start at a bucket boundary, so the first bucket is whole.
             let start = raw_from.div_euclid(tier.width_ms()) * tier.width_ms();
             let rounds = self.read(series, start, to_ms)?;
             out.retain(|p| p.ts_ms < start);
+            // The same bound as the stored points: a point's start is in
+            // the range.
             out.extend(
                 RollupPoint::build(&rounds, tier.width_ms())
                     .into_iter()
-                    .filter(|p| p.ts_ms >= from_ms.div_euclid(tier.width_ms()) * tier.width_ms()),
+                    .filter(|p| p.ts_ms >= from_ms),
             );
         }
         Ok(out)
+    }
+
+    /// The finest rollup tier that still holds the start of a range: the
+    /// hourly files are kept for less time than the daily ones.
+    fn covering_tier(&self, series: u64, finest: Tier, from_ms: i64) -> Result<Tier, StoreError> {
+        if finest == Tier::R1d {
+            return Ok(Tier::R1d);
+        }
+        let hourly = rollup::first_ts(&self.dir, series, Tier::R1h)?;
+        if hourly.is_some_and(|h| h <= from_ms) {
+            return Ok(Tier::R1h);
+        }
+        // Daily points older than every hourly one: hourly has expired
+        // there.
+        let daily = rollup::first_ts(&self.dir, series, Tier::R1d)?;
+        let hourly_day = hourly.map(|h| h.div_euclid(layout::DAY_MS) * layout::DAY_MS);
+        Ok(match (daily, hourly_day) {
+            (Some(d), Some(h)) if d < h => Tier::R1d,
+            (Some(_), None) => Tier::R1d,
+            _ => Tier::R1h,
+        })
+    }
+
+    /// Whether raw rounds hold the whole range: back to its start, or
+    /// there is nothing rolled up to use instead.
+    fn raw_complete(&self, series: u64, from_ms: i64) -> Result<bool, StoreError> {
+        let oldest_raw = layout::list_segments(&self.dir, series)?
+            .first()
+            .map(|s| s.day * layout::DAY_MS);
+        Ok(oldest_raw.is_some_and(|o| from_ms >= o)
+            || rollup::last_rolled_day(&self.dir, series)?.is_none())
+    }
+
+    /// Rounds for drawing a smoke graph of `from_ms..=to_ms`: the raw
+    /// rounds while they cover the range, else one round per rollup point
+    /// (its quantiles as the replies, and as many sent as keeps its loss
+    /// ratio), with the point width as the step to draw at.
+    pub fn read_graph(
+        &self,
+        series: u64,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<(Resolution, Vec<StoredRound>), StoreError> {
+        retry(|| {
+            if self.raw_complete(series, from_ms)? {
+                return Ok((Resolution::Raw, self.read(series, from_ms, to_ms)?));
+            }
+            let tier = self.covering_tier(series, Tier::R1h, from_ms)?;
+            let points = self.read_tier_once(series, tier, from_ms, to_ms)?;
+            Ok((
+                Resolution::Rollup(tier),
+                points.iter().map(RollupPoint::to_round).collect(),
+            ))
+        })
     }
 
     /// Points for drawing `from_ms..=to_ms` about `max_points` wide: the
@@ -123,29 +211,25 @@ impl Reader {
             .unwrap_or(i64::MAX)
             .max(1);
         let limit = i64::from(max_points.max(1)) * 2;
-        let oldest_raw = layout::list_segments(&self.dir, series)?
-            .first()
-            .map(|s| s.day * layout::DAY_MS);
-        // Raw serves the range if it holds data back to the range's start,
-        // or if there are no rollups to use instead.
-        let raw_complete = oldest_raw.is_some_and(|o| from_ms >= o)
-            || rollup::last_rolled_day(&self.dir, series)?.is_none();
-        if span / step <= limit && raw_complete {
-            let rounds = self.read(series, from_ms, to_ms)?;
-            return Ok((
-                Resolution::Raw,
-                rounds.iter().map(RollupPoint::from_round).collect(),
-            ));
-        }
-        let tier = if span / Tier::R1h.width_ms() <= limit {
-            Tier::R1h
-        } else {
-            Tier::R1d
-        };
-        Ok((
-            Resolution::Rollup(tier),
-            self.read_tier(series, tier, from_ms, to_ms)?,
-        ))
+        retry(|| {
+            if span / step <= limit && self.raw_complete(series, from_ms)? {
+                let rounds = self.read(series, from_ms, to_ms)?;
+                return Ok((
+                    Resolution::Raw,
+                    rounds.iter().map(RollupPoint::from_round).collect(),
+                ));
+            }
+            let finest = if span / Tier::R1h.width_ms() <= limit {
+                Tier::R1h
+            } else {
+                Tier::R1d
+            };
+            let tier = self.covering_tier(series, finest, from_ms)?;
+            Ok((
+                Resolution::Rollup(tier),
+                self.read_tier_once(series, tier, from_ms, to_ms)?,
+            ))
+        })
     }
 
     /// Rounds of a series with `from_ms <= ts <= to_ms`, oldest first,
@@ -274,8 +358,10 @@ impl Reader {
             for seg in layout::list_segments(&self.dir, id)? {
                 rep.segments += 1;
                 let path = seg.path.display();
-                let Some((bytes, sealed)) = self.read_segment(id, &seg)? else {
-                    continue;
+                let (bytes, sealed) = match self.read_segment(id, &seg) {
+                    Ok(Some(b)) => b,
+                    Ok(None) | Err(StoreError::Expired(_)) => continue,
+                    Err(e) => return Err(e),
                 };
                 let scan = match segment::scan(&bytes) {
                     Ok(s) => s,
@@ -353,6 +439,8 @@ impl Reader {
                     Err(e) => Err(e.into()),
                 }
             }
+            // Deleted by retention after it was listed.
+            Err(e) if missing(&e) => Err(StoreError::Expired(seg.path.clone())),
             Err(e) => Err(e.into()),
         }
     }
@@ -371,6 +459,8 @@ impl Reader {
                             m => m?,
                         }
                     }
+                    // Deleted by retention after it was listed.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     m => m?,
                 }
                 .len();

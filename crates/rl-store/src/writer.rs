@@ -403,6 +403,12 @@ impl Writer {
                     dirty.insert(seg.path.clone());
                 }
             }
+            // Days already rolled up are closed even when retention has
+            // deleted their raw segments: a round for one of them would be
+            // dropped by the next roll-up, so it must be refused as late.
+            if let Some(d) = rollup::last_rolled_day(dir, id)? {
+                s.sealed_through = s.sealed_through.max(Some(d));
+            }
             // Normally at most one open segment; older ones are complete.
             open_days.sort_unstable();
             s.open_day = open_days.pop();
@@ -604,13 +610,19 @@ impl Writer {
             // Retention: whole files only (§6.4). Every sealed raw day was
             // rolled up above before any is deleted.
             let raw_before = today - self.opts.raw_days;
-            let mut removed = false;
-            for seg in layout::list_segments(&self.dir, id)? {
-                if seg.sealed && seg.day < raw_before {
-                    std::fs::remove_file(&seg.path)?;
-                    self.stats.expired_files += 1;
-                    removed = true;
-                }
+            let expiring: Vec<_> = layout::list_segments(&self.dir, id)?
+                .into_iter()
+                .filter(|seg| seg.sealed && seg.day < raw_before)
+                .collect();
+            if !expiring.is_empty() {
+                // Their rollups may come from before a crash and be only in
+                // the page cache; make them durable before the source goes.
+                rollup::sync_all(&self.dir, id)?;
+            }
+            let removed = !expiring.is_empty();
+            for seg in expiring {
+                std::fs::remove_file(&seg.path)?;
+                self.stats.expired_files += 1;
             }
             if removed {
                 layout::sync_dir(&layout::raw_dir(&self.dir, id))?;

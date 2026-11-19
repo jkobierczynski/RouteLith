@@ -570,13 +570,20 @@ fn series_infos(plans: &[SeriesPlan], ids: &[u64], vantage: &str) -> Vec<SeriesI
         .collect()
 }
 
+/// The `p`th percentile (0 to 100) of an ascending slice by nearest rank:
+/// the smallest value with at least `p` % of the values at or below it.
+fn nearest_rank(sorted: &[u32], p: usize) -> Option<u32> {
+    let n = sorted.len();
+    if n == 0 {
+        return None;
+    }
+    let rank = (p * n).div_ceil(100).max(1);
+    Some(sorted[rank.min(n) - 1])
+}
+
 /// The newest round as `/metrics` shows it.
 fn latest_round(c: &Completed, r: &StoredRound) -> LatestRound {
-    // `rtts_us` is ascending; nearest-rank quantiles.
-    let q = |p: usize| -> Option<u32> {
-        let n = r.rtts_us.len();
-        (n > 0).then(|| r.rtts_us[(p * (n - 1) + 50) / 100])
-    };
+    let q = |p: usize| nearest_rank(&r.rtts_us, p);
     let http = match &c.outcome {
         Outcome::Measured(m) => m.http.as_ref(),
         Outcome::Failed { .. } => None,
@@ -846,6 +853,18 @@ mod tests {
         };
         let l = latest_round(&c, &stored(&c).unwrap());
         assert_eq!((l.median_us, l.http_phases_us), (None, None));
+    }
+
+    #[test]
+    fn percentiles_are_nearest_rank() {
+        let seven = [100, 200, 300, 400, 500, 600, 700];
+        assert_eq!(nearest_rank(&seven, 90), Some(700));
+        assert_eq!(nearest_rank(&seven, 50), Some(400));
+        assert_eq!(nearest_rank(&seven, 0), Some(100));
+        assert_eq!(nearest_rank(&seven, 100), Some(700));
+        assert_eq!(nearest_rank(&[100, 200], 50), Some(100));
+        assert_eq!(nearest_rank(&[100, 200], 90), Some(200));
+        assert_eq!(nearest_rank(&[], 50), None);
     }
 
     #[test]
