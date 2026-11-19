@@ -128,6 +128,8 @@ pub(crate) struct RangeQuery {
     pub(crate) points: Option<u32>,
     /// `3h`, `30h` or `10d`, ending at `to` (instead of `from`).
     range: Option<String>,
+    /// PNG pixel density (`/render/{id}.png`): 1 (default) or 2.
+    scale: Option<f32>,
 }
 
 impl RangeQuery {
@@ -268,7 +270,13 @@ pub(crate) async fn data(
     .into_response()
 }
 
-/// `GET /api/v1/render/{id}.svg`: the server-rendered smoke graph (§7.2).
+enum Image {
+    Svg(String),
+    Png(Vec<u8>),
+}
+
+/// `GET /api/v1/render/{id}.svg` and `.png`: the server-rendered smoke
+/// graph (§7.2, §21.5 F9). A PNG takes `scale=2` for high-density screens.
 pub(crate) async fn render(
     State(s): State<Arc<AppState>>,
     file: Result<Path<String>, PathRejection>,
@@ -279,12 +287,21 @@ pub(crate) async fn render(
         (Err(e), _) => return error(StatusCode::NOT_FOUND, e.body_text()),
         (_, Err(e)) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
-    let Some(id) = file
-        .strip_suffix(".svg")
-        .and_then(|i| i.parse::<u64>().ok())
-    else {
-        return error(StatusCode::NOT_FOUND, "expected /api/v1/render/<id>.svg");
+    let (stem, png) = match (file.strip_suffix(".svg"), file.strip_suffix(".png")) {
+        (Some(s), _) => (s, false),
+        (_, Some(s)) => (s, true),
+        _ => ("", false),
     };
+    let Ok(id) = stem.parse::<u64>() else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "expected /api/v1/render/<id>.svg or <id>.png",
+        );
+    };
+    let scale = q.scale.unwrap_or(1.0);
+    if !(scale == 1.0 || scale == 2.0) {
+        return error(StatusCode::BAD_REQUEST, "scale must be 1 or 2");
+    }
     let info = match find(&s, id) {
         Ok(i) => i.clone(),
         Err(r) => return r,
@@ -315,7 +332,7 @@ pub(crate) async fn render(
             "{} ({}, from {})",
             info.key.target, info.key.family, info.key.vantage
         );
-        Ok::<_, rl_store::StoreError>(rl_render::render(
+        let svg = rl_render::render(
             &view,
             &Graph {
                 title: &title,
@@ -330,11 +347,19 @@ pub(crate) async fn render(
                 height: Graph::DEFAULT_HEIGHT,
                 totals: Some((sent, received)),
             },
-        ))
+        );
+        if png {
+            rl_render::svg_to_png(&svg, scale)
+                .map(Image::Png)
+                .map_err(|e| rl_store::StoreError::Io(std::io::Error::other(e)))
+        } else {
+            Ok(Image::Svg(svg))
+        }
     })
     .await;
     match svg {
-        Ok(Ok(svg)) => (
+        Ok(Ok(Image::Png(png))) => ([(header::CONTENT_TYPE, "image/png")], png).into_response(),
+        Ok(Ok(Image::Svg(svg))) => (
             [
                 (header::CONTENT_TYPE, "image/svg+xml"),
                 // SVG may hold script; this one never does, and must not run any.

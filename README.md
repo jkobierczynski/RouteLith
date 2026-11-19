@@ -12,7 +12,7 @@ reports) is in progress. `routelith check icmp`, `check tcp`, `check dns` and
 four kinds of target. The server also answers HTTP on `127.0.0.1:8080`
 (`listen_ui` in `[server]`; `"off"` turns it off): a web UI with an overview
 matrix and smoke graphs per target, a read-only JSON API under `/api/v1`,
-server-rendered SVG graphs, Prometheus `/metrics` and `/healthz`.
+server-rendered SVG and PNG graphs (`/api/v1/render/<id>.svg` or `.png`), Prometheus `/metrics` and `/healthz`.
 There is no login yet, so keep it on loopback or behind a proxy that has one.
 Once a minute the server also records a health snapshot of its own machine
 (CPU, NIC errors and drops, default gateways, DNS servers) in
@@ -78,7 +78,7 @@ not signed yet.
 | `crates/rl-probe` | The `Probe` trait and probe implementations |
 | `crates/rl-sched` | Round scheduler, phase spreading, rate limiting |
 | `crates/rl-store` | smokestore: WAL, day segments, codecs, rollups, health and event logs |
-| `crates/rl-render` | Smoke-graph algorithm and SVG rendering |
+| `crates/rl-render` | Smoke-graph algorithm, SVG rendering and PNG (resvg, embedded Liberation Sans under `fonts/`) |
 | `crates/rl-alert` | Alert engine: thresholds with hysteresis, SmokePing patterns |
 | `crates/rl-web` | HTTP server: REST API, `/metrics`, the web UI (plain JS in `ui/`) |
 
