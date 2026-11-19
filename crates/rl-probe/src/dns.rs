@@ -289,6 +289,11 @@ fn build_query(p: &Prepared, id: u16) -> Result<(Vec<u8>, Query), String> {
 /// Check a response against the question sent, the expected rcode and
 /// the answer set.
 fn check(p: &Prepared, bytes: &[u8], id: u16, question: &Query) -> Result<(), SampleError> {
+    if !counts_fit(bytes) {
+        return Err(SampleError::Other(
+            "malformed response: header counts exceed its length".into(),
+        ));
+    }
     let msg = Message::from_vec(bytes)
         .map_err(|e| SampleError::Other(format!("malformed response: {e}")))?;
     // Name comparison ignores case, as DNS does (resolvers may echo 0x20
@@ -334,6 +339,20 @@ fn check(p: &Prepared, bytes: &[u8], id: u16, question: &Query) -> Result<(), Sa
         }
     }
     Ok(())
+}
+
+/// Whether the header's section counts could fit in the message: a
+/// question takes at least 5 bytes and a record at least 11. hickory-proto
+/// 0.25 reserves memory for every counted entry before decoding any
+/// (RUSTSEC-2026-0491), so a small spoofed packet claiming 65,535 records
+/// is rejected here instead.
+fn counts_fit(bytes: &[u8]) -> bool {
+    let Some(header) = bytes.get(..12) else {
+        return false;
+    };
+    let count = |i: usize| usize::from(u16::from_be_bytes([header[i], header[i + 1]]));
+    let need = count(4) * 5 + (count(6) + count(8) + count(10)) * 11;
+    need <= bytes.len() - 12
 }
 
 /// Lower case, without a trailing dot, so `Example.com.` matches `example.com`.
@@ -504,6 +523,18 @@ mod tests {
             matches!(&e, SampleError::DnsMismatch(m) if m.contains("truncated")),
             "{e:?}"
         );
+
+        // Header counts larger than the message are refused before decoding.
+        let mut forged = resp.clone();
+        forged[6] = 0xff;
+        forged[7] = 0xff;
+        let e = check(p, &forged, 7, &question).unwrap_err();
+        assert!(
+            matches!(&e, SampleError::Other(m) if m.contains("header counts")),
+            "{e:?}"
+        );
+        assert!(!counts_fit(&resp[..11]));
+        assert!(counts_fit(&resp));
 
         // Without expected answers only the rcode matters.
         let probe = DnsProbe::new(cfg("example.com")).unwrap();
