@@ -55,14 +55,19 @@ pub(crate) fn parse_date(s: &str) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
+    let day = civil_day(y, m, d);
+    (date(day) == s).then_some(day)
+}
+
+/// Day number of a proleptic Gregorian date, any year; `m` 1 to 12.
+pub(crate) fn civil_day(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
     let mp = if m > 2 { m - 3 } else { m + 9 };
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let day = era * 146_097 + doe - 719_468;
-    (date(day) == s).then_some(day)
+    era * 146_097 + doe - 719_468
 }
 
 pub(crate) fn index_path(dir: &Path) -> PathBuf {

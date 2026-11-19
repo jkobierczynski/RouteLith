@@ -46,6 +46,9 @@ pub struct Graph<'a> {
     /// [`MIN_HEIGHT`](Self::MIN_HEIGHT) is drawn (smaller is enlarged).
     pub width: u32,
     pub height: u32,
+    /// Pings sent and replies received for the summary line, when the
+    /// rounds' own counts are scaled (rollups); `None` sums the rounds.
+    pub totals: Option<(u64, u64)>,
 }
 
 impl Graph<'_> {
@@ -83,7 +86,9 @@ const SMOKE_OPACITY: f64 = 0.6;
 /// One drawn column.
 #[derive(Debug, Clone, PartialEq)]
 struct Bucket {
-    start_ms: i64,
+    /// Wider than `i64`: the bucket of a round near `i64::MIN` starts
+    /// below it.
+    start_ms: i128,
     sent: u32,
     /// Replies in the bucket.
     received: u32,
@@ -131,8 +136,7 @@ fn buckets(rounds: &[Round<'_>], g: &Graph<'_>, plot_width: f64) -> (Vec<BucketA
         if r.ts_ms < g.from_ms || r.ts_ms > g.to_ms {
             continue;
         }
-        // Saturating: the bucket of a round near i64::MIN starts below it.
-        let start = r.ts_ms.saturating_sub(r.ts_ms.rem_euclid(width));
+        let start = i128::from(r.ts_ms) - i128::from(r.ts_ms.rem_euclid(width));
         if out.last().is_none_or(|b| b.start_ms != start) {
             out.push(BucketAcc {
                 start_ms: start,
@@ -150,7 +154,7 @@ fn buckets(rounds: &[Round<'_>], g: &Graph<'_>, plot_width: f64) -> (Vec<BucketA
 /// A bucket being filled.
 #[derive(Debug)]
 struct BucketAcc {
-    start_ms: i64,
+    start_ms: i128,
     sent: u32,
     rtts_us: Vec<u32>,
 }
@@ -161,11 +165,12 @@ struct BucketAcc {
 fn infer_step(rounds: &[Round<'_>]) -> i64 {
     rounds
         .windows(2)
-        .map(|w| w[1].ts_ms - w[0].ts_ms)
+        .map(|w| i128::from(w[1].ts_ms) - i128::from(w[0].ts_ms))
         .filter(|&d| d > 0)
         .min()
-        .unwrap_or(300_000)
-        .min(300_000)
+        .map_or(300_000, |d| {
+            i64::try_from(d.min(300_000)).unwrap_or(300_000)
+        })
 }
 
 /// `samples` (sorted) reduced to `n` evenly spaced quantiles, nearest rank.
@@ -306,13 +311,12 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
         v += tick;
     }
     // X grid and labels.
-    let (xstep, label): (i64, fn(i64) -> String) = x_ticks(g.to_ms.saturating_sub(g.from_ms));
-    // Checked: times near the ends of i64 must stop the loop, not wrap.
-    let mut t = g
-        .from_ms
-        .div_euclid(xstep)
-        .checked_mul(xstep)
-        .and_then(|t| t.checked_add(xstep));
+    let (xstep, label): (i64, fn(i64) -> String) =
+        x_ticks(i128::from(g.to_ms) - i128::from(g.from_ms));
+    // The first boundary after `from` (a whole step on when `from` is
+    // one). Checked: times near the ends of i64 must stop the loop, not
+    // wrap.
+    let mut t = g.from_ms.checked_add(xstep - g.from_ms.rem_euclid(xstep));
     while let Some(tick) = t.filter(|&tick| tick < g.to_ms) {
         let xx = x(tick);
         s.line(xx, TOP, xx, TOP + ph, "stroke=\"#e0e0e0\"");
@@ -325,8 +329,12 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     let mut lost = String::new();
     let mut medians = String::new();
     for b in &buckets {
-        let x0 = x(b.start_ms.max(g.from_ms));
-        let x1 = x(b.start_ms.saturating_add(bucket_ms).min(g.to_ms));
+        // Clipped to the range, which also brings both ends into i64.
+        let clip = |ms: i128| {
+            i64::try_from(ms.clamp(i128::from(g.from_ms), i128::from(g.to_ms))).unwrap_or(g.to_ms)
+        };
+        let x0 = x(clip(b.start_ms));
+        let x1 = x(clip(b.start_ms + i128::from(bucket_ms)));
         let bw = (x1 - x0).max(0.5).min(pw);
         // A round exactly at `to_ms` starts a bucket on the right border:
         // draw it just inside the plot.
@@ -371,8 +379,12 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     s.rect(LEFT, TOP, pw, ph, "fill=\"none\" stroke=\"#808080\"");
 
     // Summary and legend.
-    let sent: u64 = buckets.iter().map(|b| u64::from(b.sent)).sum();
-    let received: u64 = buckets.iter().map(|b| u64::from(b.received)).sum();
+    let (sent, received) = g.totals.unwrap_or_else(|| {
+        (
+            buckets.iter().map(|b| u64::from(b.sent)).sum(),
+            buckets.iter().map(|b| u64::from(b.received)).sum(),
+        )
+    });
     let meds: Vec<f64> = buckets.iter().filter_map(|b| b.median).collect();
     let summary = if sent == 0 {
         "no data in this range".to_string()
@@ -423,16 +435,19 @@ const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 
 /// X tick spacing and label format for a range length.
-fn x_ticks(range_ms: i64) -> (i64, fn(i64) -> String) {
-    if range_ms <= 6 * HOUR_MS {
+/// `range_ms` is wider than `i64`: two times can be further apart than
+/// `i64::MAX`.
+fn x_ticks(range_ms: i128) -> (i64, fn(i64) -> String) {
+    if range_ms <= i128::from(6 * HOUR_MS) {
         (30 * 60_000, hhmm)
-    } else if range_ms <= 2 * DAY_MS {
+    } else if range_ms <= i128::from(2 * DAY_MS) {
         (3 * HOUR_MS, hhmm)
     } else {
         // Whole days, few enough that the axis stays readable (and the
         // loop short) for any range.
-        let days = ((range_ms / DAY_MS + MAX_X_TICKS - 1) / MAX_X_TICKS).max(1);
-        (days.saturating_mul(DAY_MS), mmdd)
+        let (day, max) = (i128::from(DAY_MS), i128::from(MAX_X_TICKS));
+        let days = ((range_ms / day + max - 1) / max).max(1);
+        (i64::try_from(days * day).unwrap_or(i64::MAX), mmdd)
     }
 }
 
@@ -528,6 +543,7 @@ mod tests {
             step_ms: None,
             width: 800,
             height: 300,
+            totals: None,
         };
         let (b, width) = buckets(&rounds, &g, 720.0);
         assert_eq!(width, 300_000);
@@ -588,6 +604,7 @@ mod tests {
             step_ms: Some(300_000),
             width: 800,
             height: 300,
+            totals: None,
         };
         let right = 800.0 - RIGHT;
         let svg = render(&rounds, &g);
@@ -611,6 +628,7 @@ mod tests {
                 from_ms,
                 to_ms,
                 step_ms: Some(300_000),
+                totals: None,
                 width: Graph::DEFAULT_WIDTH,
                 height: Graph::DEFAULT_HEIGHT,
             };
@@ -622,7 +640,7 @@ mod tests {
         // round, so each column has a smoke band to draw.
         let rtts = [1_000u32, 3_000];
         let width = f64::from(Graph::DEFAULT_WIDTH);
-        for (from_ms, to_ms, lo, hi) in [(i64::MIN, i64::MAX, 0.2, 0.8), (-1, i64::MAX, 0.0, 0.2)] {
+        for (from_ms, to_ms) in [(i64::MIN, i64::MAX), (-1, i64::MAX)] {
             let rounds: Vec<Round<'_>> = [from_ms, 0, to_ms]
                 .map(|ts_ms| Round {
                     ts_ms,
@@ -635,21 +653,93 @@ mod tests {
                 from_ms,
                 to_ms,
                 step_ms: Some(300_000),
+                totals: None,
                 width: Graph::DEFAULT_WIDTH,
                 height: Graph::DEFAULT_HEIGHT,
             };
             let svg = render(&rounds, &g);
             let grid = svg.matches("stroke=\"#e0e0e0\"").count();
             assert!(grid < 2 * MAX_X_TICKS as usize, "{grid} grid lines");
-            // The round at 0 sits mid-plot over the whole range and at the
-            // left edge from -1, never wrapped to the right.
-            assert!(
-                rects(&svg)
-                    .iter()
-                    .any(|&(x, ..)| x > width * lo && x < width * hi),
-                "no column in {lo}..{hi} of the width for {from_ms}..{to_ms}"
-            );
+            // Vertical grid lines: the X ticks, even from i64::MIN.
+            let x_grid = svg
+                .split("<line")
+                .skip(1)
+                .filter(|t| t.contains("#e0e0e0"))
+                .filter(|t| {
+                    let a = |n: &str| {
+                        let i = t.find(&format!(" {n}=\"")).unwrap() + n.len() + 3;
+                        &t[i..i + t[i..].find('"').unwrap()]
+                    };
+                    a("x1") == a("x2")
+                })
+                .count();
+            assert!(x_grid > 0, "no X ticks for {from_ms}..{to_ms}");
+            // Data columns only (the legend has rectangles too): the round
+            // at 0 sits mid-plot over the whole range, and at the left
+            // edge from -1, never wrapped to the right.
+            let mid = smoke_xs(&svg)
+                .into_iter()
+                .filter(|&x| x > width * 0.2 && x < width * 0.8)
+                .count();
+            let left = smoke_xs(&svg)
+                .into_iter()
+                .filter(|&x| x < width * 0.2)
+                .count();
+            if from_ms == i64::MIN {
+                assert_eq!(mid, 1, "{from_ms}..{to_ms}");
+            } else {
+                assert_eq!((mid, left > 0), (0, true), "{from_ms}..{to_ms}");
+            }
+            // With the step inferred from the rounds as well.
+            let g = Graph { step_ms: None, ..g };
+            assert!(!smoke_xs(&render(&rounds, &g)).is_empty());
         }
+    }
+
+    #[test]
+    fn given_totals_replace_the_summed_counts() {
+        // Two hourly points scaled on their own: 1200 sent, all received,
+        // shown as 400/400; and 1200 sent, none received, as 1200/0.
+        let rtts: Vec<u32> = (1..=400).map(|v| v * 10).collect();
+        let rounds = [
+            Round {
+                ts_ms: 0,
+                sent: 400,
+                rtts_us: &rtts,
+            },
+            Round {
+                ts_ms: 3_600_000,
+                sent: 1200,
+                rtts_us: &[],
+            },
+        ];
+        let g = Graph {
+            title: "t",
+            from_ms: 0,
+            to_ms: 2 * 3_600_000,
+            step_ms: Some(3_600_000),
+            width: Graph::DEFAULT_WIDTH,
+            height: Graph::DEFAULT_HEIGHT,
+            totals: None,
+        };
+        assert!(render(&rounds, &g).contains("loss 75.00 %, 1600 pings sent"));
+        let g = Graph {
+            totals: Some((2400, 1200)),
+            ..g
+        };
+        assert!(render(&rounds, &g).contains("loss 50.00 %, 2400 pings sent"));
+    }
+
+    /// X of each smoke rectangle, the data columns.
+    fn smoke_xs(svg: &str) -> Vec<f64> {
+        svg.split("<rect")
+            .skip(1)
+            .filter(|t| t[..t.find('>').unwrap()].contains("fill-opacity"))
+            .map(|t| {
+                let i = t.find(" x=\"").unwrap() + 4;
+                t[i..i + t[i..].find('"').unwrap()].parse().unwrap()
+            })
+            .collect()
     }
 
     #[test]
@@ -667,6 +757,7 @@ mod tests {
             step_ms: Some(300_000),
             width: 80,
             height: 80,
+            totals: None,
         };
         let svg = render(&rounds, &g);
         assert!(svg.contains(&format!("width=\"{}\"", Graph::MIN_WIDTH)));

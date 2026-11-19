@@ -106,7 +106,12 @@ fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
     let from_ms = to_ms - args.range.ms();
     // Raw rounds while retention keeps them, else the hourly or daily
     // rollups.
-    let (resolution, rounds) = reader
+    let rl_store::GraphRounds {
+        resolution,
+        rounds,
+        sent,
+        received,
+    } = reader
         .read_graph(id, from_ms, to_ms)
         .map_err(|e| (2, format!("reading {key}: {e}")))?;
     let view: Vec<Round<'_>> = rounds
@@ -135,6 +140,7 @@ fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
             },
             width: Graph::DEFAULT_WIDTH,
             height: Graph::DEFAULT_HEIGHT,
+            totals: Some((sent, received)),
         },
     );
     std::fs::write(&args.out, svg).map_err(|e| (2, format!("{}: {e}", args.out.display())))?;

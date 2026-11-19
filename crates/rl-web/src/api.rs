@@ -245,7 +245,12 @@ pub(crate) async fn render(
     let svg = tokio::task::spawn_blocking(move || {
         // Raw rounds while retention keeps them, else rollups, like
         // `ctl render`.
-        let (resolution, rounds) = reader.read_graph(id, from, to)?;
+        let rl_store::GraphRounds {
+            resolution,
+            rounds,
+            sent,
+            received,
+        } = reader.read_graph(id, from, to)?;
         let view: Vec<Round<'_>> = rounds
             .iter()
             .map(|r| Round {
@@ -270,6 +275,7 @@ pub(crate) async fn render(
                 },
                 width: Graph::DEFAULT_WIDTH,
                 height: Graph::DEFAULT_HEIGHT,
+                totals: Some((sent, received)),
             },
         ))
     })

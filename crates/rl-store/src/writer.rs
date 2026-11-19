@@ -217,6 +217,13 @@ impl Writer {
                 "retention must be at least one day per tier",
             ));
         }
+        // Readers find history by falling back from raw to hourly to daily;
+        // a finer tier kept longer than a coarser one would leave a gap.
+        if opts.raw_days > opts.r1h_days || opts.r1h_days > opts.r1d_days {
+            return Err(StoreError::InvalidOptions(
+                "retention must not shrink from raw to hourly to daily",
+            ));
+        }
         // Every directory `create_dir_all` is about to make.
         let mut created = Vec::new();
         let mut p = dir.to_path_buf();
@@ -609,7 +616,7 @@ impl Writer {
             }
             // Retention: whole files only (§6.4). Every sealed raw day was
             // rolled up above before any is deleted.
-            let raw_before = today - self.opts.raw_days;
+            let raw_before = today.saturating_sub(self.opts.raw_days);
             let expiring: Vec<_> = layout::list_segments(&self.dir, id)?
                 .into_iter()
                 .filter(|seg| seg.sealed && seg.day < raw_before)
@@ -632,7 +639,7 @@ impl Writer {
                 (Tier::R1d, self.opts.r1d_days),
             ] {
                 self.stats.expired_files +=
-                    rollup::expire(&self.dir, id, tier, today - days)? as u64;
+                    rollup::expire(&self.dir, id, tier, today.saturating_sub(days))? as u64;
             }
         }
         Ok(())
