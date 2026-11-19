@@ -10,3 +10,16 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+default = ["png"]
+# PNG output (architecture doc §7.2, §21.5 F9): the SVG rasterised with
+# resvg and an embedded font.
+png = ["dep:resvg"]
+
+[dependencies]
+# 0.45 is the newest that builds on the 1.85 MSRV.
+resvg = { version = "0.45.1", default-features = false, features = ["text"], optional = true }
+
+[dev-dependencies]
+png = "0.17"

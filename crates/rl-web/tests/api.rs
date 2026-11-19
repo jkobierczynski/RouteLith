@@ -327,6 +327,42 @@ async fn render_serves_svg_that_cannot_run_script() {
 }
 
 #[tokio::test]
+async fn render_serves_png() {
+    let f = fixture();
+    let uri = format!(
+        "/api/v1/render/{}.png?from={T0}&to={}&scale=2",
+        f.id,
+        T0 + 3_600_000
+    );
+    let resp = f
+        .router
+        .clone()
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "image/png");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let width = u32::from_be_bytes(body[16..20].try_into().unwrap());
+    assert_eq!(width, 2 * rl_render::Graph::DEFAULT_WIDTH);
+
+    for (bad, want) in [
+        (
+            format!("/api/v1/render/{}.png?scale=3", f.id),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/api/v1/render/{}.gif", f.id),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (st, _, body) = get(&f.router, &bad).await;
+        assert_eq!(st, want, "{bad}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn metrics_show_the_newest_round() {
     let f = fixture();
     let (st, h, body) = get(&f.router, "/metrics").await;

@@ -11,10 +11,16 @@
 //!
 //! The SVG is written by hand rather than through a plotting library: the
 //! output is small, has no font dependency and is byte-for-byte stable,
-//! which the golden tests rely on.
+//! which the golden tests rely on. With the `png` feature (on by default)
+//! [`svg_to_png`] rasterises it with an embedded font.
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "png")]
+mod png;
 mod svg;
+
+#[cfg(feature = "png")]
+pub use png::{MAX_PIXELS, svg_to_png};
 
 use std::fmt::Write as _;
 

@@ -10,7 +10,7 @@ use rl_core::config::{self, Config};
 use rl_render::{Graph, Round};
 use rl_store::{Reader, Resolution, SeriesKey};
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 #[command(group(clap::ArgGroup::new("source").required(true).args(["config", "data_dir"])))]
 pub(crate) struct RenderArgs {
     /// Target id as configured.
@@ -19,9 +19,12 @@ pub(crate) struct RenderArgs {
     /// Time range to draw, ending now (or at --end).
     #[arg(long, value_enum, default_value_t = Range::H3)]
     range: Range,
-    /// Output SVG file.
+    /// Output file: SVG, or PNG when its name ends in `.png`.
     #[arg(long)]
     out: PathBuf,
+    /// PNG pixel density: 2 for high-density screens.
+    #[arg(long, default_value_t = 1.0)]
+    scale: f32,
     /// Configuration file, for the data directory and vantage.
     #[arg(short, long)]
     config: Option<PathBuf>,
@@ -144,7 +147,16 @@ fn render(args: &RenderArgs) -> Result<(), (u8, String)> {
             totals: Some((sent, received)),
         },
     );
-    std::fs::write(&args.out, svg).map_err(|e| (2, format!("{}: {e}", args.out.display())))?;
+    let png = args
+        .out
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"));
+    let bytes = if png {
+        rl_render::svg_to_png(&svg, args.scale).map_err(|e| (2, format!("PNG: {e}")))?
+    } else {
+        svg.into_bytes()
+    };
+    std::fs::write(&args.out, bytes).map_err(|e| (2, format!("{}: {e}", args.out.display())))?;
     let what = match resolution {
         Resolution::Raw => "rounds".to_string(),
         Resolution::Rollup(tier) => format!("{} points", tier.name()),
@@ -409,11 +421,25 @@ mod tests {
             vantage: None,
             family: None,
             end: Some(end_ms / 1000),
+            scale: 1.0,
         };
         render(&args).unwrap();
         let svg = std::fs::read_to_string(&out).unwrap();
         assert!(svg.contains("gw (v4, from local)"), "{svg}");
         assert!(svg.contains("loss 20.00 %, 180 pings sent"), "{svg}");
+        // A .png name gives a PNG, at the asked density.
+        let png = dir.path().join("gw.PNG");
+        render(&RenderArgs {
+            out: png.clone(),
+            scale: 2.0,
+            ..args.clone()
+        })
+        .unwrap();
+        let bytes = std::fs::read(&png).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        // IHDR width and height, big-endian, after the 8-byte signature.
+        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        assert_eq!(width, 2 * Graph::DEFAULT_WIDTH);
         let missing = RenderArgs {
             target: "nope".into(),
             ..args
