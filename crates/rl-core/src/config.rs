@@ -797,9 +797,10 @@ impl Validator<'_> {
             None => None,
             Some(q) => {
                 let name = q.get_ref().trim();
-                // Check the name as it will be sent, with {rand} as a label.
-                let sample = name.replace("{rand}", "r0");
-                if valid_hostname(&sample) {
+                // Check the name as it will be sent: {rand} becomes a
+                // 12-character label, and "." (the root) is allowed.
+                let sample = name.replace("{rand}", "r00000000000");
+                if name == "." || valid_hostname(&sample) {
                     Some(name.to_string())
                 } else {
                     self.error(
@@ -864,6 +865,19 @@ impl Validator<'_> {
                 }
             }
         };
+        // DS and DNSKEY answers are not decoded (hickory-proto is built
+        // without its DNSSEC features), so they cannot be compared.
+        if let (Some(t), Some(Some(_)), Some(v)) = (&qtype, &expect_answers, &raw.expect_answers) {
+            if t == "DS" || t == "DNSKEY" {
+                self.error(
+                    &v.span(),
+                    format!(
+                        "expect_answers is not supported for {t} queries; check the rcode only"
+                    ),
+                );
+                return None;
+            }
+        }
         Some(ProbeConfig::Dns(DnsConfig {
             port: port?,
             query: query?,
@@ -1577,6 +1591,32 @@ name = "G"
         assert!(e.iter().any(|m| m.contains("qtype \"BOGUS\"")), "{e:?}");
         assert!(
             e.iter().any(|m| m.contains("mode does not apply to dns")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn dns_query_names_are_checked_as_sent() {
+        let target = |query: &str, extra: &str| {
+            format!(
+                "[server]\ndata_dir = \"/x\"\n[[group]]\nname = \"G\"\n[[group.target]]\n\
+                 name = \"a\"\nprobe = \"dns\"\nserver = \"10.0.0.53\"\nquery = \"{query}\"\n{extra}"
+            )
+        };
+        // The root, for example for NS.
+        assert!(errors(&target(".", "qtype = \"NS\"\n")).is_empty());
+        // {rand} becomes 12 characters: 51 + 12 = 63 fits a label, 52 + 12 does not.
+        let fits = format!("{}{{rand}}.example.com", "a".repeat(51));
+        assert!(errors(&target(&fits, "")).is_empty());
+        let too_long = format!("{}{{rand}}.example.com", "a".repeat(52));
+        assert_eq!(errors(&target(&too_long, "")).len(), 1);
+        // DS and DNSKEY answers are not decoded, so they cannot be expected.
+        let e = errors(&target(
+            "example.com",
+            "qtype = \"DS\"\nexpect_answers = [\"1 2 3 ab\"]\n",
+        ));
+        assert!(
+            e.len() == 1 && e[0].contains("not supported for DS"),
             "{e:?}"
         );
     }
