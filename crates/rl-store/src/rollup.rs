@@ -81,15 +81,19 @@ impl Tier {
     /// First day after the period a file covers, from its stem.
     fn file_end(self, stem: &str) -> Option<i64> {
         match self {
+            // The start must be a valid date; the end is counted, not
+            // parsed, so year 9999's files end in year 10000.
             Self::R1h => {
+                layout::parse_date(&format!("{stem}-01"))?;
                 let (y, m) = stem.split_once('-')?;
                 let (y, m): (i64, i64) = (y.parse().ok()?, m.parse().ok()?);
                 let (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
-                layout::parse_date(&format!("{y:04}-{m:02}-01"))
+                Some(layout::civil_day(y, m, 1))
             }
             Self::R1d => {
+                layout::parse_date(&format!("{stem}-01-01"))?;
                 let y: i64 = stem.parse().ok()?;
-                layout::parse_date(&format!("{:04}-01-01", y + 1))
+                Some(layout::civil_day(y + 1, 1, 1))
             }
         }
     }
@@ -123,8 +127,11 @@ impl RollupPoint {
             let (mut sent, mut received) = (0u32, 0u32);
             while j < rounds.len() && rounds[j].ts_ms.div_euclid(width_ms) * width_ms == bucket {
                 let r = &rounds[j];
-                sent += u32::from(r.sent);
-                received += u32::try_from(r.rtts_us.len()).unwrap_or(u32::MAX);
+                // Saturate rather than wrap: pings per round are capped
+                // far below this, but a direct write is not.
+                sent = sent.saturating_add(u32::from(r.sent));
+                received =
+                    received.saturating_add(u32::try_from(r.rtts_us.len()).unwrap_or(u32::MAX));
                 samples.extend_from_slice(&r.rtts_us);
                 j += 1;
             }

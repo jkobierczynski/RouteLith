@@ -176,9 +176,43 @@ fn rollups_serve_reads_after_raw_and_hourly_expiry() {
         "a round for a rolled-up day would be lost by the next roll-up"
     );
 
+    // A new round that is only in the WAL, with no raw segment on disk:
+    // a range starting after the rolled-up days is read raw, so the round
+    // is there before and after a checkpoint alike.
+    let mut fresh = round(0);
+    fresh.ts_ms = T0 + 4 * DAY_MS + 2 * HOUR_MS + 5 * 60_000;
+    assert_eq!(
+        w.append(id, fresh.clone()).unwrap(),
+        rl_store::Appended::Stored
+    );
+    w.sync().unwrap();
+    let rl_store::GraphRounds {
+        resolution: res,
+        rounds,
+        ..
+    } = Reader::open(dir.path())
+        .unwrap()
+        .read_graph(id, fresh.ts_ms - 4 * 60_000, fresh.ts_ms + HOUR_MS)
+        .unwrap();
+    assert_eq!(res, Resolution::Raw);
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(rounds[0].ts_ms, fresh.ts_ms);
+
     // A graph of day 0 comes from the hourly rollups.
     let reader = Reader::open(dir.path()).unwrap();
-    let (res, rounds) = reader.read_graph(id, T0, T0 + DAY_MS - 1).unwrap();
+    let g = reader.read_graph(id, T0, T0 + DAY_MS - 1).unwrap();
+    let (res, rounds) = (g.resolution, g.rounds);
+    // The totals are the points' own, not the scaled rounds'.
+    let pts = reader
+        .read_tier(id, Tier::R1h, T0, T0 + DAY_MS - 1)
+        .unwrap();
+    assert_eq!(
+        (g.sent, g.received),
+        (
+            pts.iter().map(|p| u64::from(p.sent)).sum(),
+            pts.iter().map(|p| u64::from(p.received)).sum()
+        )
+    );
     assert_eq!(res, Resolution::Rollup(Tier::R1h));
     assert_eq!(rounds.len(), 24);
     assert_eq!(rounds[0].ts_ms, T0);
@@ -208,8 +242,11 @@ fn rollups_serve_reads_after_raw_and_hourly_expiry() {
     let (res, pts) = reader.read_points(id, T0, T0 + 2 * DAY_MS, 800).unwrap();
     assert_eq!(res, Resolution::Rollup(Tier::R1d));
     assert_eq!(pts.len(), 2);
-    let (res, rounds) = reader.read_graph(id, T0, T0 + 2 * DAY_MS).unwrap();
-    assert_eq!((res, rounds.len()), (Resolution::Rollup(Tier::R1d), 2));
+    let g = reader.read_graph(id, T0, T0 + 2 * DAY_MS).unwrap();
+    assert_eq!(
+        (g.resolution, g.rounds.len()),
+        (Resolution::Rollup(Tier::R1d), 2)
+    );
 }
 
 /// A rollup file is published whole: a leftover temporary file from a
@@ -285,13 +322,73 @@ fn rounds_older_than_every_tier_are_late() {
 }
 
 #[test]
+fn retention_must_not_shrink_toward_coarser_tiers() {
+    // A finer tier kept longer than a coarser one would leave history the
+    // readers' raw, hourly, daily fallback cannot find.
+    for (raw_days, r1h_days, r1d_days) in [(10, 1, 1), (1, 400, 1), (2, 1, 400)] {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = WriterOptions {
+            raw_days,
+            r1h_days,
+            r1d_days,
+            ..WriterOptions::default()
+        };
+        assert!(
+            matches!(
+                Writer::open(dir.path(), opts, T0),
+                Err(rl_store::StoreError::InvalidOptions(_))
+            ),
+            "{raw_days}/{r1h_days}/{r1d_days} accepted"
+        );
+    }
+}
+
+/// Rollup files of year 9999 end in year 10000; they are still listed,
+/// so reads find them once raw has expired.
+#[test]
+fn rollups_of_the_last_supported_year_stay_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = WriterOptions {
+        raw_days: 1,
+        r1h_days: 30,
+        r1d_days: 30,
+        ..WriterOptions::default()
+    };
+    // 9999-12-29 00:00 UTC.
+    let day0 = 2_932_894 * DAY_MS;
+    let (mut w, _) = Writer::open(dir.path(), opts, day0).unwrap();
+    let [id] = w.register(&[SeriesKey::new("local", "gw", "v4")]).unwrap()[..] else {
+        panic!()
+    };
+    for i in 0..288 {
+        let mut r = round(i);
+        r.ts_ms = day0 + i * STEP_MS;
+        w.append(id, r).unwrap();
+    }
+    w.maintain(day0 + 2 * DAY_MS + HOUR_MS).unwrap();
+    w.close().unwrap();
+    assert!(layout::segment_file_names(dir.path(), id).is_empty());
+    let reader = Reader::open(dir.path()).unwrap();
+    for (tier, n) in [(Tier::R1h, 24), (Tier::R1d, 1)] {
+        assert_eq!(
+            reader
+                .read_tier(id, tier, day0, day0 + DAY_MS - 1)
+                .unwrap()
+                .len(),
+            n,
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
 fn the_longest_horizon_decides_what_is_late() {
     let dir = tempfile::tempdir().unwrap();
-    // Raw outlives both tiers here: a round raw would still keep is stored.
+    // A first round from a day every tier would still keep is stored.
     let opts = WriterOptions {
         raw_days: 10,
-        r1h_days: 1,
-        r1d_days: 1,
+        r1h_days: 10,
+        r1d_days: 10,
         ..WriterOptions::default()
     };
     let later = T0 + 30 * DAY_MS;
