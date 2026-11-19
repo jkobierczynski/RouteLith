@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # 0.26 needs Rust 1.88, above the 1.85 MSRV.
+      - dependency-name: hickory-proto
+        versions: [">= 0.26"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

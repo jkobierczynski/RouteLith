@@ -1,6 +1,6 @@
 //! The `routelith` binary: one executable, several modes (architecture doc §3).
 //!
-//! `server`, `check icmp`, `check tcp`,
+//! `server`, `check icmp`, `check tcp`, `check dns`,
 //! `ctl calibrate`, `ctl verify` and `ctl render` work.
 #![forbid(unsafe_code)]
 
@@ -44,6 +44,8 @@ enum CheckProbe {
     Icmp(check::IcmpArgs),
     /// TCP connect time (or time to the server's banner).
     Tcp(check::TcpArgs),
+    /// DNS query time to a server, bypassing local caches.
+    Dns(check::DnsArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -66,6 +68,9 @@ fn main() -> ExitCode {
         Command::Check {
             probe: CheckProbe::Tcp(args),
         } => run(check::tcp(args)),
+        Command::Check {
+            probe: CheckProbe::Dns(args),
+        } => run(check::dns(args)),
         Command::Ctl {
             action: CtlAction::Calibrate(args),
         } => calibrate::run(&args),

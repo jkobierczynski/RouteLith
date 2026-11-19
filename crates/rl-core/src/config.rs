@@ -48,6 +48,7 @@ const MAX_SIZE: i64 = 65_507;
 /// Smallest payload: it carries the 8-byte nonce.
 const MIN_SIZE: i64 = 8;
 const MAX_NAME_LEN: usize = 64;
+const AVAILABLE: &str = "this version measures \"icmp\", \"tcp\" and \"dns\"";
 
 /// A validated configuration.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,13 +84,62 @@ pub struct TargetConfig {
 }
 
 /// The probe of a target and its settings (architecture doc §4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProbeConfig {
     /// ICMP echo with this many payload bytes.
     Icmp { payload_size: u16 },
     /// TCP connect time to `port` (§4.3).
     Tcp { port: u16, mode: TcpMode },
+    /// One DNS query per sample to the target's server (§4.5).
+    Dns(DnsConfig),
 }
+
+/// A DNS target's query and its expected answer (§4.5).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DnsConfig {
+    pub port: u16,
+    /// Name to query; each `{rand}` becomes a fresh random label per sample,
+    /// so resolver caches cannot answer.
+    pub query: String,
+    /// Record type, upper case (`A`, `AAAA`, `MX`, ...).
+    pub qtype: String,
+    pub transport: DnsTransport,
+    /// Recursion desired (RD bit).
+    pub recursion: bool,
+    /// Expected response code, upper case (default `NOERROR`).
+    pub expect_rcode: String,
+    /// Expected answer set (record data as text, compared as a set,
+    /// ignoring case and a trailing dot); `None` accepts any answer.
+    pub expect_answers: Option<Vec<String>>,
+}
+
+/// How DNS queries travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DnsTransport {
+    #[default]
+    Udp,
+    /// A fresh TCP connection per sample; the time includes the handshake.
+    Tcp,
+}
+
+impl DnsTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+        }
+    }
+}
+
+/// Record types a DNS target may query.
+pub const DNS_QTYPES: &[&str] = &[
+    "A", "AAAA", "CAA", "CNAME", "DNSKEY", "DS", "HTTPS", "MX", "NS", "PTR", "SOA", "SRV", "SVCB",
+    "TXT",
+];
+/// Response codes a DNS target may expect.
+pub const DNS_RCODES: &[&str] = &[
+    "NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED",
+];
 
 impl ProbeConfig {
     /// The `probe` value that selects this probe.
@@ -97,6 +147,7 @@ impl ProbeConfig {
         match self {
             Self::Icmp { .. } => "icmp",
             Self::Tcp { .. } => "tcp",
+            Self::Dns(_) => "dns",
         }
     }
 }
@@ -336,6 +387,10 @@ settings_struct!(RawTarget {
     qtype: Option<Spanned<toml::Value>>,
     port: Option<Spanned<toml::Value>>,
     mode: Option<Spanned<toml::Value>>,
+    transport: Option<Spanned<toml::Value>>,
+    recursion: Option<Spanned<toml::Value>>,
+    expect_rcode: Option<Spanned<toml::Value>>,
+    expect_answers: Option<Spanned<toml::Value>>,
 });
 
 // ---- validation -----------------------------------------------------------
@@ -542,13 +597,12 @@ impl Validator<'_> {
         let kind = match raw.probe.as_ref().map(|p| (p, p.get_ref().as_str())) {
             None | Some((_, "icmp")) => "icmp",
             Some((_, "tcp")) => "tcp",
+            Some((_, "dns")) => "dns",
             Some((probe, p)) => {
-                let msg = if ["udp", "dns", "http", "https"].contains(&p) {
-                    format!(
-                        "probe {p:?} is not available yet; this version measures \"icmp\" and \"tcp\""
-                    )
+                let msg = if ["udp", "http", "https"].contains(&p) {
+                    format!("probe {p:?} is not available yet; {AVAILABLE}")
                 } else {
-                    format!("unknown probe {p:?}; this version measures \"icmp\" and \"tcp\"")
+                    format!("unknown probe {p:?}; {AVAILABLE}")
                 };
                 self.error(&probe.span(), msg);
                 // Still check the target's own schedule values.
@@ -560,10 +614,14 @@ impl Validator<'_> {
             ("url", &raw.url, false),
             ("expect_status", &raw.expect_status, false),
             ("metric", &raw.metric, false),
-            ("server", &raw.server, false),
-            ("query", &raw.query, false),
-            ("qtype", &raw.qtype, false),
-            ("port", &raw.port, kind == "tcp"),
+            ("server", &raw.server, kind == "dns"),
+            ("query", &raw.query, kind == "dns"),
+            ("qtype", &raw.qtype, kind == "dns"),
+            ("transport", &raw.transport, kind == "dns"),
+            ("recursion", &raw.recursion, kind == "dns"),
+            ("expect_rcode", &raw.expect_rcode, kind == "dns"),
+            ("expect_answers", &raw.expect_answers, kind == "dns"),
+            ("port", &raw.port, kind == "tcp" || kind == "dns"),
             ("mode", &raw.mode, kind == "tcp"),
         ] {
             if let (Some(v), false) = (value, applies) {
@@ -575,16 +633,35 @@ impl Validator<'_> {
         if let (Some(v), false) = (&raw.size, kind == "icmp") {
             self.error(&v.span(), format!("size does not apply to {kind} targets"));
         }
-        let tcp = if kind == "tcp" { self.tcp(raw) } else { None };
+        let probe = match kind {
+            "tcp" => self.tcp(raw),
+            "dns" => self.dns(raw),
+            _ => None,
+        };
+        // A DNS target's host is its server.
+        let (host_key, host_value) = if kind == "dns" {
+            if let Some(h) = &raw.host {
+                self.error(
+                    &h.span(),
+                    "dns targets name the server to query with server, not host",
+                );
+            }
+            ("server", self.string_value("server", raw.server.as_ref()))
+        } else {
+            ("host", raw.host.clone())
+        };
         // A host problem is recorded, but the settings are still checked.
-        let host = match &raw.host {
+        let host = match &host_value {
             Some(h) if !h.get_ref().trim().is_empty() => Some(h),
             Some(h) => {
-                self.error(&h.span(), "host must not be empty");
+                self.error(&h.span(), format!("{host_key} must not be empty"));
                 None
             }
             None => {
-                self.error(&raw.name.span(), format!("target {name:?} needs a host"));
+                self.error(
+                    &raw.name.span(),
+                    format!("target {name:?} needs a {host_key}"),
+                );
                 None
             }
         };
@@ -594,7 +671,7 @@ impl Validator<'_> {
                 self.error(
                     &h.span(),
                     format!(
-                        "host {:?} is neither an IP address nor a host name \
+                        "{host_key} {:?} is neither an IP address nor a host name \
                          ({kind} targets take a bare name such as \"example.org\", not a URL)",
                         h.get_ref()
                     ),
@@ -659,7 +736,7 @@ impl Validator<'_> {
                 timeout: timeout?,
             },
             probe: match kind {
-                "tcp" => tcp?,
+                "tcp" | "dns" => probe?,
                 _ => ProbeConfig::Icmp {
                     payload_size: size?,
                 },
@@ -668,13 +745,31 @@ impl Validator<'_> {
         })
     }
 
-    /// The TCP settings of a target: `port` (required) and `mode`.
-    fn tcp(&mut self, raw: &RawTarget) -> Option<ProbeConfig> {
-        let port = match &raw.port {
+    /// A string-valued probe key; any other TOML type is an error.
+    fn string_value(
+        &mut self,
+        key: &str,
+        v: Option<&Spanned<toml::Value>>,
+    ) -> Option<Spanned<String>> {
+        let v = v?;
+        match v.get_ref().as_str() {
+            Some(s) => Some(Spanned::new(v.span(), s.to_string())),
+            None => {
+                self.error(&v.span(), format!("{key} must be a string"));
+                None
+            }
+        }
+    }
+
+    /// `port`: `default` when absent, else a whole number from 1 to 65535.
+    /// `None` after an error, or when absent with no default (an error too).
+    fn port(&mut self, raw: &RawTarget, default: Option<u16>, kind: &str) -> Option<u16> {
+        match &raw.port {
+            None if default.is_some() => default,
             None => {
                 self.error(
                     &raw.name.span(),
-                    format!("tcp target {:?} needs a port", raw.name.get_ref()),
+                    format!("{kind} target {:?} needs a port", raw.name.get_ref()),
                 );
                 None
             }
@@ -685,7 +780,133 @@ impl Validator<'_> {
                     None
                 }
             },
+        }
+    }
+
+    /// The DNS settings of a target (§4.5).
+    fn dns(&mut self, raw: &RawTarget) -> Option<ProbeConfig> {
+        let port = self.port(raw, Some(53), "dns");
+        let query = match self.string_value("query", raw.query.as_ref()) {
+            None if raw.query.is_none() => {
+                self.error(
+                    &raw.name.span(),
+                    format!("dns target {:?} needs a query", raw.name.get_ref()),
+                );
+                None
+            }
+            None => None,
+            Some(q) => {
+                let name = q.get_ref().trim();
+                // Check the name as it will be sent, with {rand} as a label.
+                let sample = name.replace("{rand}", "r0");
+                if valid_hostname(&sample) {
+                    Some(name.to_string())
+                } else {
+                    self.error(
+                        &q.span(),
+                        format!(
+                            "query {:?} is not a domain name (labels of letters, digits, '-' \
+                             and '_', or {{rand}} for a random label)",
+                            q.get_ref()
+                        ),
+                    );
+                    None
+                }
+            }
         };
+        let qtype = self.one_of("qtype", raw.qtype.as_ref(), DNS_QTYPES, "A");
+        let expect_rcode = self.one_of(
+            "expect_rcode",
+            raw.expect_rcode.as_ref(),
+            DNS_RCODES,
+            "NOERROR",
+        );
+        let transport = match self.string_value("transport", raw.transport.as_ref()) {
+            None if raw.transport.is_some() => None,
+            None => Some(DnsTransport::default()),
+            Some(t) => match t.get_ref().as_str() {
+                "udp" => Some(DnsTransport::Udp),
+                "tcp" => Some(DnsTransport::Tcp),
+                _ => {
+                    self.error(&t.span(), "transport must be \"udp\" or \"tcp\"");
+                    None
+                }
+            },
+        };
+        let recursion = match &raw.recursion {
+            None => Some(true),
+            Some(v) => {
+                let b = v.get_ref().as_bool();
+                if b.is_none() {
+                    self.error(&v.span(), "recursion must be true or false");
+                }
+                b
+            }
+        };
+        let expect_answers = match &raw.expect_answers {
+            None => Some(None),
+            Some(v) => {
+                let list: Option<Vec<String>> = v.get_ref().as_array().and_then(|a| {
+                    a.iter()
+                        .map(|x| x.as_str().map(|s| s.trim().to_string()))
+                        .collect()
+                });
+                match list {
+                    Some(l) if !l.is_empty() && l.iter().all(|s| !s.is_empty()) => Some(Some(l)),
+                    _ => {
+                        self.error(
+                            &v.span(),
+                            "expect_answers must be a non-empty list of strings, \
+                             for example [\"192.0.2.1\"]",
+                        );
+                        None
+                    }
+                }
+            }
+        };
+        Some(ProbeConfig::Dns(DnsConfig {
+            port: port?,
+            query: query?,
+            qtype: qtype?,
+            transport: transport?,
+            recursion: recursion?,
+            expect_rcode: expect_rcode?,
+            expect_answers: expect_answers?,
+        }))
+    }
+
+    /// A string key whose value must be one of `allowed` (case-insensitive),
+    /// returned in upper case.
+    fn one_of(
+        &mut self,
+        key: &str,
+        v: Option<&Spanned<toml::Value>>,
+        allowed: &[&str],
+        default: &str,
+    ) -> Option<String> {
+        if v.is_none() {
+            return Some(default.to_string());
+        }
+        let s = self.string_value(key, v)?;
+        let up = s.get_ref().trim().to_ascii_uppercase();
+        if allowed.contains(&up.as_str()) {
+            Some(up)
+        } else {
+            self.error(
+                &s.span(),
+                format!(
+                    "{key} {:?} is not one of {}",
+                    s.get_ref(),
+                    allowed.join(", ")
+                ),
+            );
+            None
+        }
+    }
+
+    /// The TCP settings of a target: `port` (required) and `mode`.
+    fn tcp(&mut self, raw: &RawTarget) -> Option<ProbeConfig> {
+        let port = self.port(raw, None, "tcp");
         let mode = match &raw.mode {
             None => Some(TcpMode::default()),
             Some(v) => match v.get_ref().as_str() {
@@ -1267,6 +1488,100 @@ name = "G"
     }
 
     #[test]
+    fn dns_targets_query_their_server() {
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+[[group]]
+name = "G"
+  [[group.target]]
+  name  = "dns-primary"
+  probe = "dns"
+  server = "10.0.0.53"
+  query = "example.com"
+  qtype = "A"
+  [[group.target]]
+  name  = "dns-recursion"
+  probe = "dns"
+  server = "resolver.example.net"
+  query = "{rand}.example.com"
+  qtype = "aaaa"
+  transport = "tcp"
+  port = 5353
+  recursion = false
+  expect_rcode = "nxdomain"
+  expect_answers = ["2001:db8::1"]
+"#;
+        let p = parse(src);
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let t = p.config.unwrap().targets;
+        assert_eq!(t[0].host, "10.0.0.53");
+        assert_eq!(
+            t[0].probe,
+            ProbeConfig::Dns(DnsConfig {
+                port: 53,
+                query: "example.com".into(),
+                qtype: "A".into(),
+                transport: DnsTransport::Udp,
+                recursion: true,
+                expect_rcode: "NOERROR".into(),
+                expect_answers: None,
+            })
+        );
+        assert_eq!(t[1].host, "resolver.example.net");
+        assert_eq!(
+            t[1].probe,
+            ProbeConfig::Dns(DnsConfig {
+                port: 5353,
+                query: "{rand}.example.com".into(),
+                qtype: "AAAA".into(),
+                transport: DnsTransport::Tcp,
+                recursion: false,
+                expect_rcode: "NXDOMAIN".into(),
+                expect_answers: Some(vec!["2001:db8::1".into()]),
+            })
+        );
+    }
+
+    #[test]
+    fn dns_settings_are_checked() {
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+[[group]]
+name = "G"
+  [[group.target]]
+  name  = "a"
+  probe = "dns"
+  host = "10.0.0.53"
+  [[group.target]]
+  name  = "b"
+  probe = "dns"
+  server = "10.0.0.53"
+  query = "exa mple.com"
+  qtype = "BOGUS"
+  transport = "quic"
+  recursion = "yes"
+  expect_answers = []
+  mode = "banner"
+"#;
+        let e = errors(src);
+        // a: host instead of server, no server, no query.
+        // b: query, qtype, transport, recursion, expect_answers, mode.
+        assert_eq!(e.len(), 9, "{e:?}");
+        assert!(
+            e.iter().any(|m| m.contains("with server, not host")),
+            "{e:?}"
+        );
+        assert!(e.iter().any(|m| m.contains("needs a server")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("needs a query")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("not a domain name")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("qtype \"BOGUS\"")), "{e:?}");
+        assert!(
+            e.iter().any(|m| m.contains("mode does not apply to dns")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
     fn keys_of_other_probes_are_rejected_on_icmp() {
         let src = "[server]\ndata_dir = \"/x\"\n[[group]]\nname = \"G\"\n[[group.target]]\nname = \"a\"\nhost = \"h\"\nport = 443\n";
         let e = errors(src);
@@ -1296,7 +1611,7 @@ vantages = ["hasselt"]
     fn shipped_example_is_valid() {
         let p = parse(include_str!("../../../examples/routelith.toml"));
         assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
-        assert_eq!(p.config.unwrap().targets.len(), 4);
+        assert_eq!(p.config.unwrap().targets.len(), 5);
     }
 
     #[test]

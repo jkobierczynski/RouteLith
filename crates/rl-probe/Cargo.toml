@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+hickory-proto.workspace = true
 rl-core.workspace = true
 rl-sys.workspace = true
 thiserror.workspace = true

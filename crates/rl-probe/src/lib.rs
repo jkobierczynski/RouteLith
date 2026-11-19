@@ -1,9 +1,11 @@
 //! The Probe trait and its ICMP, TCP, UDP, DNS and HTTP implementations.
 //!
-//! ICMP (Linux ping sockets, the Windows ICMP API) and TCP connect time so far.
+//! ICMP (Linux ping sockets, the Windows ICMP API), TCP connect time and DNS
+//! queries so far.
 #![forbid(unsafe_code)]
 
 pub mod calibration;
+pub mod dns;
 pub mod icmp;
 pub mod packet;
 pub mod rate;
@@ -15,6 +17,7 @@ use std::pin::Pin;
 
 use rl_core::{ResolvedTarget, RoundPlan, RoundResult};
 
+pub use dns::DnsProbe;
 pub use icmp::{IcmpConfig, IcmpProbe, check_permission};
 pub use rate::RateLimiter;
 pub use tcp::{TcpConfig, TcpProbe};
@@ -28,6 +31,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub enum ProbeKind {
     Icmp,
     Tcp,
+    Dns,
 }
 
 /// One measurement method (architecture doc §4.1).
