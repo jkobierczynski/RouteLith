@@ -11,8 +11,10 @@
 //! `series/<id>/r1d/YYYY.roll` (one year). Each is a header followed by
 //! CRC-framed records, one record per day holding that day's points.
 //! Records are appended in day order; a torn last record (a crash during
-//! the append) is cut off and rewritten on the next build. Retention
-//! deletes whole files.
+//! the append) is cut off and rewritten on the next build. A new file is
+//! written under a temporary name and renamed into place with its header
+//! and first record, so a crash never leaves a file with a partial header.
+//! Retention deletes whole files.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -133,6 +135,27 @@ impl RollupPoint {
             i = j;
         }
         out
+    }
+
+    /// The point as one round for the smoke graph: its quantiles are the
+    /// replies, and `sent` keeps its loss ratio at that many replies.
+    pub fn to_round(&self) -> StoredRound {
+        let replies = self.quantiles_us.len() as u64;
+        let sent = if self.received == 0 {
+            u64::from(self.sent.min(1))
+        } else {
+            // ceil(replies × sent / received)
+            (replies * u64::from(self.sent)).div_ceil(u64::from(self.received))
+        };
+        StoredRound {
+            ts_ms: self.ts_ms,
+            sent: u16::try_from(sent).unwrap_or(u16::MAX),
+            rtts_us: self.quantiles_us.clone(),
+            errors: crate::round::ErrorCounts::default(),
+            resolved: None,
+            timing: None,
+            flags: 0,
+        }
     }
 
     /// One raw round as a point, so callers can treat every tier alike.
@@ -281,11 +304,13 @@ pub(crate) fn append_day(
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    let mut created = false;
     let mut file = match existing {
         Some(bytes) => {
             let (old, valid) = parse(&bytes, series, tier).map_err(|r| corrupt(&path, r))?;
             if old.last().is_some_and(|p| p.ts_ms >= day * DAY_MS) {
+                // Written before a crash, maybe not yet on disk: the raw
+                // day may be deleted once this returns.
+                sync_tier(dir, series, tier, &path)?;
                 return Ok(());
             }
             let f = OpenOptions::new().write(true).open(&path)?;
@@ -296,13 +321,25 @@ pub(crate) fn append_day(
         None => {
             let parent = tier_dir(dir, series, tier);
             std::fs::create_dir_all(&parent)?;
+            let mut bytes = header(series, tier);
+            codec::put_frame(&mut bytes, &encode(points));
+            // A leftover from a crash before the rename holds nothing that
+            // is not rebuilt here.
+            let tmp = path.with_extension("roll.tmp");
             let mut f = OpenOptions::new()
                 .write(true)
-                .create_new(true)
-                .open(&path)?;
-            f.write_all(&header(series, tier))?;
-            created = true;
-            f
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_data()?;
+            drop(f);
+            std::fs::rename(&tmp, &path)?;
+            layout::sync_dir(&parent)?;
+            if let Some(series_dir) = parent.parent() {
+                layout::sync_dir(series_dir)?;
+            }
+            return Ok(());
         }
     };
     let mut frame = Vec::new();
@@ -311,14 +348,56 @@ pub(crate) fn append_day(
     file.seek(io::SeekFrom::End(0))?;
     file.write_all(&frame)?;
     file.sync_data()?;
-    if created {
-        let parent = tier_dir(dir, series, tier);
-        layout::sync_dir(&parent)?;
-        if let Some(series_dir) = parent.parent() {
-            layout::sync_dir(series_dir)?;
-        }
+    Ok(())
+}
+
+/// Sync a tier file and the directories naming it.
+fn sync_tier(dir: &Path, series: u64, tier: Tier, path: &Path) -> Result<(), crate::StoreError> {
+    OpenOptions::new().write(true).open(path)?.sync_data()?;
+    let parent = tier_dir(dir, series, tier);
+    layout::sync_dir(&parent)?;
+    if let Some(series_dir) = parent.parent() {
+        layout::sync_dir(series_dir)?;
     }
     Ok(())
+}
+
+/// Sync every rollup file of a series, and their directories: called
+/// before raw days are deleted, as a rollup written before a crash may
+/// still be only in the page cache.
+pub(crate) fn sync_all(dir: &Path, series: u64) -> Result<(), crate::StoreError> {
+    for tier in Tier::ALL {
+        let files = list(dir, series, tier)?;
+        for (_, path) in &files {
+            OpenOptions::new().write(true).open(path)?.sync_data()?;
+        }
+        if !files.is_empty() {
+            layout::sync_dir(&tier_dir(dir, series, tier))?;
+        }
+    }
+    layout::sync_dir(&dir.join("series").join(series.to_string()))?;
+    Ok(())
+}
+
+/// Time of the oldest point of a tier, if it has any.
+pub(crate) fn first_ts(
+    dir: &Path,
+    series: u64,
+    tier: Tier,
+) -> Result<Option<i64>, crate::StoreError> {
+    for (_, path) in list(dir, series, tier)? {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            // Expired meanwhile: the next file is the oldest.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let (points, _) = parse(&bytes, series, tier).map_err(|r| corrupt(&path, r))?;
+        if let Some(p) = points.first() {
+            return Ok(Some(p.ts_ms));
+        }
+    }
+    Ok(None)
 }
 
 /// Points of a tier with `from_ms <= ts <= to_ms`, oldest first.
@@ -386,7 +465,12 @@ fn list(dir: &Path, series: u64, tier: Tier) -> io::Result<Vec<(String, PathBuf)
 /// written r1h first, so an r1d point means the day is fully rolled up.
 pub(crate) fn last_rolled_day(dir: &Path, series: u64) -> Result<Option<i64>, crate::StoreError> {
     for (_, path) in list(dir, series, Tier::R1d)?.into_iter().rev() {
-        let bytes = std::fs::read(&path)?;
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            // Expired by a writer while a reader looks.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
         let (points, _) = parse(&bytes, series, Tier::R1d).map_err(|r| corrupt(&path, r))?;
         if let Some(p) = points.last() {
             return Ok(Some(p.ts_ms.div_euclid(DAY_MS)));
