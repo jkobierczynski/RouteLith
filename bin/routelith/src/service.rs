@@ -3,8 +3,8 @@
 //!
 //! The service runs `routelith service run --config <file> --log <file>`
 //! as `NT AUTHORITY\LocalService`, starts with Windows, and is restarted
-//! by the service manager after a failure (5 s, 30 s, then every 60 s; the
-//! count resets after a day without failures). The MSI installs the same
+//! by the service manager 30 s after a failure (the count resets after a
+//! day without failures), as the MSI sets it up. The MSI installs the same
 //! service through Windows Installer; these commands are for a plain copy
 //! of the executable.
 //!
@@ -180,7 +180,7 @@ mod windows {
                 reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
                 reboot_msg: None,
                 command: None,
-                actions: Some(vec![restart(5), restart(30), restart(60)]),
+                actions: Some(vec![restart(30), restart(30), restart(30)]),
             })
             .map_err(to_io)?;
         // A server that stops with an error exit code (not only a crash)

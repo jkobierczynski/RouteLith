@@ -5,8 +5,8 @@
   Installs routelith.exe under Program Files\Routelith\bin (added to PATH),
   a starter configuration in %ProgramData%\Routelith\routelith.toml, and the
   "Routelith" Windows Service. The service runs as NT AUTHORITY\LocalService,
-  starts with Windows, and is restarted after a failure (5 s, 30 s, then
-  60 s; the count resets after a day). The configuration, data and log in
+  starts with Windows, and is restarted 30 s after a failure (the count
+  resets after a day). The configuration, data and log in
   %ProgramData%\Routelith are kept on uninstall and upgrade.
 
   Build: cargo wix -p routelith (needs the WiX Toolset 3; cargo-wix always
@@ -62,11 +62,14 @@
                               Vital="yes">
                 <ServiceConfig FailureActionsWhen="failedToStopOrReturnedError"
                                OnInstall="yes" OnReinstall="yes"/>
-                <ServiceConfigFailureActions OnInstall="yes" OnReinstall="yes" ResetPeriod="86400">
-                  <Failure Action="restartService" Delay="5000"/>
-                  <Failure Action="restartService" Delay="30000"/>
-                  <Failure Action="restartService" Delay="60000"/>
-                </ServiceConfigFailureActions>
+                <!-- util:ServiceConfig, not ServiceConfigFailureActions: Windows
+                     Installer opens the service without SERVICE_START access,
+                     so its own restart actions fail with error 1939. -->
+                <util:ServiceConfig FirstFailureActionType="restart"
+                                    SecondFailureActionType="restart"
+                                    ThirdFailureActionType="restart"
+                                    RestartServiceDelayInSeconds="30"
+                                    ResetPeriodInDays="1"/>
               </ServiceInstall>
               <ServiceControl Id="RoutelithServiceControl" Name="Routelith"
                               Start="install" Stop="both" Remove="uninstall" Wait="yes"/>
