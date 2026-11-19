@@ -112,10 +112,20 @@ pub(crate) async fn serve(
         match Writer::open(&cfg.server.data_dir, WriterOptions::default(), now_ms()) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!(
-                    "routelith server: cannot open {}: {e}",
-                    cfg.server.data_dir.display()
-                );
+                let dir = &cfg.server.data_dir;
+                if dir.is_absolute() {
+                    eprintln!("routelith server: cannot open {}: {e}", dir.display());
+                } else {
+                    // Say where a relative path ended up: under a service
+                    // the working directory is not the config's folder.
+                    let full = std::path::absolute(dir).unwrap_or_else(|_| dir.clone());
+                    eprintln!(
+                        "routelith server: cannot open {} (relative to the working \
+                         directory, so {}): {e}; set server.data_dir to an absolute path",
+                        dir.display(),
+                        full.display()
+                    );
+                }
                 return ExitCode::from(2);
             }
         };
