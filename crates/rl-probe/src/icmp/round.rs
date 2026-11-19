@@ -91,6 +91,7 @@ pub(super) async fn run(
             timing: TimingSource::new(backend),
             payload_size: u16::try_from(payload).unwrap_or(u16::MAX),
         },
+        http: None,
     })
 }
 

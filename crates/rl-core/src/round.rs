@@ -76,6 +76,15 @@ pub enum SampleError {
     /// A DNS server answered, but not with the expected rcode or answer set.
     #[error("unexpected DNS answer: {0}")]
     DnsMismatch(String),
+    /// An HTTP status outside the expected ranges.
+    #[error("HTTP status {status}")]
+    HttpStatus { status: u16 },
+    /// The response body did not match the expected pattern.
+    #[error("response body does not match body_regex")]
+    BodyMismatch,
+    /// The TLS handshake failed (certificate, protocol).
+    #[error("TLS: {0}")]
+    Tls(String),
     /// The request never left this host (socket error, resource limit).
     #[error("send failed: {0}")]
     SendFailed(String),
@@ -100,6 +109,33 @@ pub struct RoundResult {
     /// Samples in send order.
     pub samples: Vec<Sample>,
     pub meta: ProbeMeta,
+    /// HTTP detail (phase timings, certificate); `None` for other probes.
+    pub http: Option<HttpRound>,
+}
+
+/// What an HTTP round measured beyond each sample's selected metric (§4.6).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HttpRound {
+    /// Phase timings per sample, in send order; `None` for a sample that
+    /// got no response.
+    pub phases: Vec<Option<PhaseTimings>>,
+    /// Expiry (`notAfter`) of the server certificate, from the last sample
+    /// that completed a TLS handshake.
+    pub cert_not_after: Option<SystemTime>,
+}
+
+/// Where the time of one HTTP request went, in microseconds. `ttfb` and
+/// `total` count from the start of the TCP connect (like curl's
+/// `time_starttransfer` and `time_total`); `connect` and `tls` are the
+/// handshakes alone. Name resolution happens once per round, before the
+/// samples, so it is not a phase here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhaseTimings {
+    pub connect_us: u32,
+    /// `None` for plain HTTP.
+    pub tls_us: Option<u32>,
+    pub ttfb_us: u32,
+    pub total_us: u32,
 }
 
 #[cfg(test)]

@@ -128,6 +128,7 @@ impl DnsProbe {
                 timing: TimingSource::new(TimingBackend::Monotonic),
                 payload_size: 0,
             },
+            http: None,
         }
     }
 }
