@@ -104,20 +104,35 @@ impl Bucket {
     }
 }
 
+/// Most X-axis grid lines drawn, whatever the range.
+const MAX_X_TICKS: i64 = 40;
+
+/// Milliseconds from `from` to `to`, without overflow for any two `i64`
+/// times.
+fn diff_ms(from: i64, to: i64) -> f64 {
+    (i128::from(to) - i128::from(from)) as f64
+}
+
+/// The graph's time span, at least 1 ms.
+fn span_ms(from: i64, to: i64) -> f64 {
+    diff_ms(from, to).max(1.0)
+}
+
 /// Buckets of the graph, plus their width in ms.
 fn buckets(rounds: &[Round<'_>], g: &Graph<'_>, plot_width: f64) -> (Vec<BucketAcc>, i64) {
-    let range = g.to_ms.saturating_sub(g.from_ms).max(1);
     let step = g.step_ms.unwrap_or_else(|| infer_step(rounds)).max(1);
     // Wide enough that buckets are at least a pixel and hold whole rounds.
+    // (A float to int cast saturates.)
     #[allow(clippy::cast_possible_truncation)]
-    let per_pixel = (range as f64 / plot_width).ceil() as i64;
-    let width = (per_pixel.max(1) + step - 1) / step * step;
+    let per_pixel = (span_ms(g.from_ms, g.to_ms) / plot_width).ceil() as i64;
+    let width = per_pixel.max(1).saturating_add(step - 1) / step * step;
     let mut out: Vec<BucketAcc> = Vec::new();
     for r in rounds {
         if r.ts_ms < g.from_ms || r.ts_ms > g.to_ms {
             continue;
         }
-        let start = r.ts_ms.div_euclid(width) * width;
+        // Saturating: the bucket of a round near i64::MIN starts below it.
+        let start = r.ts_ms.saturating_sub(r.ts_ms.rem_euclid(width));
         if out.last().is_none_or(|b| b.start_ms != start) {
             out.push(BucketAcc {
                 start_ms: start,
@@ -232,7 +247,7 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     );
     let (w, h) = (f64::from(width), f64::from(height));
     let (pw, ph) = (w - LEFT - RIGHT, h - TOP - BOTTOM);
-    let range = g.to_ms.saturating_sub(g.from_ms).max(1) as f64;
+    let range = span_ms(g.from_ms, g.to_ms);
     let (accs, bucket_ms) = buckets(rounds, g, pw);
     let buckets: Vec<Bucket> = accs
         .into_iter()
@@ -263,7 +278,7 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     let tick = nice_step(top * 1.1, 4.0);
     let y_max = (top * 1.1 / tick).ceil() * tick;
 
-    let x = |ms: i64| LEFT + (ms.saturating_sub(g.from_ms) as f64 / range) * pw;
+    let x = |ms: i64| LEFT + (diff_ms(g.from_ms, ms) / range) * pw;
     let y = |v: f64| TOP + ph - (v.min(y_max) / y_max) * ph;
 
     let mut s = svg::Doc::new(width, height);
@@ -311,7 +326,7 @@ pub fn render(rounds: &[Round<'_>], g: &Graph<'_>) -> String {
     let mut medians = String::new();
     for b in &buckets {
         let x0 = x(b.start_ms.max(g.from_ms));
-        let x1 = x((b.start_ms + bucket_ms).min(g.to_ms));
+        let x1 = x(b.start_ms.saturating_add(bucket_ms).min(g.to_ms));
         let bw = (x1 - x0).max(0.5).min(pw);
         // A round exactly at `to_ms` starts a bucket on the right border:
         // draw it just inside the plot.
@@ -414,7 +429,10 @@ fn x_ticks(range_ms: i64) -> (i64, fn(i64) -> String) {
     } else if range_ms <= 2 * DAY_MS {
         (3 * HOUR_MS, hhmm)
     } else {
-        (DAY_MS, mmdd)
+        // Whole days, few enough that the axis stays readable (and the
+        // loop short) for any range.
+        let days = ((range_ms / DAY_MS + MAX_X_TICKS - 1) / MAX_X_TICKS).max(1);
+        (days.saturating_mul(DAY_MS), mmdd)
     }
 }
 
@@ -598,6 +616,37 @@ mod tests {
             };
             let svg = render(&[], &g);
             assert!(svg.len() < 100_000, "{} bytes", svg.len());
+        }
+        // Populated: a round at each end and one at 0, over the whole i64
+        // range and a wide one that reaches the tick loop.
+        let rtts = [1_000u32];
+        for (from_ms, to_ms) in [(i64::MIN, i64::MAX), (-1, i64::MAX)] {
+            let rounds: Vec<Round<'_>> = [from_ms, 0, to_ms]
+                .map(|ts_ms| Round {
+                    ts_ms,
+                    sent: 1,
+                    rtts_us: &rtts,
+                })
+                .to_vec();
+            let g = Graph {
+                title: "t",
+                from_ms,
+                to_ms,
+                step_ms: Some(300_000),
+                width: Graph::DEFAULT_WIDTH,
+                height: Graph::DEFAULT_HEIGHT,
+            };
+            let svg = render(&rounds, &g);
+            let grid = svg.matches("stroke=\"#e0e0e0\"").count();
+            assert!(grid < 2 * MAX_X_TICKS as usize, "{grid} grid lines");
+            // The round at 0 is drawn in the plot, not at its right edge.
+            let width = f64::from(Graph::DEFAULT_WIDTH);
+            assert!(
+                rects(&svg)
+                    .iter()
+                    .any(|&(x, ..)| x > width * 0.2 && x < width * 0.8),
+                "no column in the middle"
+            );
         }
     }
 
