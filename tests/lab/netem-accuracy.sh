@@ -189,9 +189,11 @@ while True:
     tcp=$(median_ms <<<"$out")
     tcp_ref=$(median_ms <"$icmp_out")
     rm -f "$icmp_out"
-    [[ $tcp_ref =~ ^[0-9]+(\.[0-9]+)?$ ]] || tcp_ref=$delayed
     received=$(awk '/^--- / { print $4 }' <<<"$out")
-    if ! [[ $tcp =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    if ! [[ $tcp_ref =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "FAIL  tcp: the concurrent ICMP reference produced no median (got '${tcp_ref}')"
+        failures=$((failures + 1))
+    elif ! [[ $tcp =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         echo "FAIL  tcp measurement produced no median (got '${tcp}')"
         failures=$((failures + 1))
     elif [[ $received != 500 ]]; then
