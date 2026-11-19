@@ -176,16 +176,29 @@ while True:
 ' &
     srv_pid=$!
     sleep 0.5
+    # ICMP in the same window is the reference, so host-load drift since
+    # the delay step above affects both alike.
+    icmp_out=$(mktemp)
+    measure -c 500 -i 5ms >"$icmp_out" 2>&1 &
+    icmp_pid=$!
     out=$(ip netns exec "$A" "$BIN" check tcp "$ADDR_B" -p "$TCP_PORT" -q -W 1s -c 500 -i 5ms) || true
+    wait "$icmp_pid" || true
     echo "$out"
     kill "$srv_pid" 2>/dev/null || true
     srv_pid=
     tcp=$(median_ms <<<"$out")
-    if [[ $tcp =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        check tcp "$tcp" "$delayed" "$TCP_TOL_MS"
-    else
+    tcp_ref=$(median_ms <"$icmp_out")
+    rm -f "$icmp_out"
+    [[ $tcp_ref =~ ^[0-9]+(\.[0-9]+)?$ ]] || tcp_ref=$delayed
+    received=$(awk '/^--- / { print $4 }' <<<"$out")
+    if ! [[ $tcp =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         echo "FAIL  tcp measurement produced no median (got '${tcp}')"
         failures=$((failures + 1))
+    elif [[ $received != 500 ]]; then
+        echo "FAIL  tcp: ${received:-no} of 500 connections succeeded"
+        failures=$((failures + 1))
+    else
+        check tcp "$tcp" "$tcp_ref" "$TCP_TOL_MS"
     fi
 else
     echo "SKIP  tcp: python3 is not installed (needed for the listener)"

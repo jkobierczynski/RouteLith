@@ -6,6 +6,10 @@
 //! keeps no `TIME_WAIT` state. A RST in answer to the SYN means the host is
 //! reachable but the port is closed: it is kept as
 //! [`SampleError::Refused`] with its latency.
+//!
+//! On Windows, `connect()` to a closed port fails only after the stack has
+//! retried the SYN twice (about 0.5 s apart), so a refusal is reported up
+//! to ~2 s late, and as lost when the round's timeout is shorter.
 
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
@@ -159,10 +163,12 @@ fn connect_error(e: &io::Error, elapsed: Duration) -> Sample {
         ErrorKind::ConnectionRefused => Sample::Error(SampleError::Refused {
             rtt_us: micros(elapsed),
         }),
-        // No local route or address: the SYN never left this host.
-        ErrorKind::NetworkUnreachable | ErrorKind::AddrNotAvailable | ErrorKind::AddrInUse => {
-            Sample::Error(SampleError::SendFailed(e.to_string()))
-        }
+        // No local route or address, or a local firewall said no: the SYN
+        // never left this host.
+        ErrorKind::NetworkUnreachable
+        | ErrorKind::AddrNotAvailable
+        | ErrorKind::AddrInUse
+        | ErrorKind::PermissionDenied => Sample::Error(SampleError::SendFailed(e.to_string())),
         ErrorKind::TimedOut => Sample::Lost,
         _ => Sample::Error(SampleError::Other(e.to_string())),
     }
@@ -286,8 +292,12 @@ mod tests {
             port,
             mode: TcpMode::Connect,
         });
+        // Windows retries a refused SYN twice, about half a second apart,
+        // before connect() fails, so a refusal takes up to ~2 s there.
+        let mut p = plan(2);
+        p.timeout = Duration::from_secs(5);
         let round = probe
-            .run_round(&target("127.0.0.1".parse().unwrap()), plan(2))
+            .run_round(&target("127.0.0.1".parse().unwrap()), p)
             .await
             .unwrap();
         for s in &round.samples {

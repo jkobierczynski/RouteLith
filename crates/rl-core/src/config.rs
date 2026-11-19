@@ -570,6 +570,11 @@ impl Validator<'_> {
                 self.error(&v.span(), format!("{key} does not apply to {kind} targets"));
             }
         }
+        // Only the target's own `size`: a group or [defaults] size is a
+        // shared ICMP default and may sit above TCP targets.
+        if let (Some(v), false) = (&raw.size, kind == "icmp") {
+            self.error(&v.span(), format!("size does not apply to {kind} targets"));
+        }
         let tcp = if kind == "tcp" { self.tcp(raw) } else { None };
         // A host problem is recorded, but the settings are still checked.
         let host = match &raw.host {
@@ -1190,6 +1195,33 @@ name = "G"
                 port: 443,
                 mode: TcpMode::Connect
             }
+        );
+    }
+
+    #[test]
+    fn size_on_a_tcp_target_is_an_error_but_a_shared_size_is_not() {
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+[[group]]
+name = "G"
+size = 100
+  [[group.target]]
+  name = "web"
+  host = "h"
+  probe = "tcp"
+  port = 443
+  [[group.target]]
+  name = "sized"
+  host = "h"
+  probe = "tcp"
+  port = 443
+  size = 64
+"#;
+        let e = errors(src);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].starts_with("16:") && e[0].contains("size does not apply to tcp targets"),
+            "{e:?}"
         );
     }
 
