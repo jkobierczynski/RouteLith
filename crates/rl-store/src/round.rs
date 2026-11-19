@@ -145,6 +145,7 @@ mod tests {
                 timing: TimingSource::new(TimingBackend::LinuxKernelTimestamp),
                 payload_size: 56,
             },
+            http: None,
         };
         let s = StoredRound::from_result(&r, 0).unwrap();
         assert_eq!(s.ts_ms, 300_000);

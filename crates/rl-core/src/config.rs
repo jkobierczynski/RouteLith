@@ -48,7 +48,7 @@ const MAX_SIZE: i64 = 65_507;
 /// Smallest payload: it carries the 8-byte nonce.
 const MIN_SIZE: i64 = 8;
 const MAX_NAME_LEN: usize = 64;
-const AVAILABLE: &str = "this version measures \"icmp\", \"tcp\" and \"dns\"";
+const AVAILABLE: &str = "this version measures \"icmp\", \"tcp\", \"dns\" and \"http\"";
 
 /// A validated configuration.
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +92,179 @@ pub enum ProbeConfig {
     Tcp { port: u16, mode: TcpMode },
     /// One DNS query per sample to the target's server (§4.5).
     Dns(DnsConfig),
+    /// One HTTP(S) request per sample on a fresh connection (§4.6).
+    Http(HttpConfig),
+}
+
+/// An HTTP target's request and what counts as success (§4.6).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HttpConfig {
+    /// The URL as configured.
+    pub url: String,
+    /// `https` when true, else `http`.
+    pub tls: bool,
+    /// Host name or address from the URL (no brackets), sent as the Host
+    /// header and, unless `sni` overrides it, as the TLS server name.
+    pub host: String,
+    pub port: u16,
+    /// Path and query, at least `/`.
+    pub path: String,
+    pub method: HttpMethod,
+    /// Inclusive status ranges that count as success.
+    pub expect_status: Vec<(u16, u16)>,
+    /// The time stored as the sample.
+    pub metric: HttpMetric,
+    /// Regular expression the first `BODY_LIMIT` bytes of the body must match.
+    pub body_regex: Option<String>,
+    /// Verify the server certificate (on by default).
+    pub tls_verify: bool,
+    /// Extra PEM CA certificates to trust, besides the system's.
+    pub ca_file: Option<PathBuf>,
+    /// TLS server name to send instead of the URL's host.
+    pub sni: Option<String>,
+}
+
+/// Bytes of an HTTP body read per sample (for `body_regex` and the
+/// `total` time); the rest is not downloaded.
+pub const BODY_LIMIT: usize = 1 << 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum HttpMethod {
+    #[default]
+    Get,
+    Head,
+}
+
+impl HttpMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+        }
+    }
+}
+
+/// Which HTTP time a sample stores (the others go to the phase timings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum HttpMetric {
+    /// Start of connect to the first response byte.
+    #[default]
+    Ttfb,
+    /// Start of connect to the end of the body (up to `BODY_LIMIT`).
+    Total,
+    /// The TCP handshake.
+    Connect,
+    /// The TLS handshake (https only).
+    Tls,
+}
+
+impl HttpMetric {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ttfb => "ttfb",
+            Self::Total => "total",
+            Self::Connect => "connect",
+            Self::Tls => "tls",
+        }
+    }
+}
+
+/// The parts of an `http://` or `https://` URL a probe needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpUrl {
+    pub tls: bool,
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+}
+
+/// Parse an absolute `http` or `https` URL without user info or fragment.
+pub fn parse_http_url(url: &str) -> Result<HttpUrl, String> {
+    let (tls, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return Err("must start with http:// or https://".into());
+    };
+    if url.contains('#') {
+        return Err("must not contain a #fragment".into());
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("must not contain spaces or control characters".into());
+    }
+    let split = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(split);
+    if authority.contains('@') {
+        return Err("must not contain user info (put secrets elsewhere)".into());
+    }
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let end = v6.find(']').ok_or("has an unclosed [")?;
+        let host = &v6[..end];
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(format!("[{host}] is not an IPv6 address"));
+        }
+        let after = &v6[end + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(p),
+            None if after.is_empty() => None,
+            None => return Err("has text after ]".into()),
+        };
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return Err("has no host".into());
+    }
+    let port = match port {
+        None => {
+            if tls {
+                443
+            } else {
+                80
+            }
+        }
+        Some(p) => match p.parse::<u16>() {
+            Ok(n) if n >= 1 => n,
+            _ => return Err(format!("port {p:?} is not a number from 1 to 65535")),
+        },
+    };
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('?') {
+        format!("/{path}")
+    } else {
+        path.to_string()
+    };
+    Ok(HttpUrl {
+        tls,
+        host: host.to_string(),
+        port,
+        path,
+    })
+}
+
+/// Parse `"200-299"`, `"200"` or `"200, 301-302"` into inclusive ranges.
+pub fn parse_status_ranges(s: &str) -> Result<Vec<(u16, u16)>, String> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        let (lo, hi) = part.split_once('-').unwrap_or((part, part));
+        let num = |x: &str| match x.trim().parse::<u16>() {
+            Ok(n @ 100..=599) => Ok(n),
+            _ => Err(format!("{x:?} is not an HTTP status from 100 to 599")),
+        };
+        let (lo, hi) = (num(lo)?, num(hi)?);
+        if lo > hi {
+            return Err(format!("range {part:?} runs backwards"));
+        }
+        out.push((lo, hi));
+    }
+    Ok(out)
 }
 
 /// A DNS target's query and its expected answer (§4.5).
@@ -148,6 +321,7 @@ impl ProbeConfig {
             Self::Icmp { .. } => "icmp",
             Self::Tcp { .. } => "tcp",
             Self::Dns(_) => "dns",
+            Self::Http(_) => "http",
         }
     }
 }
@@ -391,6 +565,11 @@ settings_struct!(RawTarget {
     recursion: Option<Spanned<toml::Value>>,
     expect_rcode: Option<Spanned<toml::Value>>,
     expect_answers: Option<Spanned<toml::Value>>,
+    method: Option<Spanned<toml::Value>>,
+    body_regex: Option<Spanned<toml::Value>>,
+    tls_verify: Option<Spanned<toml::Value>>,
+    ca_file: Option<Spanned<toml::Value>>,
+    sni: Option<Spanned<toml::Value>>,
 });
 
 // ---- validation -----------------------------------------------------------
@@ -598,8 +777,9 @@ impl Validator<'_> {
             None | Some((_, "icmp")) => "icmp",
             Some((_, "tcp")) => "tcp",
             Some((_, "dns")) => "dns",
+            Some((_, "http" | "https")) => "http",
             Some((probe, p)) => {
-                let msg = if ["udp", "http", "https"].contains(&p) {
+                let msg = if p == "udp" {
                     format!("probe {p:?} is not available yet; {AVAILABLE}")
                 } else {
                     format!("unknown probe {p:?}; {AVAILABLE}")
@@ -611,9 +791,14 @@ impl Validator<'_> {
             }
         };
         for (key, value, applies) in [
-            ("url", &raw.url, false),
-            ("expect_status", &raw.expect_status, false),
-            ("metric", &raw.metric, false),
+            ("url", &raw.url, kind == "http"),
+            ("expect_status", &raw.expect_status, kind == "http"),
+            ("metric", &raw.metric, kind == "http"),
+            ("method", &raw.method, kind == "http"),
+            ("body_regex", &raw.body_regex, kind == "http"),
+            ("tls_verify", &raw.tls_verify, kind == "http"),
+            ("ca_file", &raw.ca_file, kind == "http"),
+            ("sni", &raw.sni, kind == "http"),
             ("server", &raw.server, kind == "dns"),
             ("query", &raw.query, kind == "dns"),
             ("qtype", &raw.qtype, kind == "dns"),
@@ -636,10 +821,28 @@ impl Validator<'_> {
         let probe = match kind {
             "tcp" => self.tcp(raw),
             "dns" => self.dns(raw),
+            "http" => self.http(raw),
             _ => None,
         };
-        // A DNS target's host is its server.
-        let (host_key, host_value) = if kind == "dns" {
+        // A DNS target's host is its server; an HTTP target's is in its URL.
+        let (host_key, host_value) = if kind == "http" {
+            if let Some(h) = &raw.host {
+                self.error(&h.span(), "http targets take their host from url, not host");
+            }
+            let host = match &probe {
+                Some(ProbeConfig::Http(h)) => raw
+                    .url
+                    .as_ref()
+                    .map(|u| Spanned::new(u.span(), h.host.clone())),
+                _ => None,
+            };
+            // Without a valid URL the error is already reported.
+            if host.is_none() {
+                self.check_layer(s);
+                return None;
+            }
+            ("url host", host)
+        } else if kind == "dns" {
             if let Some(h) = &raw.host {
                 self.error(
                     &h.span(),
@@ -736,7 +939,7 @@ impl Validator<'_> {
                 timeout: timeout?,
             },
             probe: match kind {
-                "tcp" | "dns" => probe?,
+                "tcp" | "dns" | "http" => probe?,
                 _ => ProbeConfig::Icmp {
                     payload_size: size?,
                 },
@@ -781,6 +984,135 @@ impl Validator<'_> {
                 }
             },
         }
+    }
+
+    /// The HTTP settings of a target (§4.6).
+    fn http(&mut self, raw: &RawTarget) -> Option<ProbeConfig> {
+        let url = match self.string_value("url", raw.url.as_ref()) {
+            None if raw.url.is_none() => {
+                self.error(
+                    &raw.name.span(),
+                    format!("http target {:?} needs a url", raw.name.get_ref()),
+                );
+                None
+            }
+            None => None,
+            Some(u) => match parse_http_url(u.get_ref().trim()) {
+                Ok(parsed) => Some((u.get_ref().trim().to_string(), parsed)),
+                Err(e) => {
+                    self.error(&u.span(), format!("url {e}"));
+                    None
+                }
+            },
+        };
+        let expect_status = match self.string_value("expect_status", raw.expect_status.as_ref()) {
+            None if raw.expect_status.is_some() => None,
+            None => Some(vec![(200, 299)]),
+            Some(v) => match parse_status_ranges(v.get_ref()) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    self.error(&v.span(), format!("expect_status: {e}"));
+                    None
+                }
+            },
+        };
+        let metric = match self.string_value("metric", raw.metric.as_ref()) {
+            None if raw.metric.is_some() => None,
+            None => Some(HttpMetric::default()),
+            Some(v) => match v.get_ref().as_str() {
+                "ttfb" => Some(HttpMetric::Ttfb),
+                "total" => Some(HttpMetric::Total),
+                "connect" => Some(HttpMetric::Connect),
+                "tls" => Some(HttpMetric::Tls),
+                _ => {
+                    self.error(
+                        &v.span(),
+                        "metric must be \"ttfb\", \"total\", \"connect\" or \"tls\"",
+                    );
+                    None
+                }
+            },
+        };
+        let method = match self.string_value("method", raw.method.as_ref()) {
+            None if raw.method.is_some() => None,
+            None => Some(HttpMethod::default()),
+            Some(v) => match v.get_ref().to_ascii_uppercase().as_str() {
+                "GET" => Some(HttpMethod::Get),
+                "HEAD" => Some(HttpMethod::Head),
+                _ => {
+                    self.error(&v.span(), "method must be \"GET\" or \"HEAD\"");
+                    None
+                }
+            },
+        };
+        let body_regex = match self.string_value("body_regex", raw.body_regex.as_ref()) {
+            None if raw.body_regex.is_some() => None,
+            None => Some(None),
+            // Compiled (and checked) by the probe; rl-core has no regex engine.
+            Some(v) if v.get_ref().is_empty() => {
+                self.error(&v.span(), "body_regex must not be empty");
+                None
+            }
+            Some(v) => Some(Some(v.get_ref().clone())),
+        };
+        let tls_verify = match &raw.tls_verify {
+            None => Some(true),
+            Some(v) => match v.get_ref().as_bool() {
+                Some(b) => {
+                    if !b {
+                        self.warning(
+                            &v.span(),
+                            "tls_verify = false accepts any certificate, so this target \
+                             cannot detect an impostor or an expired certificate",
+                        );
+                    }
+                    Some(b)
+                }
+                None => {
+                    self.error(&v.span(), "tls_verify must be true or false");
+                    None
+                }
+            },
+        };
+        let ca_file = match self.string_value("ca_file", raw.ca_file.as_ref()) {
+            None if raw.ca_file.is_some() => None,
+            None => Some(None),
+            Some(v) if v.get_ref().trim().is_empty() => {
+                self.error(&v.span(), "ca_file must not be empty");
+                None
+            }
+            Some(v) => Some(Some(PathBuf::from(v.get_ref()))),
+        };
+        let sni = match self.string_value("sni", raw.sni.as_ref()) {
+            None if raw.sni.is_some() => None,
+            None => Some(None),
+            Some(v) if valid_hostname(v.get_ref()) => Some(Some(v.get_ref().clone())),
+            Some(v) => {
+                self.error(&v.span(), "sni must be a host name");
+                None
+            }
+        };
+        if let (Some((_, u)), Some(m)) = (&url, metric) {
+            if m == HttpMetric::Tls && !u.tls {
+                let at = raw.metric.as_ref().map_or(raw.name.span(), Spanned::span);
+                self.error(&at, "metric \"tls\" needs an https url");
+            }
+        }
+        let (url, u) = url?;
+        Some(ProbeConfig::Http(HttpConfig {
+            url,
+            tls: u.tls,
+            host: u.host,
+            port: u.port,
+            path: u.path,
+            method: method?,
+            expect_status: expect_status?,
+            metric: metric?,
+            body_regex: body_regex?,
+            tls_verify: tls_verify?,
+            ca_file: ca_file?,
+            sni: sni?,
+        }))
     }
 
     /// The DNS settings of a target (§4.5).
@@ -1386,10 +1718,9 @@ data_dir = "/tmp/rl"
 [[group]]
 name = "G"
   [[group.target]]
-  name = "intranet"
-  probe = "http"
-  url = "https://intranet.example.local/health"
-  expect_status = "200-299"
+  name = "reflector"
+  probe = "udp"
+  host = "10.0.0.9"
 "#;
         let e = errors(src);
         assert_eq!(e.len(), 1, "{e:?}");
@@ -1596,6 +1927,145 @@ name = "G"
     }
 
     #[test]
+    fn the_architecture_doc_example_is_valid() {
+        // §13.1, with the vantage list trimmed to this machine's.
+        let src = r#"[server]
+listen_ui     = "0.0.0.0:8080"
+listen_agents = "0.0.0.0:4443"
+data_dir      = "/var/lib/routelith"
+
+[defaults]
+step  = "300s"
+pings = 20
+
+[[group]]
+name   = "Core"
+vantages = ["local", "hasselt", "antwerp"]
+
+  [[group.target]]
+  name  = "core-fw"
+  host  = "10.0.0.1"
+  probe = "icmp"
+
+  [[group.target]]
+  name  = "intranet"
+  probe = "http"
+  url   = "https://intranet.example.local/health"
+  expect_status = "200-299"
+  metric = "ttfb"
+
+  [[group.target]]
+  name   = "dns-primary"
+  probe  = "dns"
+  server = "10.0.0.53"
+  query  = "example.com"
+  qtype  = "A"
+"#;
+        let p = parse(src);
+        assert_eq!(p.errors().count(), 0, "{:?}", p.diagnostics);
+        let t = p.config.unwrap().targets;
+        assert_eq!(t.len(), 3);
+        assert_eq!(t[1].host, "intranet.example.local");
+        let ProbeConfig::Http(h) = &t[1].probe else {
+            panic!("{:?}", t[1].probe)
+        };
+        assert!(h.tls);
+        assert_eq!((h.port, h.path.as_str()), (443, "/health"));
+        assert_eq!(h.expect_status, vec![(200, 299)]);
+        assert_eq!(h.metric, HttpMetric::Ttfb);
+    }
+
+    #[test]
+    fn http_settings_are_checked() {
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+[[group]]
+name = "G"
+  [[group.target]]
+  name  = "nourl"
+  probe = "http"
+  [[group.target]]
+  name  = "badurl"
+  probe = "http"
+  url   = "ftp://x/"
+  [[group.target]]
+  name  = "bad"
+  probe = "http"
+  url   = "http://[2001:db8::1]:8080/x"
+  host  = "h"
+  expect_status = "299-200"
+  metric = "tls"
+  method = "POST"
+  tls_verify = "no"
+  [[group.target]]
+  name  = "insecure"
+  probe = "https"
+  url   = "https://h.example/"
+  tls_verify = false
+"#;
+        let p = parse(src);
+        let e: Vec<String> = p.errors().map(ToString::to_string).collect();
+        assert_eq!(e.len(), 7, "{e:?}");
+        assert!(e.iter().any(|m| m.contains("needs a url")), "{e:?}");
+        assert!(
+            e.iter().any(|m| m.contains("url must start with http")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter().any(|m| m.contains("take their host from url")),
+            "{e:?}"
+        );
+        assert!(e.iter().any(|m| m.contains("runs backwards")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("needs an https url")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("method must")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("tls_verify must")), "{e:?}");
+        let w: Vec<_> = p
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .collect();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].message.contains("accepts any certificate"));
+    }
+
+    #[test]
+    fn urls() {
+        let u = parse_http_url("https://Example.org").unwrap();
+        assert_eq!(
+            (u.tls, u.host.as_str(), u.port, u.path.as_str()),
+            (true, "Example.org", 443, "/")
+        );
+        let u = parse_http_url("http://[::1]:8080?q=1").unwrap();
+        assert_eq!(
+            (u.host.as_str(), u.port, u.path.as_str()),
+            ("::1", 8080, "/?q=1")
+        );
+        for bad in [
+            "example.org",
+            "http://",
+            "http://user:pw@h/",
+            "http://h:0/",
+            "http://h:99999/",
+            "http://[zz]/",
+            "http://h/#x",
+            "http://h /",
+        ] {
+            assert!(parse_http_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn status_ranges() {
+        assert_eq!(parse_status_ranges("200-299"), Ok(vec![(200, 299)]));
+        assert_eq!(
+            parse_status_ranges("200, 301-302"),
+            Ok(vec![(200, 200), (301, 302)])
+        );
+        assert!(parse_status_ranges("99").is_err());
+        assert!(parse_status_ranges("200-").is_err());
+    }
+
+    #[test]
     fn dns_query_names_are_checked_as_sent() {
         let target = |query: &str, extra: &str| {
             format!(
@@ -1651,7 +2121,7 @@ vantages = ["hasselt"]
     fn shipped_example_is_valid() {
         let p = parse(include_str!("../../../examples/routelith.toml"));
         assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
-        assert_eq!(p.config.unwrap().targets.len(), 5);
+        assert_eq!(p.config.unwrap().targets.len(), 6);
     }
 
     #[test]

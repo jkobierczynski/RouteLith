@@ -24,6 +24,9 @@ ignore = [
     { id = "RUSTSEC-2026-0489", reason = "zone-file / record-text parsing: Routelith never parses DNS records from text, only decodes the wire format" },
     { id = "RUSTSEC-2026-0490", reason = "zone-file / record-text parsing: Routelith never parses DNS records from text, only decodes the wire format" },
     { id = "RUSTSEC-2026-0119", reason = "name-compression cost grows with the records encoded; Routelith only encodes its own one-question query" },
+    # time 0.3.47 (the fix) needs Rust 1.88. time comes in only through
+    # rcgen, a dev-dependency that makes test certificates.
+    { id = "RUSTSEC-2026-0009", reason = "time is only a test dependency (via rcgen) and nothing parses RFC 2822 input" },
     { id = "RUSTSEC-2026-0491", reason = "header counts are checked against the message length before decoding (rl-probe dns::counts_fit)" },
 ]
 

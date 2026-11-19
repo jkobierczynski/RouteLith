@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Args;
 use rl_core::config::{self, Config, Family, ProbeConfig};
 use rl_probe::{
-    DnsProbe, IcmpConfig, IcmpProbe, Probe, ProbeError, RateLimiter, TcpConfig, TcpProbe,
+    DnsProbe, HttpProbe, IcmpConfig, IcmpProbe, Probe, ProbeError, RateLimiter, TcpConfig, TcpProbe,
 };
 use rl_sched::{Completed, FailCause, Job, Outcome, Sink, Snapshot, Stats};
 use rl_store::{Appended, ErrorCounts, SeriesKey, StoredRound, Writer, WriterOptions};
@@ -318,6 +318,9 @@ fn make_probe(cfg: &ProbeConfig, limiter: &Arc<RateLimiter>) -> Result<Arc<dyn P
         }
         ProbeConfig::Dns(d) => {
             Arc::new(DnsProbe::new(d.clone())?.with_rate_limiter(limiter.clone()))
+        }
+        ProbeConfig::Http(h) => {
+            Arc::new(HttpProbe::new(h.clone())?.with_rate_limiter(limiter.clone()))
         }
     })
 }

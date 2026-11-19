@@ -6,12 +6,17 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use clap::Args;
-use rl_core::config::{DNS_QTYPES, DNS_RCODES, DnsConfig, DnsTransport, TcpMode};
+use rl_core::config::{
+    DNS_QTYPES, DNS_RCODES, DnsConfig, DnsTransport, HttpConfig, HttpMethod, HttpMetric, TcpMode,
+    parse_http_url, parse_status_ranges,
+};
 use rl_core::{ResolvedTarget, RoundPlan, RoundResult, RoundStats, Sample, SampleError};
-use rl_probe::{DnsProbe, IcmpConfig, IcmpProbe, Probe, TcpConfig, TcpProbe};
+use rl_probe::{DnsProbe, HttpProbe, IcmpConfig, IcmpProbe, Probe, TcpConfig, TcpProbe};
 
 #[derive(Debug, Args)]
 pub(crate) struct IcmpArgs {
+    /// Host name or IP address to measure.
+    host: String,
     #[command(flatten)]
     common: CommonArgs,
     /// ICMP payload size in bytes (minimum 8).
@@ -21,6 +26,8 @@ pub(crate) struct IcmpArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct TcpArgs {
+    /// Host name or IP address to connect to.
+    host: String,
     #[command(flatten)]
     common: CommonArgs,
     /// TCP port to connect to.
@@ -33,6 +40,8 @@ pub(crate) struct TcpArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct DnsArgs {
+    /// DNS server to query (host name or IP address).
+    server: String,
     #[command(flatten)]
     common: CommonArgs,
     /// Name to query; `{rand}` becomes a random label per sample.
@@ -69,11 +78,38 @@ fn upper_in(allowed: &'static [&'static str]) -> impl Fn(&str) -> Result<String,
     }
 }
 
+#[derive(Debug, Args)]
+pub(crate) struct HttpArgs {
+    /// URL to request (http:// or https://).
+    url: String,
+    #[command(flatten)]
+    common: CommonArgs,
+    /// Time stored as the sample: ttfb, total, connect or tls.
+    #[arg(long, default_value = "ttfb", value_parser = ["ttfb", "total", "connect", "tls"])]
+    metric: String,
+    /// Status ranges that count as success, e.g. 200-299 or "200,301-302".
+    #[arg(long, default_value = "200-299")]
+    expect_status: String,
+    /// Send HEAD instead of GET.
+    #[arg(long)]
+    head: bool,
+    /// Regular expression the body (first MiB) must match.
+    #[arg(long)]
+    body_regex: Option<String>,
+    /// Accept any certificate (insecure).
+    #[arg(short = 'k', long)]
+    insecure: bool,
+    /// Extra CA certificates to trust (PEM).
+    #[arg(long)]
+    ca_file: Option<std::path::PathBuf>,
+    /// TLS server name to send instead of the URL's host.
+    #[arg(long)]
+    sni: Option<String>,
+}
+
 /// Arguments every probe takes.
 #[derive(Debug, Args)]
 struct CommonArgs {
-    /// Host name or IP address to measure.
-    host: String,
     /// Number of samples in the round.
     #[arg(short = 'c', long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..))]
     count: u16,
@@ -101,7 +137,7 @@ pub(crate) async fn icmp(args: IcmpArgs) -> ExitCode {
     let probe = IcmpProbe::new(IcmpConfig {
         payload_size: args.size,
     });
-    run(&args.common, &probe, |t, r| {
+    run(&args.host, &args.common, &probe, |t, r| {
         format!(
             "ICMP {} ({}): {} samples, {}-byte payload",
             t.name,
@@ -121,7 +157,7 @@ pub(crate) async fn tcp(args: TcpArgs) -> ExitCode {
     };
     let port = args.port;
     let probe = TcpProbe::new(TcpConfig { port, mode });
-    run(&args.common, &probe, |t, r| {
+    run(&args.host, &args.common, &probe, |t, r| {
         let what = match mode {
             TcpMode::Connect => "connect time",
             TcpMode::Banner => "time to banner",
@@ -158,7 +194,7 @@ pub(crate) async fn dns(args: DnsArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    run(&args.common, &probe, |t, r| {
+    run(&args.server, &args.common, &probe, |t, r| {
         format!(
             "DNS {} {} @{} ({}) port {} over {}: {} samples",
             args.qtype,
@@ -173,8 +209,72 @@ pub(crate) async fn dns(args: DnsArgs) -> ExitCode {
     .await
 }
 
+pub(crate) async fn http(args: HttpArgs) -> ExitCode {
+    let url = args.url.trim().to_string();
+    let parsed = match parse_http_url(&url) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("routelith check: url {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let expect_status = match parse_status_ranges(&args.expect_status) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("routelith check: --expect-status: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let metric = match args.metric.as_str() {
+        "total" => HttpMetric::Total,
+        "connect" => HttpMetric::Connect,
+        "tls" if parsed.tls => HttpMetric::Tls,
+        "tls" => {
+            eprintln!("routelith check: --metric tls needs an https URL");
+            return ExitCode::from(2);
+        }
+        _ => HttpMetric::Ttfb,
+    };
+    let cfg = HttpConfig {
+        url: url.clone(),
+        tls: parsed.tls,
+        host: parsed.host.clone(),
+        port: parsed.port,
+        path: parsed.path,
+        method: if args.head {
+            HttpMethod::Head
+        } else {
+            HttpMethod::Get
+        },
+        expect_status,
+        metric,
+        body_regex: args.body_regex.clone(),
+        tls_verify: !args.insecure,
+        ca_file: args.ca_file.clone(),
+        sni: args.sni.clone(),
+    };
+    let probe = match HttpProbe::new(cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("routelith check: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    run(&parsed.host, &args.common, &probe, |_, r| {
+        format!(
+            "HTTP {} {url} ({}): {} samples, {}",
+            if args.head { "HEAD" } else { "GET" },
+            r.meta.resolved,
+            r.samples.len(),
+            metric.as_str()
+        )
+    })
+    .await
+}
+
 /// Resolve, run one round and print it under the probe's `header` line.
 async fn run(
+    host: &str,
     args: &CommonArgs,
     probe: &dyn Probe,
     header: impl Fn(&ResolvedTarget, &RoundResult) -> String,
@@ -189,7 +289,7 @@ async fn run(
         );
         return ExitCode::from(2);
     }
-    let addr = match resolve(&args.host, args.ipv4, args.ipv6).await {
+    let addr = match resolve(host, args.ipv4, args.ipv6).await {
         Ok(addr) => addr,
         Err(msg) => {
             eprintln!("routelith check: {msg}");
@@ -197,7 +297,7 @@ async fn run(
         }
     };
     let target = ResolvedTarget {
-        name: args.host.clone(),
+        name: host.to_string(),
         addr,
     };
     let spread = args.interval * u32::from(args.count);
@@ -276,7 +376,24 @@ fn render(header: &str, round: &RoundResult, quiet: bool) -> String {
                 Sample::Lost => "lost".to_owned(),
                 Sample::Error(e) => format!("error: {e}"),
             };
-            let _ = writeln!(out, "  #{:<4} {line}", i + 1);
+            let phases = round
+                .http
+                .as_ref()
+                .and_then(|h| h.phases.get(i).copied().flatten())
+                .map(|p| {
+                    let tls = p
+                        .tls_us
+                        .map(|t| format!(" tls {}", ms(t)))
+                        .unwrap_or_default();
+                    format!(
+                        "  (connect {}{tls} ttfb {} total {})",
+                        ms(p.connect_us),
+                        ms(p.ttfb_us),
+                        ms(p.total_us)
+                    )
+                })
+                .unwrap_or_default();
+            let _ = writeln!(out, "  #{:<4} {line}{phases}", i + 1);
         }
     }
     let _ = writeln!(
@@ -299,6 +416,16 @@ fn render(header: &str, round: &RoundResult, quiet: bool) -> String {
         );
     }
     let _ = writeln!(out, "timing: {}", round.meta.timing);
+    if let Some(t) = round.http.as_ref().and_then(|h| h.cert_not_after) {
+        let line = match t.duration_since(SystemTime::now()) {
+            Ok(left) => format!("certificate expires in {} days", left.as_secs() / 86_400),
+            Err(e) => format!(
+                "certificate EXPIRED {} days ago",
+                e.duration().as_secs() / 86_400
+            ),
+        };
+        let _ = writeln!(out, "{line}");
+    }
     out
 }
 
@@ -352,6 +479,7 @@ mod tests {
                 timing: TimingSource::new(TimingBackend::LinuxKernelTimestamp),
                 payload_size: 56,
             },
+            http: None,
         };
         let text = render(
             &format!("ICMP lab ({}): 3 samples, 56-byte payload", target.addr),
