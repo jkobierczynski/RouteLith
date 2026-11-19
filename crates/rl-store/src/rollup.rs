@@ -165,10 +165,19 @@ impl RollupPoint {
         let rtts_us = if q.is_empty() {
             Vec::new()
         } else {
-            // Reply k of n takes the quantile at the same rank.
-            (0..replies)
-                .map(|k| q[usize::try_from(k * q.len() as u64 / replies).unwrap_or(0)])
-                .collect()
+            // Reply k of n takes the quantile at the same rank, so the first
+            // and last replies keep the minimum and maximum. One reply
+            // takes the median.
+            let last = q.len() as u64 - 1;
+            let at = |i: u64| q[usize::try_from(i).unwrap_or(0).min(q.len() - 1)];
+            if replies == 1 {
+                vec![at(last / 2)]
+            } else {
+                let span = replies - 1;
+                (0..replies)
+                    .map(|k| at((k * last * 2 + span) / (span * 2)))
+                    .collect()
+            }
         };
         StoredRound {
             ts_ms: self.ts_ms,
@@ -580,8 +589,13 @@ mod tests {
         let r = point(5760, 0).to_round();
         assert!(r.sent > 0 && r.rtts_us.is_empty());
         let r = point(100_000, 1).to_round();
-        assert_eq!(r.rtts_us.len(), 1);
+        assert_eq!(r.rtts_us, [10]);
         assert!(r.sent > 1);
+        // Sparse replies still reach both ends of the spread.
+        let r = point(3, 3).to_round();
+        assert_eq!(r.rtts_us, [1, 11, 20]);
+        let r = point(10, 3).to_round();
+        assert_eq!(r.rtts_us, [1, 11, 20]);
     }
 
     #[test]

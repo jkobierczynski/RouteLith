@@ -283,3 +283,26 @@ fn rounds_older_than_every_tier_are_late() {
     now.ts_ms = later + 2 * HOUR_MS;
     assert_eq!(w.append(id, now).unwrap(), rl_store::Appended::Stored);
 }
+
+#[test]
+fn the_longest_horizon_decides_what_is_late() {
+    let dir = tempfile::tempdir().unwrap();
+    // Raw outlives both tiers here: a round raw would still keep is stored.
+    let opts = WriterOptions {
+        raw_days: 10,
+        r1h_days: 1,
+        r1d_days: 1,
+        ..WriterOptions::default()
+    };
+    let later = T0 + 30 * DAY_MS;
+    let (mut w, _) = Writer::open(dir.path(), opts, later).unwrap();
+    w.maintain(later).unwrap();
+    let [id] = w.register(&[SeriesKey::new("local", "gw", "v4")]).unwrap()[..] else {
+        panic!()
+    };
+    let mut old = round(0);
+    old.ts_ms = later - 20 * DAY_MS;
+    assert_eq!(w.append(id, old.clone()).unwrap(), rl_store::Appended::Late);
+    old.ts_ms = later - 5 * DAY_MS;
+    assert_eq!(w.append(id, old).unwrap(), rl_store::Appended::Stored);
+}
