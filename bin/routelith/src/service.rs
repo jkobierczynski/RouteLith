@@ -138,8 +138,11 @@ mod windows {
                 data_dir.display()
             )));
         }
-        // The service account must be able to read the configuration and
-        // write its data and log.
+        // The service account must be able to run the binary, read the
+        // configuration and write its data and log. The binary needs its own
+        // grant when it lives in a user profile, such as a cargo target dir.
+        let exe = std::env::current_exe()?;
+        grant(&exe, "RX")?;
         grant(&config, "RX")?;
         std::fs::create_dir_all(&data_dir)?;
         grant(&data_dir, "(OI)(CI)M")?;
@@ -160,7 +163,7 @@ mod windows {
             service_type: ServiceType::OWN_PROCESS,
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
-            executable_path: std::env::current_exe()?,
+            executable_path: exe.clone(),
             launch_arguments: vec![
                 "service".into(),
                 "run".into(),
@@ -201,7 +204,16 @@ mod windows {
             .map_err(to_io)?;
         println!("Installed service {NAME}; it logs to {}", log.display());
         if !args.no_start {
-            service.start::<&OsStr>(&[]).map_err(to_io)?;
+            service.start::<&OsStr>(&[]).map_err(|e| {
+                io::Error::other(format!(
+                    "installed, but the service did not start: {}. LocalService must be \
+                     able to read {} and every file it uses; a copy outside your user \
+                     profile (e.g. C:\\Program Files\\Routelith\\bin) avoids this. Check the \
+                     log, then run `sc start {NAME}`",
+                    to_io(e),
+                    exe.display()
+                ))
+            })?;
             println!("Started service {NAME}");
         }
         Ok(())

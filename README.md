@@ -47,8 +47,13 @@ system keeps `net.ipv4.ping_group_range` closed.
 runs as `LocalService`, starts with Windows and is restarted after a
 failure. Its log is `C:\ProgramData\Routelith\routelith.log`. Without the MSI,
 `routelith service install --config <file>` (as Administrator) registers the
-same service and `routelith service uninstall` removes it. The MSI is not
-signed yet.
+same service and `routelith service uninstall` removes it. The service runs
+the `routelith.exe` you install it from, so copy it out of `target\release`
+first (for example to `C:\Program Files\Routelith\bin`): a rebuild replaces
+that file and the access granted to `LocalService` with it, and the service
+then fails to start. Keep the configuration, `data_dir` and log outside your
+user profile too, for example under `C:\ProgramData\Routelith`. The MSI is
+not signed yet.
 
 ## Layout
 
