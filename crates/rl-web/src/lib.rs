@@ -86,6 +86,36 @@ impl Latest {
     }
 }
 
+/// MOS of a newest round (§19): `None` when it received nothing.
+pub(crate) fn latest_mos(l: &LatestRound) -> Option<f64> {
+    if l.sent == 0 {
+        return None;
+    }
+    let (min, median, p90) = (l.min_us?, l.median_us?, l.p90_us?);
+    let loss = f64::from(l.sent - l.received.min(l.sent)) / f64::from(l.sent);
+    rl_core::mos::round_mos(min, median, p90, loss)
+}
+
+/// MOS of a point of quantiles (ascending, as the store gives them).
+pub(crate) fn point_mos(sent: u32, received: u32, q: &[u32]) -> Option<f64> {
+    if sent == 0 || q.is_empty() {
+        return None;
+    }
+    let k = q.len();
+    let median = if k % 2 == 1 {
+        q[k / 2]
+    } else {
+        u32::try_from((u64::from(q[k / 2 - 1]) + u64::from(q[k / 2])) / 2).unwrap_or(u32::MAX)
+    };
+    let p90 = q[(k - 1) * 9 / 10];
+    let loss = f64::from(sent - received.min(sent)) / f64::from(sent);
+    rl_core::mos::round_mos(q[0], median, p90, loss)
+}
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
 /// Extra lines for `/metrics` from the rest of the server (scheduler and
 /// store counters).
 pub type ExtraMetrics = Arc<dyn Fn(&mut MetricsWriter) + Send + Sync>;

@@ -137,7 +137,7 @@ try {
   check(drawn.painted > 1000, "the canvas is drawn (" + drawn.painted + " pixels)");
   check(drawn.coloured > 0, "median lines are drawn (" + drawn.coloured + " pixels)");
   const summary = await page.textContent("section.graph .summary");
-  check(/^median .* ms · loss 0 % · \d+ rounds · every round/.test(summary), "the summary reads " + JSON.stringify(summary));
+  check(/^median .* ms · loss 0 % · MOS 4\.\d\d · \d+ rounds · every round/.test(summary), "the summary reads " + JSON.stringify(summary));
 
   for (const r of ["30h", "10d"]) {
     await page.click(`.ranges button:text("${r}")`);

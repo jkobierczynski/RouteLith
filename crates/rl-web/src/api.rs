@@ -91,6 +91,9 @@ struct LatestJson {
     max_us: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cert_not_after_s: Option<i64>,
+    /// Estimated voice quality, 1 to 4.5 (G.107 E-model).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mos: Option<f64>,
 }
 
 /// The newest round of every series that has one, for the overview.
@@ -109,6 +112,7 @@ pub(crate) async fn latest(State(s): State<Arc<AppState>>) -> Response {
             p90_us: l.p90_us,
             max_us: l.max_us,
             cert_not_after_s: l.cert_not_after_s,
+            mos: crate::latest_mos(&l).map(crate::round2),
         })
         .collect();
     list.sort_by_key(|l| l.series);
@@ -194,6 +198,9 @@ struct PointJson<'a> {
     recv: u32,
     /// Quantiles in microseconds, minimum to maximum; empty if all lost.
     q: &'a [u32],
+    /// Estimated voice quality, 1 to 4.5 (G.107 E-model).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mos: Option<f64>,
 }
 
 /// Quantile frames for the canvas graph: the tier is chosen from the range
@@ -240,6 +247,7 @@ pub(crate) async fn data(
             sent: p.sent,
             recv: p.received,
             q: &p.quantiles_us,
+            mos: crate::point_mos(p.sent, p.received, &p.quantiles_us).map(crate::round2),
         })
         .collect();
     Json(serde_json::json!({
