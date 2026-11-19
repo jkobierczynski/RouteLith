@@ -82,9 +82,14 @@ fn summary(cfg: &Config, warnings: usize) -> String {
         .map(|t| t.schedule.pps() * f64::from(t.family.series()))
         .sum();
     format!(
-        "OK: {} target{}, {series} series, {pps:.1} of {} packets/s on average, vantage {:?}{}",
+        "OK: {} target{}, {series} series, {}{pps:.1} of {} packets/s on average, vantage {:?}{}",
         cfg.targets.len(),
         if cfg.targets.len() == 1 { "" } else { "s" },
+        match cfg.alerts.len() {
+            0 => String::new(),
+            1 => "1 alert rule, ".to_string(),
+            n => format!("{n} alert rules, "),
+        },
         cfg.server.max_pps,
         cfg.server.vantage,
         match warnings {

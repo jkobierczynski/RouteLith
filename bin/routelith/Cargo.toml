@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 clap.workspace = true
+rl-alert.workspace = true
 rl-core.workspace = true
 rl-probe.workspace = true
 rl-render.workspace = true

@@ -11,6 +11,7 @@ repository = "https://github.com/jkobierczynski/routelith"
 publish = false
 
 [workspace.dependencies]
+rl-alert = { path = "crates/rl-alert" }
 rl-core = { path = "crates/rl-core" }
 rl-sys = { path = "crates/rl-sys" }
 rl-probe = { path = "crates/rl-probe" }

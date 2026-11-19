@@ -1,0 +1,19 @@
+[package]
+name = "rl-alert"
+description = "Routelith: alert rule engine (thresholds with hysteresis, SmokePing patterns)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rl-core.workspace = true
+rl-store.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

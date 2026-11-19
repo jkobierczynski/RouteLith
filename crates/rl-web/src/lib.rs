@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+mod alerts;
 mod api;
 mod host;
 mod metrics;
@@ -27,6 +28,7 @@ use axum::routing::get;
 use rl_store::{Reader, SeriesKey};
 use tokio::net::TcpListener;
 
+pub use alerts::{AlertBoard, RuleInfo};
 pub use host::{HostHealth, LatestHost, NicTotal};
 pub use metrics::MetricsWriter;
 
@@ -135,6 +137,8 @@ pub struct AppState {
     pub vantage: String,
     pub started: Instant,
     pub extra_metrics: Option<ExtraMetrics>,
+    /// Alert rules and the alerts raised now.
+    pub alerts: Arc<AlertBoard>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -157,6 +161,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/series", get(api::series))
         .route("/api/v1/series/{id}/data", get(api::data))
         .route("/api/v1/health", get(host::history))
+        .route("/api/v1/alerts", get(alerts::alerts))
+        .route("/api/v1/events", get(alerts::events))
         .route("/api/v1/render/{file}", get(api::render))
         .fallback(api::not_found)
         .layer(axum::middleware::map_response(security_headers))

@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::alerting::Alerting;
 use clap::Args;
 use rl_core::config::{self, Config, Family, ProbeConfig};
 use rl_probe::{
@@ -170,6 +171,26 @@ pub(crate) async fn serve(
         return ExitCode::from(2);
     }
 
+    // Alerts: the engine, its event log, and the state of the last run.
+    let alert_series: Vec<crate::alerting::SeriesAlerts> = plans
+        .iter()
+        .zip(ids.iter().zip(&keys))
+        .map(|(p, (&id, key))| crate::alerting::SeriesAlerts {
+            id,
+            key: key.clone(),
+            step_ms: u64::try_from(p.schedule.step.as_millis()).unwrap_or(u64::MAX),
+            rules: p.alerts.clone(),
+        })
+        .collect();
+    let alerting = match crate::alerting::start(&cfg, &alert_series, now_ms()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("routelith server: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let board = alerting.board.clone();
+
     // The HTTP side: bind now, so a port in use stops start-up.
     let latest = Arc::new(Latest::default());
     let host = Arc::new(LatestHost::default());
@@ -201,6 +222,7 @@ pub(crate) async fn serve(
                 vantage: cfg.server.vantage.clone(),
                 started: Instant::now(),
                 extra_metrics: Some(extra_metrics(stats.clone(), store_stats.clone())),
+                alerts: board.clone(),
             };
             Some((addr, listener, rl_web::router(Arc::new(state))))
         }
@@ -212,7 +234,8 @@ pub(crate) async fn serve(
     let store_latest = latest.clone();
     let shared_counters = store_stats.clone();
     let store = std::thread::spawn(move || {
-        let r = store_loop(writer, &rx, &store_latest, &shared_counters);
+        let mut alerting = alerting;
+        let r = store_loop(writer, &rx, &store_latest, &shared_counters, &mut alerting);
         let _ = store_done_tx.send(());
         r
     });
@@ -418,6 +441,8 @@ struct SeriesPlan {
     group: String,
     schedule: rl_core::config::Schedule,
     probe: ProbeConfig,
+    /// Alert rules that apply.
+    alerts: Vec<String>,
 }
 
 /// One probe instance per distinct probe configuration, all sharing the
@@ -457,6 +482,7 @@ fn series_plans(cfg: &Config) -> Vec<SeriesPlan> {
                 family,
                 schedule: t.schedule,
                 probe: t.probe.clone(),
+                alerts: t.alerts.clone(),
             });
         }
     }
@@ -516,9 +542,18 @@ fn store_loop(
     rx: &mpsc::Receiver<Completed>,
     latest: &Latest,
     counters: &Mutex<StoreCounters>,
+    alerting: &mut Alerting,
 ) -> Result<u64, rl_store::StoreError> {
     let (mut late, mut rejected) = (0u64, 0u64);
-    let result = store_rounds(&mut w, rx, latest, counters, &mut late, &mut rejected);
+    let result = store_rounds(
+        &mut w,
+        rx,
+        latest,
+        counters,
+        alerting,
+        &mut late,
+        &mut rejected,
+    );
     if late > 0 {
         eprintln!(
             "routelith server: store: {late} round(s) were not newer than the last one and were dropped"
@@ -526,6 +561,7 @@ fn store_loop(
     }
     result?;
     w.close()?;
+    alerting.stopped(now_ms());
     Ok(rejected)
 }
 
@@ -534,6 +570,7 @@ fn store_rounds(
     rx: &mpsc::Receiver<Completed>,
     latest: &Latest,
     counters: &Mutex<StoreCounters>,
+    alerting: &mut Alerting,
     late: &mut u64,
     rejected: &mut u64,
 ) -> Result<(), rl_store::StoreError> {
@@ -544,10 +581,14 @@ fn store_rounds(
         match rx.recv_timeout(wait) {
             Ok(c) => match stored(&c).and_then(|r| {
                 let newest = latest_round(&c, &r);
-                w.append(c.series, r).map(|a| (a, newest))
+                // The writer takes the round; alerts need it after.
+                w.append(c.series, r.clone()).map(|a| (a, newest, r))
             }) {
-                Ok((Appended::Stored, newest)) => latest.record(c.series, newest),
-                Ok((Appended::Late, _)) => *late += 1,
+                Ok((Appended::Stored, newest, r)) => {
+                    latest.record(c.series, newest);
+                    alerting.round(c.series, &r);
+                }
+                Ok((Appended::Late, _, _)) => *late += 1,
                 Err(rl_store::StoreError::InvalidRound(msg)) => {
                     *rejected += 1;
                     if last_invalid.as_deref() != Some(msg) {
@@ -571,6 +612,7 @@ fn store_rounds(
                 writer: w.stats(),
                 wal_bytes: w.wal_bytes(),
                 rejected: *rejected,
+                event_errors: alerting.write_errors,
             };
         }
     }
@@ -582,6 +624,8 @@ struct StoreCounters {
     writer: WriterStats,
     wal_bytes: u64,
     rejected: u64,
+    /// Events the event log could not take.
+    event_errors: u64,
 }
 
 /// The API's view of the series.
@@ -664,7 +708,7 @@ fn extra_metrics(stats: Arc<Stats>, store: Arc<Mutex<StoreCounters>>) -> rl_web:
         let s = stats.snapshot(false);
         let st = *store.lock().unwrap_or_else(PoisonError::into_inner);
         #[allow(clippy::cast_precision_loss)]
-        let counters: [(&str, &str, u64); 11] = [
+        let counters: [(&str, &str, u64); 12] = [
             (
                 "routelith_rounds_total",
                 "Rounds the scheduler finished.",
@@ -719,6 +763,11 @@ fn extra_metrics(stats: Arc<Stats>, store: Arc<Mutex<StoreCounters>>) -> rl_web:
                 "routelith_store_files_expired_total",
                 "Files deleted by retention.",
                 st.writer.expired_files,
+            ),
+            (
+                "routelith_event_log_errors_total",
+                "Events (alerts, address changes) that could not be written to the event log.",
+                st.event_errors,
             ),
         ];
         for (name, help, v) in counters {
@@ -929,7 +978,16 @@ mod tests {
         drop(tx);
         let latest = Latest::default();
         let counters = Mutex::new(StoreCounters::default());
-        assert_eq!(store_loop(w, &rx, &latest, &counters).unwrap(), 1);
+        let src = format!(
+            "[server]\ndata_dir = {:?}\n[[group]]\nname = \"g\"\n[[group.target]]\nname = \"t\"\nhost = \"192.0.2.1\"\n",
+            dir.path().display().to_string()
+        );
+        let cfg = config::parse(&src).config.unwrap();
+        let mut alerting = crate::alerting::start(&cfg, &[], 0).unwrap();
+        assert_eq!(
+            store_loop(w, &rx, &latest, &counters, &mut alerting).unwrap(),
+            1
+        );
         let rounds = rl_store::Reader::open(dir.path())
             .unwrap()
             .read(id, 0, i64::MAX)
