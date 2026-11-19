@@ -4,6 +4,14 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+# hickory-proto 0.25 (the last release for our 1.85 MSRV): both advisories
+# are in its DNSSEC validation, which is behind the dnssec-ring and
+# dnssec-aws-lc-rs features. Routelith builds it with only "std", so that
+# code is not compiled. Drop these when moving to 0.26 (Rust 1.88).
+ignore = [
+    { id = "RUSTSEC-2026-0550", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+    { id = "RUSTSEC-2026-0551", reason = "DNSSEC validation is not compiled: hickory-proto is built without its dnssec-* features" },
+]
 
 [licenses]
 # Licences compatible with GPL-3.0-or-later.
