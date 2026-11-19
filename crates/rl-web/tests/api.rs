@@ -269,6 +269,7 @@ async fn the_ui_is_served_from_the_binary() {
     for (path, ty) in [
         ("/ui/app.js", "text/javascript"),
         ("/ui/style.css", "text/css"),
+        ("/ui/icon.svg", "image/svg+xml"),
     ] {
         let (st, h, body) = get(&f.router, path).await;
         assert_eq!(st, StatusCode::OK, "{path}");
