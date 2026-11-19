@@ -645,9 +645,15 @@ impl Writer {
         log: bool,
     ) -> Result<Appended, StoreError> {
         let day = day_of(round.ts_ms);
+        // Older than every tier keeps: once the files that marked such a day
+        // as rolled up have expired, nothing else says it is closed.
+        let retained_from = self
+            .rolled_at
+            .map(|cutoff| cutoff.saturating_sub(self.opts.r1d_days));
         let s = self.series.entry(id).or_default();
         let late = s.last_ts.is_some_and(|t| round.ts_ms <= t)
-            || s.sealed_through.is_some_and(|d| day <= d);
+            || s.sealed_through.is_some_and(|d| day <= d)
+            || retained_from.is_some_and(|d| day < d);
         if late {
             self.stats.late += 1;
             return Ok(Appended::Late);

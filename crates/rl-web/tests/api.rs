@@ -189,6 +189,15 @@ async fn bad_requests_are_json_errors() {
             format!("/api/v1/render/{}.svg?from=abc", f.id),
             StatusCode::BAD_REQUEST,
         ),
+        (
+            format!("/api/v1/render/{}.svg?points=abc", f.id),
+            StatusCode::BAD_REQUEST,
+        ),
+        // A `from` computed from `range` before the year 0000.
+        (
+            format!("/api/v1/render/{}.svg?range=3h&to=-62167219200000", f.id),
+            StatusCode::BAD_REQUEST,
+        ),
         // Past the years the store holds (and the renderer's tick loop).
         (
             format!(

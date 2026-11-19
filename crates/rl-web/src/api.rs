@@ -109,6 +109,13 @@ impl RangeQuery {
                 ));
             }
         };
+        // `range` computes `from`, which must be in the store's years too.
+        if !in_store(from) {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "from and to must be within the years 0000 to 9999",
+            ));
+        }
         if from >= to || to.saturating_sub(from) > MAX_SPAN_MS {
             return Err(error(
                 StatusCode::BAD_REQUEST,
