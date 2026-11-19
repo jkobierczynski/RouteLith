@@ -85,7 +85,9 @@
           <Component Id="DataFolder" Guid="F49C4B03-8D2A-4726-A087-EDA0C9A157DE"
                      Permanent="yes" KeyPath="yes">
             <CreateFolder>
-              <util:PermissionEx User="LocalService" Domain="NT AUTHORITY"
+              <!-- No Domain: WixUtilExtension resolves "LocalService" as the
+                   well-known account only when the domain is empty. -->
+              <util:PermissionEx User="LocalService"
                                  GenericRead="yes" GenericWrite="yes"
                                  GenericExecute="yes" Delete="yes"/>
             </CreateFolder>

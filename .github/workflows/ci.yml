@@ -184,7 +184,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           function Msi($verb, $log) {
             $p = Start-Process msiexec -Wait -PassThru -ArgumentList $verb, 'target\wix\routelith.msi', '/qn', '/l*v', $log
-            if ($p.ExitCode -ne 0) { Get-Content $log -Tail 100; throw "msiexec $verb exited with $($p.ExitCode)" }
+            if ($p.ExitCode -ne 0) {
+              # The failing action and Windows Installer's error messages.
+              Select-String -Path $log -Pattern 'Return value 3', '^Error \d+', 'Error \d{4}\.' -Context 15, 2 | Out-String -Width 300
+              if (Test-Path C:\ProgramData\Routelith\routelith.log) { Get-Content C:\ProgramData\Routelith\routelith.log }
+              throw "msiexec $verb exited with $($p.ExitCode)"
+            }
           }
           Msi '/i' 'install.log'
           $svc = Get-CimInstance Win32_Service -Filter "Name='Routelith'"
