@@ -167,7 +167,10 @@ pub struct ImportedHistory {
 pub struct ImportReport {
     pub hourly: usize,
     pub daily: usize,
+    /// Rounds stored.
     pub rounds: usize,
+    /// Rounds dropped as older than every tier keeps.
+    pub late: usize,
 }
 
 /// Why imported history cannot be stored as it is, if it cannot.
@@ -598,6 +601,11 @@ impl Writer {
             let day = |p: &RollupPoint| p.ts_ms.div_euclid(layout::DAY_MS);
             let mut last = None;
             let (mut h, mut d) = (0, 0);
+            let write_day = |w: &mut Self, today: i64, hourly, daily| {
+                // r1h first: an r1d point marks the day as rolled up.
+                rollup::append_day(&w.dir, series, Tier::R1h, today, hourly)?;
+                rollup::append_day(&w.dir, series, Tier::R1d, today, daily)
+            };
             while d < history.daily.len() {
                 let today = day(&history.daily[d]);
                 let h_end = h + history.hourly[h..]
@@ -608,21 +616,36 @@ impl Writer {
                     .iter()
                     .take_while(|p| day(p) == today)
                     .count();
-                // r1h first: an r1d point marks the day as rolled up.
-                rollup::append_day(&w.dir, series, Tier::R1h, today, &history.hourly[h..h_end])?;
-                rollup::append_day(&w.dir, series, Tier::R1d, today, &history.daily[d..d_end])?;
+                let written = write_day(
+                    w,
+                    today,
+                    &history.hourly[h..h_end],
+                    &history.daily[d..d_end],
+                );
+                if let Err(e) = written {
+                    // The series held nothing before: take the partial
+                    // rollups away again, so the same import can be retried.
+                    for tier in Tier::ALL {
+                        let _ = std::fs::remove_dir_all(rollup::tier_dir(&w.dir, series, tier));
+                    }
+                    return Err(e);
+                }
                 (h, d, last) = (h_end, d_end, Some(today));
             }
             // Rounds on these days would be dropped by the next roll-up.
             let s = w.series.entry(series).or_default();
             s.sealed_through = s.sealed_through.max(last);
+            let mut stored = 0;
             for r in &history.rounds {
-                w.ingest(series, r.clone(), true)?;
+                if w.ingest(series, r.clone(), true)? == Appended::Stored {
+                    stored += 1;
+                }
             }
             Ok(ImportReport {
                 hourly: history.hourly.len(),
                 daily: history.daily.len(),
-                rounds: history.rounds.len(),
+                rounds: stored,
+                late: history.rounds.len() - stored,
             })
         })
     }

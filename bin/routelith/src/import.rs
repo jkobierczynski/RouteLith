@@ -91,7 +91,8 @@ fn import(args: &SmokepingArgs) -> Result<String, (u8, String)> {
     let path = &args.file;
     let xml = std::fs::read_to_string(path).map_err(|e| (2, format!("{}: {e}", path.display())))?;
     let dump = parse(&xml).map_err(|e| (1, format!("{}: {e}", path.display())))?;
-    let conv = convert(&dump).map_err(|e| (1, format!("{}: {e}", path.display())))?;
+    let today = now_ms().div_euclid(DAY_S * 1000);
+    let conv = convert(&dump, today).map_err(|e| (1, format!("{}: {e}", path.display())))?;
     let h = &conv.history;
     if h.rounds.is_empty() && h.daily.is_empty() {
         return Err((
@@ -137,7 +138,7 @@ fn import(args: &SmokepingArgs) -> Result<String, (u8, String)> {
         _ => "nothing".to_string(),
     };
     Ok(format!(
-        "imported {key}: {} rounds ({}), {} hourly and {} daily points ({}){}",
+        "imported {key}: {} rounds ({}), {} hourly and {} daily points ({}){}{}",
         report.rounds,
         span(
             h.rounds.first().map(|r| r.ts_ms),
@@ -149,6 +150,14 @@ fn import(args: &SmokepingArgs) -> Result<String, (u8, String)> {
             h.daily.first().map(|p| p.ts_ms),
             h.daily.last().map(|p| p.ts_ms)
         ),
+        if report.late > 0 {
+            format!(
+                "; {} rounds older than the store keeps were left out",
+                report.late
+            )
+        } else {
+            String::new()
+        },
         if conv.dropped_rounds > 0 {
             format!(
                 "; {} raw rows of a partly rolled-up day were left to the hourly points",
@@ -297,9 +306,16 @@ struct Converted {
     dropped_rounds: usize,
 }
 
-/// The replies of one row: RTTs in µs, ascending, and how many were sent
-/// per round, or `None` if the row is unknown.
-fn replies(row: &[f64], loss_col: usize, ping_cols: &[usize]) -> Option<(Vec<u32>, f64)> {
+/// The replies of one row: RTTs in µs, ascending, and the loss column
+/// (lost pings per round), or `None` if the row is unknown. `raw` rows
+/// are trimmed to the reply count their loss gives; consolidated rows
+/// keep every known value, as their loss is an average over rounds.
+fn replies(
+    row: &[f64],
+    loss_col: usize,
+    ping_cols: &[usize],
+    raw: bool,
+) -> Option<(Vec<u32>, f64)> {
     let loss = row[loss_col];
     if !loss.is_finite() {
         return None;
@@ -312,10 +328,12 @@ fn replies(row: &[f64], loss_col: usize, ping_cols: &[usize]) -> Option<(Vec<u32
         // Seconds to µs; RRD values are well inside u32 (71 minutes).
         .map(|v| (v * 1e6).round().min(f64::from(u32::MAX)) as u32)
         .collect();
-    // The loss column is the count per round; a consolidated row
-    // averages it, so it may be fractional.
     let loss = loss.clamp(0.0, n as f64);
-    let want = n - (loss.round() as usize).min(n);
+    let want = if raw {
+        n - (loss.round() as usize).min(n)
+    } else {
+        n
+    };
     // Usually the same. Where they differ, a lost ping's slot took a
     // value from the neighbouring round (rrdtool blends the two rounds a
     // step overlaps). SmokePing puts lost pings at both ends of the slots,
@@ -330,7 +348,9 @@ fn replies(row: &[f64], loss_col: usize, ping_cols: &[usize]) -> Option<(Vec<u32
     Some((known, loss))
 }
 
-fn convert(d: &Dump) -> Result<Converted, String> {
+/// `today` is the current UTC day: nothing of it is rolled up, so live
+/// rounds can still be added to it.
+fn convert(d: &Dump, today: i64) -> Result<Converted, String> {
     let col = |name: &str| d.ds.iter().position(|n| n == name);
     let loss_col = col("loss");
     let mut pings: Vec<(u32, usize)> =
@@ -364,12 +384,13 @@ fn convert(d: &Dump) -> Result<Converted, String> {
     // Rows with a value, as (start s, width s, point).
     let mut rows: Vec<(i64, i64, RollupPoint)> = Vec::new();
     for (&w, r) in &by_width {
-        if r.pdp_per_row == 1 {
+        // Rows that fit neither an hour nor a day evenly are not used.
+        if r.pdp_per_row == 1 || w > DAY_S || DAY_S % w != 0 {
             continue;
         }
         let pdp = u32::try_from(r.pdp_per_row).unwrap_or(u32::MAX);
         for (start, row) in r.timed_rows(d) {
-            let Some((rtts, loss)) = replies(row, loss_col, &ping_cols) else {
+            let Some((rtts, loss)) = replies(row, loss_col, &ping_cols, false) else {
                 continue;
             };
             let total = f64::from(pdp) * f64::from(sent);
@@ -395,7 +416,7 @@ fn convert(d: &Dump) -> Result<Converted, String> {
     let mut rounds: Vec<StoredRound> = Vec::new();
     if let Some(raw) = by_width.get(&d.step_s).filter(|r| r.pdp_per_row == 1) {
         for (start, row) in raw.timed_rows(d) {
-            if let Some((rtts, _)) = replies(row, loss_col, &ping_cols) {
+            if let Some((rtts, _)) = replies(row, loss_col, &ping_cols, true) {
                 rounds.push(StoredRound {
                     ts_ms: start * 1000,
                     sent,
@@ -409,16 +430,22 @@ fn convert(d: &Dump) -> Result<Converted, String> {
         }
     }
     // A day is rolled up or raw, not both: raw rounds start on their
-    // first day if the raw archive covers all of it, or if the coarser
-    // archives have nothing that day; else on the next day.
+    // first day if the raw archive covers all of it, if the coarser
+    // archives have nothing that day, or if it is today (a rolled-up day
+    // is closed to the live rounds that follow); else on the next day.
     let day_of = |s: i64| s.div_euclid(DAY_S);
+    rows.retain(|(s, _, _)| day_of(*s) < today);
     let mut dropped = 0;
     if let Some(first) = rounds.first() {
         let first_s = first.ts_ms / 1000;
         let d0 = day_of(first_s);
         let partial = first_s > d0 * DAY_S;
         let covered = rows.iter().any(|(s, _, _)| day_of(*s) == d0);
-        let raw_from = if partial && covered { d0 + 1 } else { d0 };
+        let raw_from = if partial && covered && d0 < today {
+            d0 + 1
+        } else {
+            d0
+        };
         let before = rounds.len();
         rounds.retain(|r| day_of(r.ts_ms / 1000) >= raw_from);
         dropped = before - rounds.len();
@@ -509,7 +536,7 @@ mod tests {
     #[test]
     fn a_real_dump_converts() {
         let d = parse(FIXTURE).unwrap();
-        let c = convert(&d).unwrap();
+        let c = convert(&d, i64::MAX).unwrap();
         let h = &c.history;
         // The raw archive holds the last 12 hours, all on 2025-11-22, a
         // day the hourly archive also covers: they become hourly points.
@@ -549,7 +576,7 @@ mod tests {
         let mut d = parse(FIXTURE).unwrap();
         // Keep only the raw archive, so its rows become rounds.
         d.rras.retain(|r| r.pdp_per_row == 1);
-        let c = convert(&d).unwrap();
+        let c = convert(&d, i64::MAX).unwrap();
         let rounds = &c.history.rounds;
         assert_eq!(rounds.len(), 144);
         let rows: Vec<_> = d.rras[0].timed_rows(&d).collect();
@@ -590,11 +617,11 @@ mod tests {
             ],
         };
         // 36 raw rows: the last 18 hours, a partial day 9.
-        let c = convert(&dump(36)).unwrap();
+        let c = convert(&dump(36), i64::MAX).unwrap();
         assert!(c.history.rounds.is_empty());
         assert_eq!(c.history.daily.len(), 3);
         // 96 raw rows: days 8 and 9 whole; hourly points end on day 7.
-        let c = convert(&dump(96)).unwrap();
+        let c = convert(&dump(96), i64::MAX).unwrap();
         let h = &c.history;
         assert_eq!((h.rounds.len(), c.dropped_rounds), (96, 0));
         assert_eq!(h.rounds[0].ts_ms, 8 * DAY_S * 1000);
@@ -603,6 +630,85 @@ mod tests {
         // Half a lost ping per round, two rounds: one of four lost.
         assert_eq!((h.hourly[0].sent, h.hourly[0].received), (4, 3));
         assert_eq!(h.rounds[0].rtts_us, [10_000, 20_000]);
+    }
+
+    #[test]
+    fn today_stays_open_for_live_rounds() {
+        let dump = Dump {
+            step_s: 1800,
+            last_update_s: 10 * DAY_S,
+            ds: vec!["loss".into(), "ping1".into(), "ping2".into()],
+            rras: vec![
+                Rra {
+                    cf: "AVERAGE".into(),
+                    pdp_per_row: 1,
+                    rows: vec![vec![0.0, 0.01, 0.02]; 36],
+                },
+                Rra {
+                    cf: "AVERAGE".into(),
+                    pdp_per_row: 2,
+                    rows: vec![vec![0.0, 0.01, 0.02]; 72],
+                },
+            ],
+        };
+        // Day 9 is today: its raw rounds are kept, nothing of it rolled up.
+        let c = convert(&dump, 9).unwrap();
+        let h = &c.history;
+        assert_eq!((h.rounds.len(), c.dropped_rounds), (36, 0));
+        assert_eq!(h.daily.len(), 2);
+        assert!(h.daily.iter().all(|p| p.ts_ms < 9 * DAY_S * 1000));
+    }
+
+    #[test]
+    fn archives_that_fit_no_bucket_do_not_replace_raw_rounds() {
+        // 7 steps of 300 s: 2100 s rows fit neither an hour nor a day.
+        let dump = Dump {
+            step_s: 300,
+            last_update_s: 10 * DAY_S,
+            ds: vec!["loss".into(), "ping1".into()],
+            rras: vec![
+                Rra {
+                    cf: "AVERAGE".into(),
+                    pdp_per_row: 1,
+                    rows: vec![vec![0.0, 0.01]; 100],
+                },
+                Rra {
+                    cf: "AVERAGE".into(),
+                    pdp_per_row: 7,
+                    rows: vec![vec![0.0, 0.01]; 100],
+                },
+            ],
+        };
+        let c = convert(&dump, i64::MAX).unwrap();
+        assert_eq!((c.history.rounds.len(), c.dropped_rounds), (100, 0));
+        assert!(c.history.daily.is_empty());
+    }
+
+    #[test]
+    fn consolidated_rows_keep_their_replies_at_high_loss() {
+        // 12 rounds of 5 pings, 4.5 lost on average: 6 of 60 answered,
+        // and the one known slot average is kept.
+        let dump = Dump {
+            step_s: 300,
+            last_update_s: 10 * DAY_S,
+            ds: vec![
+                "loss".into(),
+                "ping1".into(),
+                "ping2".into(),
+                "ping3".into(),
+                "ping4".into(),
+                "ping5".into(),
+            ],
+            rras: vec![Rra {
+                cf: "AVERAGE".into(),
+                pdp_per_row: 12,
+                rows: vec![vec![4.5, f64::NAN, f64::NAN, 0.02, f64::NAN, f64::NAN]],
+            }],
+        };
+        let c = convert(&dump, i64::MAX).unwrap();
+        let p = &c.history.hourly[0];
+        assert_eq!((p.sent, p.received), (60, 6));
+        assert_eq!(p.quantiles_us, vec![20_000; rl_store::QUANTILES]);
     }
 
     #[test]
@@ -641,7 +747,11 @@ mod tests {
         assert!(parse("<html/>").unwrap_err().contains("rrdtool dump"));
         let mut d = parse(FIXTURE).unwrap();
         d.ds[1] = "lost".into();
-        assert!(convert(&d).unwrap_err().contains("not a SmokePing RRD"));
+        assert!(
+            convert(&d, i64::MAX)
+                .unwrap_err()
+                .contains("not a SmokePing RRD")
+        );
     }
 
     #[test]
