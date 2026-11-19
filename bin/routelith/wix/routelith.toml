@@ -14,8 +14,15 @@ data_dir = 'C:\ProgramData\Routelith\data'
 step  = "300s"   # one round per step; must divide a day
 pings = 20       # samples per round
 
-# Only this machine is measured until you add your own targets, for
-# example your gateway, a DNS server or a website:
+[[group]]
+name = "Local"
+
+  [[group.target]]
+  name = "loopback"
+  host = "127.0.0.1"
+
+# Only this machine is measured until you add your own targets to this
+# group, for example your gateway, a DNS server or a website:
 #
 #   [[group.target]]
 #   name = "gateway"
@@ -25,10 +32,3 @@ pings = 20       # samples per round
 #   name  = "web"
 #   probe = "http"
 #   url   = "https://www.example.org/"
-
-[[group]]
-name = "Local"
-
-  [[group.target]]
-  name = "loopback"
-  host = "127.0.0.1"

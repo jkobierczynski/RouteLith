@@ -108,6 +108,8 @@ mod windows {
     use crate::server::{self, ServerArgs};
 
     const ACCOUNT: &str = r"NT AUTHORITY\LocalService";
+    /// The LocalService SID, so icacls works on non-English Windows too.
+    const ACCOUNT_SID: &str = "*S-1-5-19";
     /// Seconds between stats lines in the log (the console default is 60).
     const STATS_EVERY: u64 = 3600;
 
@@ -129,7 +131,16 @@ mod windows {
         // The service account must be able to read the configuration and
         // write its data and log.
         grant(&config, "RX")?;
-        let data_dir = std::path::absolute(&cfg.server.data_dir)?;
+        // The service starts in System32, so a relative data_dir would
+        // name a different folder there than the one granted here.
+        let data_dir = PathBuf::from(&cfg.server.data_dir);
+        if !data_dir.is_absolute() {
+            return Err(io::Error::other(format!(
+                "server.data_dir in {} must be an absolute path for the service, not {}",
+                config.display(),
+                data_dir.display()
+            )));
+        }
         std::fs::create_dir_all(&data_dir)?;
         grant(&data_dir, "(OI)(CI)M")?;
         if let Some(dir) = log.parent() {
@@ -278,7 +289,7 @@ mod windows {
         let status = Command::new("icacls")
             .arg(path)
             .arg("/grant")
-            .arg(OsString::from(format!("{ACCOUNT}:{rights}")))
+            .arg(OsString::from(format!("{ACCOUNT_SID}:{rights}")))
             .arg("/Q")
             .status()?;
         if status.success() {
