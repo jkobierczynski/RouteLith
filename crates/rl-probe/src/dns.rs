@@ -158,7 +158,7 @@ impl Probe for DnsProbe {
 /// One query.
 async fn sample(p: &Prepared, dest: SocketAddr, timeout: Duration) -> Sample {
     let id = random_u64() as u16;
-    let query = match build_query(p, id) {
+    let (query, question) = match build_query(p, id) {
         Ok(q) => q,
         Err(e) => return Sample::Error(SampleError::SendFailed(e)),
     };
@@ -182,7 +182,7 @@ async fn sample(p: &Prepared, dest: SocketAddr, timeout: Duration) -> Sample {
         Ok(Err(Failure::Remote(e))) => return Sample::Error(SampleError::Other(e)),
         Ok(Ok(r)) => r,
     };
-    match check(p, &response, id) {
+    match check(p, &response, id, &question) {
         Ok(()) => Sample::Ok {
             rtt_us: u32::try_from(rtt.as_micros()).unwrap_or(u32::MAX),
         },
@@ -268,23 +268,35 @@ async fn tcp_exchange(dest: SocketAddr, query: &[u8]) -> Result<Vec<u8>, Failure
     Ok(buf)
 }
 
-fn build_query(p: &Prepared, id: u16) -> Result<Vec<u8>, String> {
+/// The query's wire form and the question it asks ({rand} expanded).
+fn build_query(p: &Prepared, id: u16) -> Result<(Vec<u8>, Query), String> {
     let name = expand_rand(&p.cfg.query);
-    let name = Name::from_ascii(&name).map_err(|e| format!("bad query name {name:?}: {e}"))?;
+    let mut name = Name::from_ascii(&name).map_err(|e| format!("bad query name {name:?}: {e}"))?;
+    // Sent as written; marked absolute so it compares equal to the name
+    // parsed back from the response.
+    name.set_fqdn(true);
+    let question = Query::query(name, p.qtype);
     let mut msg = Message::new();
     msg.set_id(id)
         .set_message_type(MessageType::Query)
         .set_op_code(OpCode::Query)
         .set_recursion_desired(p.cfg.recursion)
-        .add_query(Query::query(name, p.qtype));
-    msg.to_vec().map_err(|e| e.to_string())
+        .add_query(question.clone());
+    let bytes = msg.to_vec().map_err(|e| e.to_string())?;
+    Ok((bytes, question))
 }
 
-/// Check a response against the expected rcode and answer set.
-fn check(p: &Prepared, bytes: &[u8], id: u16) -> Result<(), SampleError> {
+/// Check a response against the question sent, the expected rcode and
+/// the answer set.
+fn check(p: &Prepared, bytes: &[u8], id: u16, question: &Query) -> Result<(), SampleError> {
     let msg = Message::from_vec(bytes)
         .map_err(|e| SampleError::Other(format!("malformed response: {e}")))?;
-    if msg.id() != id || msg.message_type() != MessageType::Response {
+    // Name comparison ignores case, as DNS does (resolvers may echo 0x20
+    // mixed case).
+    if msg.id() != id
+        || msg.message_type() != MessageType::Response
+        || msg.queries() != std::slice::from_ref(question)
+    {
         return Err(SampleError::Other(
             "response does not match the query".into(),
         ));
@@ -301,6 +313,12 @@ fn check(p: &Prepared, bytes: &[u8], id: u16) -> Result<(), SampleError> {
         )));
     }
     if let Some(expected) = &p.answers {
+        // A truncated answer may hold only part of the set (RFC 2181 §9).
+        if msg.truncated() {
+            return Err(SampleError::DnsMismatch(
+                "truncated answer, so the set cannot be checked; use transport = \"tcp\"".into(),
+            ));
+        }
         let got: BTreeSet<String> = msg
             .answers()
             .iter()
@@ -439,6 +457,57 @@ mod tests {
             }
         });
         (port, rx)
+    }
+
+    #[test]
+    fn check_matches_the_question_and_rejects_truncation() {
+        let mut c = cfg("example.com");
+        c.expect_answers = Some(vec!["192.0.2.1".into()]);
+        let probe = DnsProbe::new(c).unwrap();
+        let p = &*probe.config;
+        let (query, question) = build_query(p, 7).unwrap();
+        let (resp, _) = answer(&query);
+        check(p, &resp, 7, &question).unwrap();
+
+        // A resolver echoing the name in mixed case (0x20) still matches.
+        let mut msg = Message::from_vec(&resp).unwrap();
+        let mixed = Query::query(Name::from_ascii("ExAmPle.CoM.").unwrap(), RecordType::A);
+        msg.take_queries();
+        msg.add_query(mixed);
+        check(p, &msg.to_vec().unwrap(), 7, &question).unwrap();
+
+        // An answer to another question does not.
+        let mut msg = Message::from_vec(&resp).unwrap();
+        msg.take_queries();
+        msg.add_query(Query::query(
+            Name::from_ascii("other.com.").unwrap(),
+            RecordType::A,
+        ));
+        let e = check(p, &msg.to_vec().unwrap(), 7, &question).unwrap_err();
+        assert!(
+            matches!(&e, SampleError::Other(m) if m.contains("does not match")),
+            "{e:?}"
+        );
+        let mut msg = Message::from_vec(&resp).unwrap();
+        msg.take_queries();
+        msg.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::AAAA,
+        ));
+        assert!(check(p, &msg.to_vec().unwrap(), 7, &question).is_err());
+
+        // A truncated answer cannot be compared with the expected set.
+        let mut msg = Message::from_vec(&resp).unwrap();
+        msg.set_truncated(true);
+        let e = check(p, &msg.to_vec().unwrap(), 7, &question).unwrap_err();
+        assert!(
+            matches!(&e, SampleError::DnsMismatch(m) if m.contains("truncated")),
+            "{e:?}"
+        );
+
+        // Without expected answers only the rcode matters.
+        let probe = DnsProbe::new(cfg("example.com")).unwrap();
+        check(&probe.config, &msg.to_vec().unwrap(), 7, &question).unwrap();
     }
 
     #[test]
