@@ -43,6 +43,10 @@ pub struct HealthSample {
     /// One-minute load average at `t` (Linux).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load1: Option<f64>,
+    /// When the NIC counters could not be read for a while, the longer
+    /// span (ms) their deltas below cover instead of `interval_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nic_interval_ms: Option<i64>,
     /// Receive and transmit errors on all interfaces during the interval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nic_errors: Option<u64>,
@@ -131,12 +135,19 @@ impl HealthLog {
         }
         let dir = health_dir(data_dir, vantage);
         std::fs::create_dir_all(&dir)?;
+        // Make the names leading to it durable, whether this call created
+        // them or an earlier one that failed before syncing did.
+        for d in [dir.parent(), Some(data_dir)].into_iter().flatten() {
+            layout::sync_dir(d)?;
+        }
         Ok(Self {
             dir,
             keep_days,
             expired_at: None,
             expired_files: 0,
-            dir_unsynced: false,
+            // A day file left by a run that stopped before syncing its
+            // name: sync the directory on the first append regardless.
+            dir_unsynced: true,
         })
     }
 
@@ -251,6 +262,7 @@ mod tests {
         HealthSample {
             t,
             interval_ms: MIN,
+            nic_interval_ms: None,
             cpu_pct: Some(12.5),
             load1: Some(0.25),
             nic_errors: Some(1),
