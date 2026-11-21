@@ -31,6 +31,21 @@ the target's events; `/api/v1/alerts` lists the alerts raised now,
 alert plus raise and clear counters. Sending them to syslog, the Event Log, webhooks and e-mail comes
 next.
 
+A condition can follow the target's own history instead of a fixed value:
+`condition = "> baseline_p50_7d * 2 + 5ms"` compares with the median of the
+last week's hourly medians (`baseline_<p50|p90|min|max>_<1d|7d|28d>`, from
+the hourly tier, refreshed every hour; such a rule cannot raise until the
+window holds 24 hourly values, or 18 for a 1-day window). A target's
+`parent` (or a group's, for its other targets) names the target it depends
+on: a child alert raised while the parent has an alert raised is marked as
+suppressed. The mark is decided when the child's alert is raised, and its
+clear keeps it; a parent alert raised later does not mark it. `[[silence]]` tables
+mark alerts raised in a window (`start` and `end`) or a recurring one (an
+`rrule` with FREQ=DAILY or WEEKLY, BYDAY, BYHOUR and BYMINUTE, in UTC, plus a
+`duration`), for some targets, groups or rules. Suppressed and silenced
+alerts are still logged and shown, and outputs will not send them. See
+`examples/routelith.toml`.
+
 History from SmokePing comes over with `routelith ctl import smokeping`,
 with the server stopped. It reads `rrdtool dump` XML, so the RRD files can
 be dumped on the SmokePing machine and copied over:

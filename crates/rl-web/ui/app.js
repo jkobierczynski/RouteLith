@@ -324,8 +324,13 @@
 
   function showAlerts(panel, data) {
     const list = data.active;
-    panel.hidden = list.length === 0;
-    if (!list.length) return;
+    const silences = activeSilences(data);
+    panel.hidden = list.length === 0 && silences.length === 0;
+    if (panel.hidden) return;
+    if (!list.length) {
+      panel.replaceChildren(...silences);
+      return;
+    }
     panel.replaceChildren(
       el("h2", { text: list.length === 1 ? "1 alert raised" : list.length + " alerts raised" }),
       el(
@@ -346,11 +351,27 @@
                 " since " + fmtTime(a.since, data.now - a.since > 20 * 3600e3) +
                 " (" + fmtAge(data.now - a.since) + ")" +
                 (a.value !== undefined ? ", " + fmtValue(a.rule, a.value, data.rules) : ""),
-            })
+            }),
+            ...(a.silenced_by
+              ? [" ", el("span", { class: "badge quiet", text: "silenced: " + a.silenced_by, title: "Logged, not sent" })]
+              : []),
+            ...(a.suppressed_by
+              ? [" ", el("span", { class: "badge quiet", text: "suppressed: parent " + a.suppressed_by + " had an alert", title: "Logged, not sent" })]
+              : [])
           );
         })
-      )
+      ),
+      ...silences
     );
+  }
+
+  // A line naming the silences in force now, if any.
+  function activeSilences(data) {
+    const on = (data.silences || []).filter((x) => x.active);
+    if (!on.length) return [];
+    return [
+      el("p", { class: "muted", text: "Silenced now: " + on.map((x) => x.name + " (" + x.summary + ")").join(", ") }),
+    ];
   }
 
   // Events of one target in the shown range, newest first.

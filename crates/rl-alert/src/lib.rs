@@ -10,7 +10,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use rl_core::alert::{AlertRule, Metric, Pattern, PatternValue, RuleKind, Threshold, all_hold};
+use rl_core::alert::{
+    AlertRule, Baseline, BaselineStat, Comparison, Metric, Pattern, PatternValue, RuleKind,
+    Threshold, eval,
+};
 use rl_store::{Event, EventKind};
 
 /// What a rule sees of one round.
@@ -96,6 +99,11 @@ pub struct ActiveAlert {
     pub since_ms: i64,
     /// The value that raised it, in the rule's unit.
     pub value: Option<f64>,
+    /// The silence it was raised under (§21.5 F6); set by the caller.
+    pub silenced_by: Option<String>,
+    /// The parent target that had an alert when it was raised; set by
+    /// the caller.
+    pub suppressed_by: Option<String>,
 }
 
 /// An alert raised or cleared by a round.
@@ -132,7 +140,11 @@ struct RuleState {
 pub struct Engine {
     rules: Vec<AlertRule>,
     series: HashMap<u64, Vec<RuleState>>,
+    /// Known baselines per series, by metric and baseline (§21.5 F5).
+    baselines: HashMap<u64, HashMap<(Metric, Baseline), f64>>,
 }
+
+const HOUR_MS: i64 = 3_600_000;
 
 impl Engine {
     /// `assign` lists, per series, the names of the rules that apply to
@@ -159,7 +171,58 @@ impl Engine {
                 series.insert(id, states);
             }
         }
-        Self { rules, series }
+        Self {
+            rules,
+            series,
+            baselines: HashMap::new(),
+        }
+    }
+
+    /// The metrics and baselines the rules of `series` use; empty when
+    /// none of them uses a baseline.
+    pub fn baselines_used(&self, series: u64) -> Vec<(Metric, Baseline)> {
+        let mut out: Vec<(Metric, Baseline)> = self
+            .series
+            .get(&series)
+            .into_iter()
+            .flatten()
+            .filter_map(|st| match &self.rules[st.rule].kind {
+                RuleKind::Threshold(t) => Some(t.baselines().into_iter().map(|b| (t.metric, b))),
+                RuleKind::Pattern(_) => None,
+            })
+            .flatten()
+            .collect();
+        out.sort_by_key(|(m, b)| (m.as_str(), *b));
+        out.dedup();
+        out
+    }
+
+    /// Recompute the baselines of `series` from its hourly values (one
+    /// [`RoundValues`] per hour, any order). Each covers the whole hours of
+    /// its window before the hour of `now_ms`, and stays unknown until the
+    /// window holds [`Baseline::min_hours`] values.
+    pub fn set_hourly(&mut self, series: u64, hourly: &[RoundValues], now_ms: i64) {
+        let hour = now_ms - now_ms.rem_euclid(HOUR_MS);
+        let mut known = HashMap::new();
+        for (metric, b) in self.baselines_used(series) {
+            let from = hour - i64::from(b.days) * 24 * HOUR_MS;
+            let mut v: Vec<f64> = hourly
+                .iter()
+                .filter(|r| r.ts_ms >= from && r.ts_ms < hour)
+                .filter_map(|r| r.metric(metric))
+                .collect();
+            if v.len() < b.min_hours() {
+                continue;
+            }
+            v.sort_by(f64::total_cmp);
+            known.insert((metric, b), stat(&v, b.stat));
+        }
+        self.baselines.insert(series, known);
+    }
+
+    /// A baseline of `series` for `metric`, if known.
+    pub fn baseline(&self, series: u64, metric: Metric, b: Baseline) -> Option<f64> {
+        self.baselines.get(&series)?.get(&(metric, b)).copied()
     }
 
     pub fn rules(&self) -> &[AlertRule] {
@@ -213,10 +276,14 @@ impl Engine {
         let Some(states) = self.series.get_mut(&series) else {
             return out;
         };
+        let known = self.baselines.get(&series);
         for st in states {
             let rule = &self.rules[st.rule];
             let t = match &rule.kind {
-                RuleKind::Threshold(t) => threshold(st, t, r),
+                RuleKind::Threshold(t) => {
+                    let base = |b: Baseline| known?.get(&(t.metric, b)).copied();
+                    threshold(st, t, r, &base)
+                }
                 RuleKind::Pattern(p) => pattern(st, p, r),
             };
             if let Some((raised, since_ms, value, what)) = t {
@@ -251,6 +318,8 @@ impl Engine {
                         rule: self.rules[st.rule].name.clone(),
                         since_ms,
                         value,
+                        silenced_by: None,
+                        suppressed_by: None,
                     })
                 })
             })
@@ -269,12 +338,31 @@ fn push(h: &mut VecDeque<PatternValue>, v: PatternValue, window: usize) {
 
 type Change = (bool, i64, Option<f64>, String);
 
-fn threshold(st: &mut RuleState, t: &Threshold, r: &RoundValues) -> Option<Change> {
+/// A statistic of values in ascending order (not empty).
+fn stat(v: &[f64], s: BaselineStat) -> f64 {
+    let n = v.len();
+    match s {
+        BaselineStat::Min => v[0],
+        BaselineStat::Max => v[n - 1],
+        // As a round's median: the mean of the middle two for an even count.
+        BaselineStat::P50 if n % 2 == 0 => (v[n / 2 - 1] + v[n / 2]) / 2.0,
+        BaselineStat::P50 => v[n / 2],
+        // Nearest rank, as a round's p90.
+        BaselineStat::P90 => v[(90 * n).div_ceil(100).max(1) - 1],
+    }
+}
+
+fn threshold(
+    st: &mut RuleState,
+    t: &Threshold,
+    r: &RoundValues,
+    base: &dyn Fn(Baseline) -> Option<f64>,
+) -> Option<Change> {
     let v = r.metric(t.metric);
     let shown = |v: Option<f64>| v.map_or_else(|| "no value".to_string(), |v| t.metric.format(v));
     match st.active {
         None => {
-            if all_hold(&t.condition, v) {
+            if eval(&t.condition, v, base) == Some(true) {
                 if st.raise_streak == 0 {
                     st.streak_start = r.ts_ms;
                 }
@@ -296,15 +384,16 @@ fn threshold(st: &mut RuleState, t: &Threshold, r: &RoundValues) -> Option<Chang
                 "{} {} {}{rounds}",
                 t.metric,
                 shown(v),
-                describe(&t.condition, t.metric)
+                describe(&t.condition, t.metric, base)
             );
             Some((true, st.streak_start, v, what))
         }
         Some((since, _)) => {
             let clear = match &t.clear {
-                Some(c) => all_hold(c, v),
-                // Not met, and known: a round without a value says nothing.
-                None => v.is_some() && !all_hold(&t.condition, v),
+                Some(c) => eval(c, v, base) == Some(true),
+                // Not met, and known: a round without a value, or while a
+                // baseline is unknown, says nothing.
+                None => eval(&t.condition, v, base) == Some(false),
             };
             st.clear_streak = if clear { st.clear_streak + 1 } else { 0 };
             if st.clear_streak < t.clear_rounds {
@@ -318,9 +407,13 @@ fn threshold(st: &mut RuleState, t: &Threshold, r: &RoundValues) -> Option<Chang
     }
 }
 
-fn describe(cmps: &[rl_core::alert::Comparison], m: Metric) -> String {
+/// The condition as written, with the limit a baseline gave in brackets.
+fn describe(cmps: &[Comparison], m: Metric, base: &dyn Fn(Baseline) -> Option<f64>) -> String {
     cmps.iter()
-        .map(|c| format!("{} {}", c.op.as_str(), m.format_limit(c.limit)))
+        .map(|c| match (c.baseline, c.limit_with(base)) {
+            (Some(_), Some(limit)) => format!("{} (= {})", c.text(m), m.format(limit)),
+            _ => c.text(m),
+        })
         .collect::<Vec<_>>()
         .join(" and ")
 }
@@ -368,14 +461,14 @@ fn pattern(st: &mut RuleState, p: &Pattern, r: &RoundValues) -> Option<Change> {
 /// Alerts the event log leaves raised: each series and rule whose last
 /// alert event is a raise, with its start and value. `events` oldest first.
 pub fn active_from_events(events: &[Event]) -> Vec<ActiveAlert> {
-    let mut open: HashMap<(u64, String), (i64, Option<f64>)> = HashMap::new();
+    let mut open: HashMap<(u64, String), &Event> = HashMap::new();
     for e in events {
         let (Some(series), Some(rule)) = (e.series, &e.rule) else {
             continue;
         };
         match e.kind {
             EventKind::AlertRaised => {
-                open.insert((series, rule.clone()), (e.since.unwrap_or(e.t), e.value));
+                open.insert((series, rule.clone()), e);
             }
             EventKind::AlertCleared => {
                 open.remove(&(series, rule.clone()));
@@ -385,11 +478,13 @@ pub fn active_from_events(events: &[Event]) -> Vec<ActiveAlert> {
     }
     let mut out: Vec<ActiveAlert> = open
         .into_iter()
-        .map(|((series, rule), (since_ms, value))| ActiveAlert {
+        .map(|((series, rule), e)| ActiveAlert {
             series,
             rule,
-            since_ms,
-            value,
+            since_ms: e.since.unwrap_or(e.t),
+            value: e.value,
+            silenced_by: e.silenced_by.clone(),
+            suppressed_by: e.suppressed_by.clone(),
         })
         .collect();
     out.sort_by(|a, b| (a.series, &a.rule).cmp(&(b.series, &b.rule)));

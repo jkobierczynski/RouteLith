@@ -186,7 +186,9 @@ fn restored_alerts_clear_normally_and_are_not_raised_twice() {
             series: 7,
             rule: "slow".into(),
             since_ms: 5,
-            value: Some(31.0)
+            value: Some(31.0),
+            silenced_by: None,
+            suppressed_by: None,
         }]
     );
     // Still slow: no second raise.
@@ -275,4 +277,89 @@ proptest! {
         }
         prop_assert_eq!(active, !e.active().is_empty());
     }
+}
+
+/// One hourly value per hour before `now`, newest last, each a round of
+/// 20 replies in the given ms.
+fn hours(now: i64, ms: &[u32]) -> Vec<RoundValues> {
+    let hour = now - now.rem_euclid(HOUR_MS);
+    let n = ms.len() as i64;
+    ms.iter()
+        .enumerate()
+        .map(|(i, &m)| {
+            RoundValues::from_sorted(hour - (n - i as i64) * HOUR_MS, 20, &[m * 1000; 20])
+        })
+        .collect()
+}
+
+#[test]
+fn baselines_need_a_day_of_hours_and_follow_the_window() {
+    let rule = threshold(
+        "above-normal",
+        Metric::Median,
+        "> baseline_p50_7d * 2",
+        1,
+        None,
+    );
+    let b = Baseline {
+        stat: BaselineStat::P50,
+        days: 7,
+    };
+    let mut e = engine(rule);
+    assert_eq!(e.baselines_used(7), [(Metric::Median, b)]);
+    assert!(e.baselines_used(8).is_empty());
+    let now = 1_000 * HOUR_MS + 1_234;
+    // 23 hours: not known, so 100 ms raises nothing.
+    e.set_hourly(7, &hours(now, &[10; 23]), now);
+    assert_eq!(e.baseline(7, Metric::Median, b), None);
+    assert!(run(&mut e, &[round(now / STEP, 100, 0)]).is_empty());
+    // A day: known. The hour in progress and hours older than the window
+    // do not count.
+    let mut h = hours(now, &[1000; 24 * 7 + 5]);
+    for r in h.iter_mut().rev().take(24) {
+        *r = RoundValues::from_sorted(r.ts_ms, 20, &[10_000; 20]);
+    }
+    h.push(RoundValues::from_sorted(now, 20, &[1; 20]));
+    e.set_hourly(7, &h, now);
+    // 24 hours of 10 ms and 144 of 1000 ms within the week.
+    assert_eq!(e.baseline(7, Metric::Median, b), Some(1000.0));
+    e.set_hourly(7, &hours(now, &[10; 24]), now);
+    assert_eq!(e.baseline(7, Metric::Median, b), Some(10.0));
+    let t = e.observe(7, &round(now / STEP, 25, 0));
+    assert_eq!(t.len(), 1);
+    assert_eq!(
+        t[0].message,
+        "above-normal raised: median 25ms > baseline_p50_7d * 2 (= 20ms)"
+    );
+    // While the baseline is unknown the alert neither clears by default…
+    e.set_hourly(7, &[], now);
+    assert!(run(&mut e, &[round(now / STEP + 1, 5, 0)]).is_empty());
+    // …and clears once it is known again.
+    e.set_hourly(7, &hours(now, &[10; 24]), now);
+    assert_eq!(run(&mut e, &[round(now / STEP + 2, 5, 0)]), [(0, false)]);
+}
+
+#[test]
+fn baseline_statistics() {
+    let v = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+    assert_eq!(stat(&v, BaselineStat::Min), 1.0);
+    assert_eq!(stat(&v, BaselineStat::Max), 10.0);
+    assert_eq!(stat(&v, BaselineStat::P50), 5.5);
+    assert_eq!(stat(&v[..9], BaselineStat::P50), 5.0);
+    assert_eq!(stat(&v, BaselineStat::P90), 9.0);
+    // Loss baselines: percent per hour.
+    let rule = threshold("lossy", Metric::Loss, ">= baseline_max_1d + 5%", 1, None);
+    let mut e = engine(rule);
+    let now = 500 * HOUR_MS;
+    let h: Vec<RoundValues> = (1..=18)
+        .map(|i| RoundValues::from_sorted(now - i * HOUR_MS, 20, &[1000; 19]))
+        .collect();
+    e.set_hourly(7, &h, now);
+    let b = Baseline {
+        stat: BaselineStat::Max,
+        days: 1,
+    };
+    assert_eq!(e.baseline(7, Metric::Loss, b), Some(5.0));
+    assert!(run(&mut e, &[round(now / STEP, 1, 1)]).is_empty());
+    assert_eq!(run(&mut e, &[round(now / STEP + 1, 1, 2)]), [(0, true)]);
 }

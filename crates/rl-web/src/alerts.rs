@@ -10,6 +10,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use rl_alert::ActiveAlert;
+use rl_core::silence::Silence;
 use serde::{Deserialize, Serialize};
 
 use crate::api::now_ms;
@@ -37,6 +38,7 @@ pub struct RuleInfo {
 #[derive(Debug, Default)]
 pub struct AlertBoard {
     rules: Vec<RuleInfo>,
+    silences: Vec<Silence>,
     active: Mutex<Vec<ActiveAlert>>,
     raised: AtomicU64,
     cleared: AtomicU64,
@@ -48,6 +50,13 @@ impl AlertBoard {
             rules,
             ..Self::default()
         }
+    }
+
+    /// The configured silences, listed with whether each is in force.
+    #[must_use]
+    pub fn with_silences(mut self, silences: Vec<Silence>) -> Self {
+        self.silences = silences;
+        self
     }
 
     /// Replace the active alerts.
@@ -79,6 +88,24 @@ struct ActiveJson<'a> {
     since: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<f64>,
+    /// Raised under this silence: logged, not sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    silenced_by: Option<&'a str>,
+    /// Raised while this parent target had an alert: logged, not sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suppressed_by: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct SilenceJson<'a> {
+    name: &'a str,
+    /// When it applies, in one line.
+    summary: String,
+    targets: &'a [String],
+    groups: &'a [String],
+    alerts: &'a [String],
+    /// In force now.
+    active: bool,
 }
 
 /// Active alerts and the configured rules.
@@ -96,13 +123,30 @@ pub(crate) async fn alerts(State(s): State<Arc<AppState>>) -> Response {
                 rule: &a.rule,
                 since: a.since_ms,
                 value: a.value.map(crate::round2),
+                silenced_by: a.silenced_by.as_deref(),
+                suppressed_by: a.suppressed_by.as_deref(),
             })
         })
         .collect();
+    let now = now_ms();
+    let silences: Vec<SilenceJson<'_>> = s
+        .alerts
+        .silences
+        .iter()
+        .map(|x| SilenceJson {
+            name: &x.name,
+            summary: x.summary(),
+            targets: &x.targets,
+            groups: &x.groups,
+            alerts: &x.alerts,
+            active: x.active_at(now),
+        })
+        .collect();
     Json(serde_json::json!({
-        "now": now_ms(),
+        "now": now,
         "active": list,
         "rules": s.alerts.rules,
+        "silences": silences,
     }))
     .into_response()
 }
