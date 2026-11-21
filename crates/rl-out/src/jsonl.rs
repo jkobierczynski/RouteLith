@@ -2,7 +2,7 @@
 //! event log's own shape.
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use rl_store::Event;
@@ -40,9 +40,22 @@ struct Pending {
 fn open(path: &Path) -> Result<std::fs::File, String> {
     OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))
+}
+
+/// Whether the file ends partway through a line: a write cut short and then
+/// given up on (the server stopped before the retry), or another writer.
+fn ends_mid_line(file: &mut std::fs::File) -> std::io::Result<bool> {
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 impl Sink for JsonlSink {
@@ -54,12 +67,20 @@ impl Sink for JsonlSink {
         let mut p = match self.pending.take() {
             Some(p) => p,
             None => {
-                let mut line = serde_json::to_vec(e).map_err(|err| err.to_string())?;
+                let mut file = open(&self.path)?;
+                // End a cut-off line first, so it cannot run into this one:
+                // the cut-off line stays unreadable, but this one is whole.
+                let mut line = match ends_mid_line(&mut file) {
+                    Ok(true) => vec![b'\n'],
+                    Ok(false) => Vec::new(),
+                    Err(err) => return Err(format!("cannot read {}: {err}", self.path.display())),
+                };
+                serde_json::to_writer(&mut line, e).map_err(|err| err.to_string())?;
                 line.push(b'\n');
                 Pending {
                     line,
                     done: 0,
-                    file: open(&self.path)?,
+                    file,
                 }
             }
         };
@@ -110,5 +131,29 @@ mod tests {
         // The next event opens the path again.
         sink.deliver(&e).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), line);
+    }
+
+    #[test]
+    fn a_line_cut_off_before_a_restart_does_not_spoil_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.jsonl");
+        let e = Event::new(1, EventKind::ServerStarted, "local", "started");
+        let mut line = serde_json::to_vec(&e).unwrap();
+        line.push(b'\n');
+        // A short write, then the server stopped before the retry.
+        std::fs::write(&path, &line[..10]).unwrap();
+        let mut sink = JsonlSink::new(&path).unwrap();
+        sink.deliver(&e).unwrap();
+        let text = std::fs::read(&path).unwrap();
+        let lines: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], &line[..10]);
+        assert_eq!(lines[1], &line[..line.len() - 1]);
+        assert!(lines[2].is_empty());
+        // A whole file gets nothing extra.
+        sink.deliver(&e).unwrap();
+        let mut want = text.clone();
+        want.extend_from_slice(&line);
+        assert_eq!(std::fs::read(&path).unwrap(), want);
     }
 }
