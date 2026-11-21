@@ -439,3 +439,42 @@ fn structured_data_stays_on_one_line() {
     let line = format_rfc5424(&e, &header());
     assert!(line.contains(r#"vantage="a b c""#), "{line}");
 }
+
+#[test]
+fn a_tls_receiver_that_trickles_cannot_hold_the_handshake() {
+    use std::io::Write;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    // A handshake record header promising 16 KiB, then one byte of it
+    // every 100 ms: each read gets data, so only the deadline stops it.
+    let trickle = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        if s.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).is_err() {
+            return;
+        }
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if s.write_all(&[0]).is_err() {
+                return;
+            }
+        }
+    });
+    let config = crate::tls::client_config(None, None, None).or_else(|_| {
+        // No system roots here: any root will do, the handshake never ends.
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, ck.cert.pem()).unwrap();
+        crate::tls::client_config(Some(&ca), None, None)
+    });
+    let mut c =
+        rustls::ClientConnection::new(config.unwrap(), "localhost".try_into().unwrap()).unwrap();
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let started = Instant::now();
+    let err = syslog::handshake(&mut c, &mut sock, started + Duration::from_secs(1)).unwrap_err();
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(1500), "{took:?}: {err}");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+    drop(sock);
+    let _ = trickle.join();
+}

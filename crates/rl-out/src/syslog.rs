@@ -269,17 +269,11 @@ impl SyslogSink {
                 let (config, name) = self.tls.clone().ok_or("no TLS configuration")?;
                 let mut sock = Self::tcp(a)?;
                 let mut c = ClientConnection::new(config, name).map_err(|e| format!("TLS: {e}"))?;
-                // Each read and write has its own timeout; this bounds the
-                // whole handshake, so a receiver that trickles bytes cannot
-                // hold the thread (and a stop) for long.
-                let until = Instant::now() + HANDSHAKE_TIMEOUT;
-                while c.is_handshaking() {
-                    if Instant::now() >= until {
-                        return Err(format!("TLS handshake with {a}: timed out"));
-                    }
-                    c.complete_io(&mut sock)
-                        .map_err(|e| format!("TLS handshake with {a}: {e}"))?;
-                }
+                handshake(&mut c, &mut sock, Instant::now() + HANDSHAKE_TIMEOUT)
+                    .map_err(|e| format!("TLS handshake with {a}: {e}"))?;
+                sock.set_write_timeout(Some(IO_TIMEOUT))
+                    .and_then(|()| sock.set_read_timeout(Some(IO_TIMEOUT)))
+                    .map_err(|e| e.to_string())?;
                 Ok(Conn::Tls(Box::new(StreamOwned::new(c, sock))))
             }
         }
@@ -314,6 +308,49 @@ impl SyslogSink {
             (_, Framing::Lf) => format!("{msg}\n").into_bytes(),
         }
     }
+}
+
+/// Drive a TLS handshake one socket read or write at a time, each with
+/// a timeout of what is left before `until`, so the whole handshake ends
+/// by then even if the receiver trickles bytes.
+pub(crate) fn handshake(
+    c: &mut ClientConnection,
+    sock: &mut TcpStream,
+    until: Instant,
+) -> io::Result<()> {
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "timed out");
+    while c.is_handshaking() {
+        let left = until
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(timed_out)?;
+        if c.wants_write() {
+            sock.set_write_timeout(Some(left))?;
+            c.write_tls(sock)?;
+        } else if c.wants_read() {
+            sock.set_read_timeout(Some(left))?;
+            if c.read_tls(sock)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the receiver closed the connection",
+                ));
+            }
+            c.process_new_packets()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        } else {
+            break;
+        }
+    }
+    // The last flight (client Finished) may still be queued.
+    while c.wants_write() {
+        let left = until
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(timed_out)?;
+        sock.set_write_timeout(Some(left))?;
+        c.write_tls(sock)?;
+    }
+    Ok(())
 }
 
 /// Whether a stream the receiver may have closed is still open: a
