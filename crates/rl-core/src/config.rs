@@ -1300,8 +1300,34 @@ impl Validator<'_> {
             .unwrap_or_else(|| "routelith".to_string());
         let sd_id = token(self, &o.sd_id, "sd_id", 32, true)
             .unwrap_or_else(|| "routelith@32473".to_string());
+        // Names without '@' are for IANA (RFC 5424 §7.2.2).
+        let qualified = sd_id.split_once('@').is_some_and(|(n, pen)| {
+            !n.is_empty() && !pen.is_empty() && pen.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        });
+        if let (Some(v), false) = (&o.sd_id, qualified) {
+            self.error(
+                &v.span(),
+                format!(
+                    "output {name:?}: sd_id must be name@enterprise-number, as in \"routelith@32473\""
+                ),
+            );
+        }
+        // An RFC 3164 TAG ends at the first character that is not a letter
+        // or digit.
+        if let (Some(v), SyslogFormat::Rfc3164) = (&o.app_name, format) {
+            let a = v.get_ref();
+            if a.len() > 32 || !a.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                self.error(
+                    &v.span(),
+                    format!(
+                        "output {name:?}: with format = \"rfc3164\", app_name must be 1 to 32 \
+                         letters or digits"
+                    ),
+                );
+            }
+        }
         if let Some(v) = &o.server_name {
-            if !valid_hostname(v.get_ref()) {
+            if !valid_hostname(v.get_ref()) || numeric_tld(v.get_ref()) {
                 self.error(
                     &v.span(),
                     format!("output {name:?}: server_name is not a valid host name"),
@@ -1322,6 +1348,17 @@ impl Validator<'_> {
                 return None;
             }
         };
+        // A certificate names a DNS name or an address; a name whose last
+        // label is all digits is neither.
+        if transport == Transport::Tls && o.server_name.is_none() && numeric_tld(&host) {
+            self.error(
+                &address.span(),
+                format!(
+                    "output {name:?}: {host:?} cannot be checked against a certificate; \
+                     set server_name"
+                ),
+            );
+        }
         let path = |v: &Option<Spanned<String>>| v.as_ref().map(|v| PathBuf::from(v.get_ref()));
         (self.error_count() == errors_before).then(|| SyslogOutput {
             host,
@@ -2272,6 +2309,17 @@ fn valid_hostname(s: &str) -> bool {
         })
 }
 
+/// A name (not an address) whose last label is all digits, which TLS
+/// rejects as a server name.
+fn numeric_tld(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_err()
+        && host
+            .trim_end_matches('.')
+            .rsplit('.')
+            .next()
+            .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// `host`, `host:port`, `[v6]:port` or a bare IPv6 address.
 fn split_address(s: &str, default_port: u16) -> Result<(String, u16), String> {
     let s = s.trim();
@@ -2294,6 +2342,11 @@ fn split_address(s: &str, default_port: u16) -> Result<(String, u16), String> {
         (s, default_port)
     } else {
         match s.rsplit_once(':') {
+            Some((h, _)) if h.contains(':') => {
+                return Err(
+                    "put an IPv6 address with a port in brackets, as in [2001:db8::1]:514".into(),
+                );
+            }
             Some((h, p)) => (h, port(p)?),
             None => (s, default_port),
         }
@@ -2603,6 +2656,26 @@ alerts = ["loss"]
                 "ca_file   = \"/etc/routelith/siem-ca.pem\"",
                 "cert_file = \"/c.pem\"",
                 "cert_file needs a key_file",
+            ),
+            (
+                "address = \"[2001:db8::5]:5514\"",
+                "address = \"2001:db8::5:65535\"",
+                "in brackets",
+            ),
+            (
+                "\"siem.example.net\"",
+                "\"collector.123\"",
+                "set server_name",
+            ),
+            (
+                "quiet   = true",
+                "quiet = true\napp_name = \"route-lith\"",
+                "letters or digits",
+            ),
+            (
+                "quiet   = true",
+                "quiet = true\nsd_id = \"routelith\"",
+                "name@enterprise-number",
             ),
         ] {
             assert!(OUTPUTS.contains(from), "{from}");

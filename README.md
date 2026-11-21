@@ -39,10 +39,11 @@ targets, groups or rules. Each has its own queue (`queue`, default 1000)
 and thread: an unreachable receiver fills only its queue, which then drops
 events and counts them (`routelith_output_events_dropped_total`), and the
 event in hand is retried with a pause that grows from 1 s to a minute. On a
-clean stop the outputs get 5 seconds to send what they hold. Syslog
+clean stop the outputs get 5 seconds to send what they hold. RFC 5424
 messages put the event's fields in structured data under the SD-ID
 `routelith@32473` (32473 is the example enterprise number of RFC 5612;
-set `sd_id` if your site has its own) and MSGID is the event kind. The
+set `sd_id` if your site has its own) and MSGID is the event kind; RFC
+3164 messages have only the old header and the event's text. The
 Event Log, webhooks and e-mail come next.
 
 A condition can follow the target's own history instead of a fixed value:

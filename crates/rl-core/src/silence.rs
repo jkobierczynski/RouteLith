@@ -294,7 +294,9 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Year, month and day of a day number (days since 1970-01-01).
+/// Year, month and day of a day number (days since 1970-01-01). Meant for
+/// days from a millisecond time (`ms.div_euclid(86_400_000)`); numbers near
+/// `i64::MAX` overflow.
 pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);

@@ -39,8 +39,15 @@ impl Sink for JsonlSink {
     fn deliver(&mut self, e: &Event) -> Result<(), String> {
         let mut line = serde_json::to_vec(e).map_err(|err| err.to_string())?;
         line.push(b'\n');
-        open(&self.path)?
-            .write_all(&line)
-            .map_err(|err| format!("cannot write {}: {err}", self.path.display()))
+        let mut f = open(&self.path)?;
+        let before = f.metadata().map(|m| m.len()).ok();
+        f.write_all(&line).map_err(|err| {
+            // A short write (disk full) leaves part of the line; cut it off
+            // so the retry does not append to a broken line.
+            if let Some(len) = before {
+                let _ = f.set_len(len);
+            }
+            format!("cannot write {}: {err}", self.path.display())
+        })
     }
 }

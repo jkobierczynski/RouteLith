@@ -154,6 +154,14 @@ impl Outputs {
             };
             sinks.push((o, sink));
         }
+        Self::with_sinks(sinks, groups)
+    }
+
+    /// Start a thread for each output with its sink.
+    fn with_sinks(
+        sinks: Vec<(&Output, Box<dyn Sink>)>,
+        groups: HashMap<String, String>,
+    ) -> Result<Self, String> {
         let stop = Arc::new(Stop::default());
         let mut running = Vec::new();
         for (o, sink) in sinks {
@@ -207,8 +215,8 @@ impl Outputs {
         self.running.iter().map(|r| r.stats.clone()).collect()
     }
 
-    /// Deliver what is queued, for at most about `grace` (plus one
-    /// connection attempt), then drop the rest and end the threads.
+    /// Deliver what is queued, for at most about `grace` (plus the one
+    /// attempt under way then), then drop the rest and end the threads.
     pub fn close(self, grace: Duration) {
         *self
             .stop
@@ -259,7 +267,7 @@ pub fn passes(f: &EventFilter, e: &Event, groups: &HashMap<String, String>) -> b
 /// through or the server stops.
 fn work(rx: &Receiver<Arc<Event>>, mut sink: Box<dyn Sink>, stats: &OutputStats, stop: &Stop) {
     let mut last_error: Option<String> = None;
-    // Set once delivery fails after the stop deadline: the rest is dropped.
+    // Set once the stop deadline has passed: the rest is dropped.
     let mut giving_up = false;
     while let Ok(e) = rx.recv() {
         stats.queued.fetch_sub(1, Ordering::Relaxed);
@@ -269,6 +277,11 @@ fn work(rx: &Receiver<Arc<Event>>, mut sink: Box<dyn Sink>, stats: &OutputStats,
         }
         let mut backoff = FIRST_BACKOFF;
         loop {
+            if stop.deadline().is_some_and(|d| Instant::now() >= d) {
+                stats.dropped.fetch_add(1, Ordering::Relaxed);
+                giving_up = true;
+                break;
+            }
             match sink.deliver(&e) {
                 Ok(()) => {
                     stats.sent.fetch_add(1, Ordering::Relaxed);
@@ -288,11 +301,6 @@ fn work(rx: &Receiver<Arc<Event>>, mut sink: Box<dyn Sink>, stats: &OutputStats,
                             stats.name
                         );
                         last_error = Some(msg);
-                    }
-                    if stop.deadline().is_some_and(|d| Instant::now() >= d) {
-                        stats.dropped.fetch_add(1, Ordering::Relaxed);
-                        giving_up = true;
-                        break;
                     }
                     stop.pause(backoff);
                     backoff = (backoff * 2).min(MAX_BACKOFF);

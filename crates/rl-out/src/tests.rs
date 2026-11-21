@@ -399,3 +399,43 @@ fn queued_events_are_delivered_at_close() {
     assert_eq!(reader.join().unwrap(), 50);
     assert_eq!(stats[0].sent.load(Ordering::Relaxed), 50);
 }
+
+/// Takes 20 ms per event, and always works.
+struct Slow;
+
+impl Sink for Slow {
+    fn deliver(&mut self, _: &Event) -> Result<(), String> {
+        std::thread::sleep(Duration::from_millis(20));
+        Ok(())
+    }
+}
+
+#[test]
+fn close_keeps_to_its_grace_with_a_slow_receiver() {
+    let o = output(OutputKind::Jsonl(JsonlOutput { path: "x".into() }), 1000);
+    let outs = Outputs::with_sinks(vec![(&o, Box::new(Slow))], HashMap::new()).unwrap();
+    for _ in 0..500 {
+        outs.send(&raised());
+    }
+    let stats = outs.stats();
+    let closing = Instant::now();
+    outs.close(Duration::from_millis(200));
+    assert!(
+        closing.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        closing.elapsed()
+    );
+    let (sent, dropped) = (
+        stats[0].sent.load(Ordering::Relaxed),
+        stats[0].dropped.load(Ordering::Relaxed),
+    );
+    assert!(sent > 0 && dropped > 0, "{sent} {dropped}");
+    assert_eq!(sent + dropped, 500);
+}
+
+#[test]
+fn structured_data_stays_on_one_line() {
+    let e = Event::new(T, EventKind::ServerStarted, "a\nb\rc", "x");
+    let line = format_rfc5424(&e, &header());
+    assert!(line.contains(r#"vantage="a b c""#), "{line}");
+}

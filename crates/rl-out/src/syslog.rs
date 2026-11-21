@@ -12,6 +12,7 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rl_core::output::{Framing, SyslogFormat, SyslogOutput, Transport};
 use rl_core::silence::civil_from_days;
@@ -26,6 +27,8 @@ const DAY_MS: i64 = 86_400_000;
 /// (RFC 5426 §3.2 for RFC 5424; RFC 3164 §4.1 says 1024).
 const UDP_MAX_5424: usize = 2048;
 const UDP_MAX_3164: usize = 1024;
+/// The longest a TLS handshake may take.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The fixed parts of the messages of one output.
 #[derive(Debug, Clone)]
@@ -60,14 +63,16 @@ fn rfc3339(ms: i64) -> String {
     )
 }
 
-/// A PARAM-VALUE: `"`, `\` and `]` escaped (RFC 5424 §6.3.3).
+/// A PARAM-VALUE: `"`, `\` and `]` escaped (RFC 5424 §6.3.3), on one line.
 fn sd_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(c, '"' | '\\' | ']') {
             out.push('\\');
         }
-        out.push(c);
+        // Control characters (a line break could end an LF-framed message)
+        // become spaces.
+        out.push(if c.is_control() { ' ' } else { c });
     }
     out
 }
@@ -236,27 +241,20 @@ impl SyslogSink {
         Ok(addrs)
     }
 
-    fn tcp(&self) -> Result<TcpStream, String> {
-        let mut last = String::new();
-        for a in self.addresses()? {
-            match TcpStream::connect_timeout(&a, IO_TIMEOUT) {
-                Ok(s) => {
-                    let _ = s.set_nodelay(true);
-                    s.set_write_timeout(Some(IO_TIMEOUT))
-                        .and_then(|()| s.set_read_timeout(Some(IO_TIMEOUT)))
-                        .map_err(|e| e.to_string())?;
-                    return Ok(s);
-                }
-                Err(e) => last = format!("cannot connect to {a}: {e}"),
-            }
-        }
-        Err(last)
+    fn tcp(a: SocketAddr) -> Result<TcpStream, String> {
+        let s = TcpStream::connect_timeout(&a, IO_TIMEOUT)
+            .map_err(|e| format!("cannot connect to {a}: {e}"))?;
+        let _ = s.set_nodelay(true);
+        s.set_write_timeout(Some(IO_TIMEOUT))
+            .and_then(|()| s.set_read_timeout(Some(IO_TIMEOUT)))
+            .map_err(|e| e.to_string())?;
+        Ok(s)
     }
 
-    fn connect(&self) -> Result<Conn, String> {
+    /// Connect to one address of the receiver.
+    fn connect_to(&self, a: SocketAddr) -> Result<Conn, String> {
         match self.cfg.transport {
             Transport::Udp => {
-                let a = self.addresses()?[0];
                 let local: SocketAddr = if a.is_ipv4() {
                     ([0, 0, 0, 0], 0).into()
                 } else {
@@ -266,18 +264,37 @@ impl SyslogSink {
                 s.connect(a).map_err(|e| format!("cannot reach {a}: {e}"))?;
                 Ok(Conn::Udp(s))
             }
-            Transport::Tcp => Ok(Conn::Tcp(self.tcp()?)),
+            Transport::Tcp => Ok(Conn::Tcp(Self::tcp(a)?)),
             Transport::Tls => {
                 let (config, name) = self.tls.clone().ok_or("no TLS configuration")?;
-                let mut sock = self.tcp()?;
+                let mut sock = Self::tcp(a)?;
                 let mut c = ClientConnection::new(config, name).map_err(|e| format!("TLS: {e}"))?;
+                // Each read and write has its own timeout; this bounds the
+                // whole handshake, so a receiver that trickles bytes cannot
+                // hold the thread (and a stop) for long.
+                let until = Instant::now() + HANDSHAKE_TIMEOUT;
                 while c.is_handshaking() {
+                    if Instant::now() >= until {
+                        return Err(format!("TLS handshake with {a}: timed out"));
+                    }
                     c.complete_io(&mut sock)
-                        .map_err(|e| format!("TLS handshake with {}: {e}", self.cfg.host))?;
+                        .map_err(|e| format!("TLS handshake with {a}: {e}"))?;
                 }
                 Ok(Conn::Tls(Box::new(StreamOwned::new(c, sock))))
             }
         }
+    }
+
+    /// Connect to the first address of the receiver that works.
+    fn connect(&self) -> Result<Conn, String> {
+        let mut last = String::new();
+        for a in self.addresses()? {
+            match self.connect_to(a) {
+                Ok(c) => return Ok(c),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
     }
 
     fn frame(&self, e: &Event) -> Vec<u8> {
@@ -348,11 +365,9 @@ impl Sink for SyslogSink {
         })
     }
 
+    /// Drop the connection without flushing: buffered data of the event
+    /// that failed must not go out, as it is sent again.
     fn reset(&mut self) {
-        if let Some(Conn::Tls(mut s)) = self.conn.take() {
-            // A last courtesy; the receiver may be gone already.
-            s.conn.send_close_notify();
-            let _ = s.flush();
-        }
+        self.conn = None;
     }
 }

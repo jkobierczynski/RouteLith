@@ -46,7 +46,8 @@ pub(crate) fn client_config(
                 .with_client_auth_cert(chain, key)
                 .map_err(|e| format!("cert_file and key_file: {e}"))?
         }
-        _ => builder.with_no_client_auth(),
+        (None, None) => builder.with_no_client_auth(),
+        _ => return Err("cert_file and key_file go together".into()),
     };
     Ok(Arc::new(config))
 }
