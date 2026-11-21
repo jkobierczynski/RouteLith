@@ -41,7 +41,8 @@ const DEFAULT_PINGS: u16 = 20;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SIZE: u16 = 56;
 const DEFAULT_MAX_PPS: u32 = 1_000;
-const DEFAULT_VANTAGE: &str = "local";
+/// The vantage of a configuration that names none.
+pub const DEFAULT_VANTAGE: &str = "local";
 const MAX_PINGS: i64 = 1_000;
 const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 /// Largest ICMP payload that fits one IPv4 datagram.

@@ -31,6 +31,22 @@ the target's events; `/api/v1/alerts` lists the alerts raised now,
 alert plus raise and clear counters. Sending them to syslog, the Event Log, webhooks and e-mail comes
 next.
 
+History from SmokePing comes over with `routelith ctl import smokeping`,
+with the server stopped. It reads `rrdtool dump` XML, so the RRD files can
+be dumped on the SmokePing machine and copied over:
+
+```console
+$ rrdtool dump /var/lib/smokeping/Gateway.rrd > gateway.xml
+$ routelith ctl import smokeping gateway.xml --target gateway --config routelith.toml
+imported local/gateway/v4: 863 rounds (2025-11-20 to 2025-11-22), 4249 hourly and 197 daily points (2025-05-07 to 2025-11-19)
+```
+
+The newest archive (5-minute rows) becomes raw rounds and the older ones
+hourly and daily points. Import a target before the server first measures
+it, so its live rounds continue the imported history; a series that
+already has data is refused, so import under another `--target` or
+`--vantage` then.
+
 ```console
 $ routelith check icmp example.net -c 5 -i 200ms
 ICMP example.net (192.0.2.10): 5 samples, 56-byte payload

@@ -1381,6 +1381,7 @@ dependencies = [
  "rl-store",
  "rl-sys",
  "rl-web",
+ "roxmltree",
  "tempfile",
  "tokio",
  "windows-service",

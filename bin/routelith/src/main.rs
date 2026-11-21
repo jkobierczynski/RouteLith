@@ -1,13 +1,15 @@
 //! The `routelith` binary: one executable, several modes (architecture doc §3).
 //!
 //! `server`, `service install|uninstall`, `check icmp|tcp|dns|http`,
-//! `ctl calibrate`, `ctl verify` and `ctl render` work.
+//! `ctl calibrate`, `ctl verify`, `ctl render` and `ctl import smokeping`
+//! work.
 #![forbid(unsafe_code)]
 
 mod alerting;
 mod calibrate;
 mod check;
 mod health;
+mod import;
 mod render;
 mod server;
 mod service;
@@ -67,6 +69,18 @@ enum CtlAction {
     Calibrate(calibrate::CalibrateArgs),
     /// Render a smoke graph from the store as SVG.
     Render(render::RenderArgs),
+    /// Import history from another tool into the store (with the server
+    /// stopped).
+    Import {
+        #[command(subcommand)]
+        from: ImportFrom,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ImportFrom {
+    /// A SmokePing target's RRD, as `rrdtool dump` XML.
+    Smokeping(import::SmokepingArgs),
 }
 
 fn main() -> ExitCode {
@@ -95,6 +109,12 @@ fn main() -> ExitCode {
         Command::Ctl {
             action: CtlAction::Render(args),
         } => render::run(&args),
+        Command::Ctl {
+            action:
+                CtlAction::Import {
+                    from: ImportFrom::Smokeping(args),
+                },
+        } => import::run(&args),
     }
 }
 

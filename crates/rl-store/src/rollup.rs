@@ -209,6 +209,66 @@ impl RollupPoint {
     }
 }
 
+impl RollupPoint {
+    /// One point standing for all of `points`, at `ts_ms`: counts are
+    /// summed, and the quantiles are taken from the union of the points'
+    /// quantiles, each standing for an equal share of its point's replies.
+    pub fn merge(points: &[RollupPoint], ts_ms: i64) -> RollupPoint {
+        let mut weighted: Vec<(u32, f64)> = Vec::new();
+        let (mut rounds, mut sent, mut received) = (0u32, 0u32, 0u32);
+        for p in points {
+            rounds = rounds.saturating_add(p.rounds);
+            sent = sent.saturating_add(p.sent);
+            received = received.saturating_add(p.received);
+            if !p.quantiles_us.is_empty() {
+                let w = f64::from(p.received) / p.quantiles_us.len() as f64;
+                weighted.extend(p.quantiles_us.iter().map(|&q| (q, w)));
+            }
+        }
+        weighted.sort_unstable_by_key(|&(q, _)| q);
+        let total: f64 = weighted.iter().map(|&(_, w)| w).sum();
+        let quantiles_us = if weighted.is_empty() || total <= 0.0 {
+            Vec::new()
+        } else {
+            // Value k covers the weight from cum[k-1] to cum[k]; the
+            // quantile at fraction f is the value covering f × total.
+            let mut out = Vec::with_capacity(QUANTILES);
+            let (mut k, mut cum) = (0, weighted[0].1);
+            for i in 0..QUANTILES {
+                let at = total * i as f64 / (QUANTILES - 1) as f64;
+                while k + 1 < weighted.len() && cum < at {
+                    k += 1;
+                    cum += weighted[k].1;
+                }
+                out.push(weighted[k].0);
+            }
+            // The extremes stay exact.
+            out[0] = weighted[0].0;
+            out[QUANTILES - 1] = weighted[weighted.len() - 1].0;
+            out
+        };
+        RollupPoint {
+            ts_ms,
+            rounds,
+            sent,
+            received: if quantiles_us.is_empty() { 0 } else { received },
+            quantiles_us,
+        }
+    }
+
+    /// Whether the point could have been built by this module: counts
+    /// that fit, and [`QUANTILES`] sorted quantiles when anything was
+    /// received.
+    pub(crate) fn is_valid(&self) -> bool {
+        self.received <= self.sent
+            && if self.received == 0 {
+                self.quantiles_us.is_empty()
+            } else {
+                self.quantiles_us.len() == QUANTILES && self.quantiles_us.is_sorted()
+            }
+    }
+}
+
 /// [`QUANTILES`] values at ranks `round(i × (n − 1) / (Q − 1))` of a sorted
 /// slice: the first is the minimum, the last the maximum.
 pub fn quantiles(sorted: &[u32]) -> Vec<u32> {
@@ -416,6 +476,11 @@ pub(crate) fn sync_all(dir: &Path, series: u64) -> Result<(), crate::StoreError>
     }
     layout::sync_dir(&dir.join("series").join(series.to_string()))?;
     Ok(())
+}
+
+/// Whether a tier has any file for the series.
+pub(crate) fn has_files(dir: &Path, series: u64, tier: Tier) -> io::Result<bool> {
+    Ok(!list(dir, series, tier)?.is_empty())
 }
 
 /// Time of the oldest point of a tier, if it has any.
@@ -709,5 +774,53 @@ mod tests {
         );
         assert_eq!(expire(d, 1, Tier::R1d, b).unwrap(), 1);
         assert_eq!(read(d, 1, Tier::R1d, 0, i64::MAX).unwrap().len(), 1);
+    }
+    #[test]
+    fn merged_points_keep_the_union_distribution() {
+        let rounds = |base: u32| -> Vec<StoredRound> {
+            (0..12)
+                .map(|i| StoredRound {
+                    ts_ms: i64::from(i) * 300_000,
+                    sent: 20,
+                    rtts_us: (0..20).map(|j| base + i * 20 + j).collect(),
+                    errors: crate::round::ErrorCounts::default(),
+                    resolved: None,
+                    timing: None,
+                    flags: 0,
+                })
+                .collect()
+        };
+        let one = RollupPoint::build(&rounds(1000), HOUR_MS).remove(0);
+        // One point merges into itself.
+        assert_eq!(RollupPoint::merge(std::slice::from_ref(&one), 0), one);
+        // Two hours of 240 samples each: the merged quantiles stay within
+        // one source quantile step of the exact ones.
+        let mut both = rounds(1000);
+        both.extend(rounds(1240).into_iter().map(|mut r| {
+            r.ts_ms += HOUR_MS;
+            r
+        }));
+        let exact = RollupPoint::build(&both, DAY_MS).remove(0);
+        let hours = RollupPoint::build(&both, HOUR_MS);
+        let merged = RollupPoint::merge(&hours, 0);
+        assert_eq!(
+            (merged.rounds, merged.sent, merged.received),
+            (exact.rounds, exact.sent, exact.received)
+        );
+        for (m, e) in merged.quantiles_us.iter().zip(&exact.quantiles_us) {
+            assert!(m.abs_diff(*e) <= 13, "{merged:?} vs {exact:?}");
+        }
+        assert_eq!(merged.quantiles_us[0], 1000);
+        assert_eq!(merged.quantiles_us[QUANTILES - 1], 1479);
+        // Nothing received: no quantiles.
+        let lost = RollupPoint {
+            ts_ms: 0,
+            rounds: 1,
+            sent: 20,
+            received: 0,
+            quantiles_us: Vec::new(),
+        };
+        let m = RollupPoint::merge(&[lost.clone(), lost], 0);
+        assert_eq!((m.sent, m.received, m.quantiles_us.len()), (40, 0, 0));
     }
 }

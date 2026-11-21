@@ -25,7 +25,7 @@ pub fn day_of(ts_ms: i64) -> i64 {
 
 /// `YYYY-MM-DD` of a day number (proleptic Gregorian, H. Hinnant's
 /// `civil_from_days`).
-pub(crate) fn date(day: i64) -> String {
+pub fn date(day: i64) -> String {
     let z = day + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
