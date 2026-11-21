@@ -319,6 +319,16 @@ pub(crate) fn handshake(
     until: Instant,
 ) -> io::Result<()> {
     let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "timed out");
+    // A socket timeout shows as WouldBlock on Unix and TimedOut on Windows.
+    let io = |r: io::Result<usize>| {
+        r.map_err(|e| {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                timed_out()
+            } else {
+                e
+            }
+        })
+    };
     while c.is_handshaking() {
         let left = until
             .checked_duration_since(Instant::now())
@@ -326,10 +336,10 @@ pub(crate) fn handshake(
             .ok_or_else(timed_out)?;
         if c.wants_write() {
             sock.set_write_timeout(Some(left))?;
-            c.write_tls(sock)?;
+            io(c.write_tls(sock))?;
         } else if c.wants_read() {
             sock.set_read_timeout(Some(left))?;
-            if c.read_tls(sock)? == 0 {
+            if io(c.read_tls(sock))? == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "the receiver closed the connection",
@@ -348,7 +358,7 @@ pub(crate) fn handshake(
             .filter(|d| !d.is_zero())
             .ok_or_else(timed_out)?;
         sock.set_write_timeout(Some(left))?;
-        c.write_tls(sock)?;
+        io(c.write_tls(sock))?;
     }
     Ok(())
 }

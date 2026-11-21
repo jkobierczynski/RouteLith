@@ -371,6 +371,15 @@ fn jsonl_appends_events() {
     );
     let err = Outputs::start(&[bad], HashMap::new()).unwrap_err();
     assert!(err.contains("cannot open"), "{err}");
+    // Two spellings of one file: their lines would interleave.
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let alias = dir.path().join("sub/../events.jsonl");
+    let outs = [
+        output(OutputKind::Jsonl(JsonlOutput { path: path.clone() }), 10),
+        output(OutputKind::Jsonl(JsonlOutput { path: alias }), 10),
+    ];
+    let err = Outputs::start(&outs, HashMap::new()).unwrap_err();
+    assert!(err.contains("already writes"), "{err}");
 }
 
 #[test]

@@ -141,16 +141,36 @@ impl Outputs {
     pub fn start(outputs: &[Output], groups: HashMap<String, String>) -> Result<Self, String> {
         let hostname = machine_hostname();
         let mut sinks: Vec<(&Output, Box<dyn Sink>)> = Vec::new();
+        // The file each JSON-lines output writes, as the system resolves it:
+        // the config check compares paths as written, which misses `..` and
+        // symbolic links.
+        let mut files: HashMap<std::path::PathBuf, &str> = HashMap::new();
         for o in outputs {
             let sink: Box<dyn Sink> = match &o.kind {
                 OutputKind::Syslog(s) => Box::new(
                     syslog::SyslogSink::new(s, hostname.as_deref())
                         .map_err(|e| format!("output {:?}: {e}", o.name))?,
                 ),
-                OutputKind::Jsonl(j) => Box::new(
-                    jsonl::JsonlSink::new(&j.path)
-                        .map_err(|e| format!("output {:?}: {e}", o.name))?,
-                ),
+                OutputKind::Jsonl(j) => {
+                    let sink = jsonl::JsonlSink::new(&j.path)
+                        .map_err(|e| format!("output {:?}: {e}", o.name))?;
+                    let real = std::fs::canonicalize(&j.path).map_err(|e| {
+                        format!(
+                            "output {:?}: cannot resolve {}: {e}",
+                            o.name,
+                            j.path.display()
+                        )
+                    })?;
+                    if let Some(first) = files.insert(real, &o.name) {
+                        // Two writers would interleave their lines.
+                        return Err(format!(
+                            "output {:?}: output {first:?} already writes {}",
+                            o.name,
+                            j.path.display()
+                        ));
+                    }
+                    Box::new(sink)
+                }
             };
             sinks.push((o, sink));
         }
