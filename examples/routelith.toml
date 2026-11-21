@@ -43,6 +43,25 @@ name    = "loss-burst"
 type    = "loss"            # loss (% or count of lost samples) or rtt (median, ms)
 pattern = [">0%", "*3*", ">0%"]
 
+# Against the target's own history: the median of the last week's hourly
+# medians (baseline_<p50|p90|min|max>_<1d|7d|28d>). A baseline is unknown,
+# so the rule cannot raise, until a day of history exists.
+[[alert]]
+name      = "slower-than-usual"
+metric    = "median"
+condition = "> baseline_p50_7d * 2 + 5ms"
+for       = "3 rounds"
+
+# Alerts raised in a silence are logged and shown, but marked as not to be
+# sent. Times are UTC. One window: start and end. Recurring: an rrule
+# (FREQ=DAILY or WEEKLY, BYDAY, BYHOUR, BYMINUTE) and a duration.
+[[silence]]
+name     = "sunday-maintenance"
+groups   = ["Internet"]          # or targets = [...]; neither: every target
+# alerts = ["slow"]              # default: every rule
+rrule    = "FREQ=WEEKLY;BYDAY=SU;BYHOUR=2;BYMINUTE=0"
+duration = "2h"
+
 [[group]]
 name = "Core"
 alerts = ["down", "loss-burst"]
@@ -60,11 +79,14 @@ alerts = ["down", "loss-burst"]
 name = "Internet"
 step = "60s"
 pings = 10
+# While the gateway has an alert raised, these targets' alerts are marked
+# as suppressed (logged, not sent). A target can set its own parent.
+parent = "gateway"
 
   [[group.target]]
   name = "cloudflare"
   host = "1.1.1.1"
-  alerts = ["down", "slow"]
+  alerts = ["down", "slow", "slower-than-usual"]
 
   [[group.target]]
   name  = "cloudflare-https"

@@ -33,6 +33,7 @@ use toml::Spanned;
 
 use crate::alert::{self, AlertRule, Metric, PatternType, RuleKind, Threshold};
 use crate::duration;
+use crate::silence::{Silence, When};
 
 /// Seconds in a day; steps must divide it so rounds stay aligned to UTC days.
 const DAY_SECS: u64 = 86_400;
@@ -60,6 +61,8 @@ pub struct Config {
     pub targets: Vec<TargetConfig>,
     /// Alert rules, in file order (§21.5 F1).
     pub alerts: Vec<crate::alert::AlertRule>,
+    /// Silences, in file order (§21.5 F6).
+    pub silences: Vec<crate::silence::Silence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +94,9 @@ pub struct TargetConfig {
     pub probe: ProbeConfig,
     /// Names of the alert rules that apply, from the `alerts` setting.
     pub alerts: Vec<String>,
+    /// The target this one depends on (§21.5 F6): while it has an alert
+    /// raised, this target's alerts are recorded as suppressed.
+    pub parent: Option<String>,
     /// 1-based line of the target's table, for messages.
     pub line: usize,
 }
@@ -485,6 +491,24 @@ struct RawConfig {
     groups: Vec<Spanned<RawGroup>>,
     #[serde(default, rename = "alert")]
     alerts: Vec<Spanned<RawAlert>>,
+    #[serde(default, rename = "silence")]
+    silences: Vec<Spanned<RawSilence>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSilence {
+    name: Spanned<String>,
+    targets: Option<Spanned<Vec<String>>>,
+    groups: Option<Spanned<Vec<String>>>,
+    alerts: Option<Spanned<Vec<String>>>,
+    start: Option<Spanned<String>>,
+    end: Option<Spanned<String>>,
+    rrule: Option<Spanned<String>>,
+    duration: Option<Spanned<String>>,
+    /// Free text for people; not used.
+    #[allow(dead_code)]
+    comment: Option<Spanned<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -577,6 +601,7 @@ settings_struct!(RawDefaults {});
 
 settings_struct!(RawGroup {
     name: Spanned<String>,
+    parent: Option<Spanned<String>>,
     vantages: Option<Spanned<Vec<String>>>,
     #[serde(default, rename = "target")]
     targets: Vec<Spanned<RawTarget>>,
@@ -584,6 +609,7 @@ settings_struct!(RawGroup {
 
 settings_struct!(RawTarget {
     name: Spanned<String>,
+    parent: Option<Spanned<String>>,
     host: Option<Spanned<String>>,
     probe: Option<Spanned<String>>,
     // Keys of the M1 probes (§13.1 example), accepted so that a target using
@@ -666,6 +692,8 @@ impl Validator<'_> {
         let mut targets = Vec::new();
         let mut group_names: HashMap<String, Range<usize>> = HashMap::new();
         let mut target_names: HashMap<String, usize> = HashMap::new();
+        // Each target's parent as written, with where it was written.
+        let mut parents: Vec<(String, Spanned<String>, bool)> = Vec::new();
         for group in raw.groups {
             let group_span = group.span();
             let group = group.into_inner();
@@ -715,12 +743,26 @@ impl Validator<'_> {
                     target_names.insert(name, self.position(span.start).0);
                 }
                 let settings = target.settings().over(&group_settings);
+                let parent = target.parent.clone().or_else(|| {
+                    // A group's parent covers its other targets.
+                    group
+                        .parent
+                        .clone()
+                        .filter(|p| p.get_ref() != target.name.get_ref())
+                });
+                if let Some(p) = &parent {
+                    parents.push((target.name.get_ref().clone(), p.clone(), measured_here));
+                }
                 let t = self.target(&target, &gname, &settings, span);
-                if let (Some(t), true) = (t, measured_here) {
+                if let (Some(mut t), true) = (t, measured_here) {
+                    t.parent = parent.map(|p| p.into_inner());
                     targets.push(t);
                 }
             }
         }
+
+        self.parents(&parents, &target_names, &targets);
+        let silences = self.silences(&raw.silences, &target_names, &group_names);
 
         let server = server?;
         // Packets per day as integers (every step divides a day), so a
@@ -761,7 +803,202 @@ impl Validator<'_> {
             server,
             targets,
             alerts,
+            silences,
         })
+    }
+
+    /// `parent` settings: each names another target, and they form no loop.
+    fn parents(
+        &mut self,
+        parents: &[(String, Spanned<String>, bool)],
+        names: &HashMap<String, usize>,
+        measured: &[TargetConfig],
+    ) {
+        let of: HashMap<&str, &str> = parents
+            .iter()
+            .map(|(child, p, _)| (child.as_str(), p.get_ref().as_str()))
+            .collect();
+        for (child, p, here) in parents {
+            let name = p.get_ref();
+            if name == child {
+                self.error(
+                    &p.span(),
+                    format!("target {child:?} cannot be its own parent"),
+                );
+            } else if !names.contains_key(name) {
+                self.error(
+                    &p.span(),
+                    format!("parent {name:?} of target {child:?} is not a target in this file"),
+                );
+            } else if *here && !measured.iter().any(|t| &t.id == name) {
+                self.warning(
+                    &p.span(),
+                    format!(
+                        "parent {name:?} of target {child:?} is not measured from this vantage, \
+                         so it never suppresses its alerts here"
+                    ),
+                );
+            } else {
+                // Follow the chain: a loop comes back to `child`.
+                let mut at = name.as_str();
+                for _ in 0..of.len() {
+                    match of.get(at) {
+                        Some(&next) if next == child => {
+                            self.error(
+                                &p.span(),
+                                format!("parents of target {child:?} form a loop through {name:?}"),
+                            );
+                            break;
+                        }
+                        Some(&next) => at = next,
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `[[silence]]` tables (§21.5 F6).
+    fn silences(
+        &mut self,
+        raw: &[Spanned<RawSilence>],
+        targets: &HashMap<String, usize>,
+        groups: &HashMap<String, Range<usize>>,
+    ) -> Vec<Silence> {
+        let mut out = Vec::new();
+        let mut first_line: HashMap<String, usize> = HashMap::new();
+        for s in raw {
+            let line = self.position(s.span().start).0;
+            let errors_before = self.error_count();
+            let s = s.get_ref();
+            let name = s.name.get_ref().clone();
+            if !valid_name(&name) {
+                self.error(&s.name.span(), name_rule("silence name"));
+            } else if let Some(first) = first_line.get(&name) {
+                self.error(
+                    &s.name.span(),
+                    format!("duplicate silence name {name:?} (first defined on line {first})"),
+                );
+            } else {
+                first_line.insert(name.clone(), line);
+            }
+            let alert_names = self.alert_names.clone();
+            let mut list = |v: &Option<Spanned<Vec<String>>>,
+                            what: &str,
+                            known: &dyn Fn(&str) -> bool| {
+                let Some(v) = v else {
+                    return Vec::new();
+                };
+                for n in v.get_ref() {
+                    if !known(n) {
+                        self.error(&v.span(), format!("silence {name:?}: unknown {what} {n:?}"));
+                    }
+                }
+                v.get_ref().clone()
+            };
+            let t = list(&s.targets, "target", &|n| targets.contains_key(n));
+            let g = list(&s.groups, "group", &|n| groups.contains_key(n));
+            let a = list(&s.alerts, "alert", &|n| alert_names.contains_key(n));
+            let time =
+                |v: &Option<Spanned<String>>, me: &mut Self, key: &str| -> Option<Option<i64>> {
+                    match v {
+                        None => Some(None),
+                        Some(v) => match crate::silence::parse_time(v.get_ref()) {
+                            Ok(t) => Some(Some(t)),
+                            Err(e) => {
+                                me.error(&v.span(), format!("{key}: {e}"));
+                                None
+                            }
+                        },
+                    }
+                };
+            let start = time(&s.start, self, "start");
+            let end = time(&s.end, self, "end");
+            if let (Some(Some(a)), Some(Some(b)), Some(e)) = (start, end, &s.end) {
+                if b <= a {
+                    self.error(
+                        &e.span(),
+                        format!("silence {name:?}: end must be after start"),
+                    );
+                }
+            }
+            let when = match (&s.rrule, &s.duration) {
+                (Some(r), Some(d)) => {
+                    let rule = match crate::silence::parse_rrule(r.get_ref()) {
+                        Ok(rule) => Some(rule),
+                        Err(e) => {
+                            self.error(&r.span(), e);
+                            None
+                        }
+                    };
+                    let duration_ms = self.duration("duration", d).and_then(|v| {
+                        let ms = i64::try_from(v.as_millis()).unwrap_or(i64::MAX);
+                        if (60_000..=7 * 86_400_000).contains(&ms) {
+                            Some(ms)
+                        } else {
+                            self.error(
+                                &d.span(),
+                                format!(
+                                    "silence {name:?}: duration must be from 1m to 168h (a week)"
+                                ),
+                            );
+                            None
+                        }
+                    });
+                    match (rule, duration_ms, start, end) {
+                        (Some(rule), Some(duration_ms), Some(start_ms), Some(end_ms)) => {
+                            Some(When::Every {
+                                rule,
+                                duration_ms,
+                                start_ms,
+                                end_ms,
+                            })
+                        }
+                        _ => None,
+                    }
+                }
+                (Some(r), None) => {
+                    self.error(
+                        &r.span(),
+                        format!("silence {name:?} has an rrule and needs a duration, as in \"2h\""),
+                    );
+                    None
+                }
+                (None, Some(d)) => {
+                    self.error(
+                        &d.span(),
+                        format!("silence {name:?}: duration applies with an rrule only"),
+                    );
+                    None
+                }
+                (None, None) => match (start, end) {
+                    (Some(Some(start_ms)), Some(Some(end_ms))) => {
+                        Some(When::Once { start_ms, end_ms })
+                    }
+                    (Some(_), Some(_)) => {
+                        self.error(
+                            &s.name.span(),
+                            format!(
+                                "silence {name:?} needs a start and an end, or an rrule and a duration"
+                            ),
+                        );
+                        None
+                    }
+                    _ => None,
+                },
+            };
+            if let (Some(when), true) = (when, self.error_count() == errors_before) {
+                out.push(Silence {
+                    name,
+                    targets: t,
+                    groups: g,
+                    alerts: a,
+                    when,
+                    line,
+                });
+            }
+        }
+        out
     }
 
     /// The `[[alert]]` tables (§21.5 F1–F3). Names are recorded even for a
@@ -1201,6 +1438,7 @@ impl Validator<'_> {
                 },
             },
             alerts,
+            parent: None,
             line: self.position(span.start).0,
         })
     }
@@ -1779,6 +2017,173 @@ name = "Core"
   host   = "10.0.0.2"
   alerts = ["loss-burst", "slow"]
 "#;
+
+    const DEPENDENCIES: &str = r#"
+[server]
+data_dir = "/tmp/rl"
+
+[[alert]]
+name      = "slow"
+metric    = "median"
+condition = "> baseline_p50_7d * 2 + 5ms"
+
+[[silence]]
+name     = "sunday"
+groups   = ["Branch"]
+rrule    = "FREQ=WEEKLY;BYDAY=SU;BYHOUR=2"
+duration = "2h"
+comment  = "ISP maintenance"
+
+[[silence]]
+name    = "works"
+targets = ["gw"]
+alerts  = ["slow"]
+start   = "2026-12-01T22:00:00Z"
+end     = "2026-12-02T04:00:00+01:00"
+
+[[group]]
+name   = "Core"
+alerts = ["slow"]
+
+  [[group.target]]
+  name = "gw"
+  host = "10.0.0.1"
+
+[[group]]
+name   = "Branch"
+parent = "router"
+
+  [[group.target]]
+  name   = "router"
+  host   = "10.1.0.1"
+  parent = "gw"
+
+  [[group.target]]
+  name = "printer"
+  host = "10.1.0.9"
+"#;
+
+    #[test]
+    fn parents_and_silences_parse() {
+        use crate::silence::When;
+        let p = parse(DEPENDENCIES);
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let c = p.config.unwrap();
+        let parent = |id: &str| {
+            c.targets
+                .iter()
+                .find(|t| t.id == id)
+                .and_then(|t| t.parent.clone())
+        };
+        assert_eq!(parent("gw"), None);
+        // The target's own setting, and the group's for the others.
+        assert_eq!(parent("router").as_deref(), Some("gw"));
+        assert_eq!(parent("printer").as_deref(), Some("router"));
+        assert_eq!(c.silences.len(), 2);
+        assert_eq!(c.silences[0].groups, ["Branch"]);
+        assert!(matches!(
+            c.silences[0].when,
+            When::Every {
+                duration_ms: 7_200_000,
+                ..
+            }
+        ));
+        assert_eq!(
+            c.silences[1].when,
+            When::Once {
+                start_ms: 1_796_162_400_000,
+                end_ms: 1_796_180_400_000
+            }
+        );
+        assert_eq!(c.silences[1].alerts, ["slow"]);
+    }
+
+    #[test]
+    fn parent_and_silence_mistakes_are_reported() {
+        for (from, to, message) in [
+            (
+                "parent = \"gw\"",
+                "parent = \"nope\"",
+                "parent \"nope\" of target \"router\" is not a target",
+            ),
+            (
+                "parent = \"gw\"",
+                "parent = \"router\"",
+                "cannot be its own parent",
+            ),
+            (
+                "name = \"gw\"\n",
+                "name = \"gw\"\n  parent = \"printer\"\n",
+                "form a loop",
+            ),
+            (
+                "groups   = [\"Branch\"]",
+                "groups   = [\"Nope\"]",
+                "unknown group \"Nope\"",
+            ),
+            (
+                "targets = [\"gw\"]",
+                "targets = [\"nope\"]",
+                "unknown target \"nope\"",
+            ),
+            (
+                "alerts  = [\"slow\"]",
+                "alerts  = [\"fast\"]",
+                "unknown alert \"fast\"",
+            ),
+            ("BYHOUR=2", "BYHOUR=25", "BYHOUR"),
+            (
+                "FREQ=WEEKLY",
+                "FREQ=MONTHLY",
+                "FREQ=MONTHLY is not supported",
+            ),
+            (
+                "duration = \"2h\"",
+                "duration = \"169h\"",
+                "from 1m to 168h",
+            ),
+            ("duration = \"2h\"", "", "needs a duration"),
+            ("+01:00", "", "is not a time with a zone"),
+            (
+                "end     = \"2026-12-02T04:00:00+01:00\"",
+                "end = \"2026-12-01T21:00:00Z\"",
+                "end must be after start",
+            ),
+            (
+                "end     = \"2026-12-02T04:00:00+01:00\"",
+                "",
+                "needs a start and an end",
+            ),
+            (
+                "name    = \"works\"",
+                "name    = \"sunday\"",
+                "duplicate silence name",
+            ),
+            ("* 2 + 5ms", "* 2 + 5", "needs a time unit"),
+        ] {
+            assert!(DEPENDENCIES.contains(from), "{from}");
+            let src = DEPENDENCIES.replacen(from, to, 1);
+            let errs = errors(&src);
+            assert!(
+                errs.iter().any(|e| e.contains(message)),
+                "{message}: {errs:?}"
+            );
+        }
+        // A parent that is not measured here only warns.
+        let src = DEPENDENCIES.replace(
+            "name   = \"Core\"\n",
+            "name   = \"Core\"\nvantages = [\"elsewhere\"]\n",
+        );
+        let p = parse(&src);
+        assert!(errors(&src).is_empty(), "{:?}", p.diagnostics);
+        assert!(
+            p.diagnostics
+                .iter()
+                .any(|d| d.message.contains("never suppresses")),
+            "{:?}",
+            p.diagnostics
+        );
+    }
 
     #[test]
     fn alert_rules_parse_and_cascade() {

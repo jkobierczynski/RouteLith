@@ -346,11 +346,27 @@
                 " since " + fmtTime(a.since, data.now - a.since > 20 * 3600e3) +
                 " (" + fmtAge(data.now - a.since) + ")" +
                 (a.value !== undefined ? ", " + fmtValue(a.rule, a.value, data.rules) : ""),
-            })
+            }),
+            ...(a.silenced_by
+              ? [" ", el("span", { class: "badge quiet", text: "silenced: " + a.silenced_by, title: "Logged, not sent" })]
+              : []),
+            ...(a.suppressed_by
+              ? [" ", el("span", { class: "badge quiet", text: "parent " + a.suppressed_by + " down", title: "Logged, not sent" })]
+              : [])
           );
         })
-      )
+      ),
+      ...activeSilences(data)
     );
+  }
+
+  // A line naming the silences in force now, if any.
+  function activeSilences(data) {
+    const on = (data.silences || []).filter((x) => x.active);
+    if (!on.length) return [];
+    return [
+      el("p", { class: "muted", text: "Silenced now: " + on.map((x) => x.name + " (" + x.summary + ")").join(", ") }),
+    ];
   }
 
   // Events of one target in the shown range, newest first.

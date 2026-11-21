@@ -6,6 +6,7 @@ pub mod config;
 pub mod duration;
 pub mod mos;
 pub mod round;
+pub mod silence;
 pub mod stats;
 pub mod timing;
 

@@ -127,17 +127,35 @@ fn fixture() -> Fixture {
         e.target = Some("other".into());
         events.append(&e).unwrap();
     }
-    let alerts = Arc::new(AlertBoard::new(vec![RuleInfo {
-        name: "slow".into(),
-        kind: "threshold".into(),
-        summary: "median > 20ms".into(),
-        series: vec![id],
-    }]));
+    let silence = rl_core::silence::Silence {
+        name: "always".into(),
+        targets: Vec::new(),
+        groups: vec!["g".into()],
+        alerts: Vec::new(),
+        when: rl_core::silence::When::Every {
+            rule: rl_core::silence::parse_rrule("FREQ=DAILY").unwrap(),
+            duration_ms: 86_400_000,
+            start_ms: None,
+            end_ms: None,
+        },
+        line: 1,
+    };
+    let alerts = Arc::new(
+        AlertBoard::new(vec![RuleInfo {
+            name: "slow".into(),
+            kind: "threshold".into(),
+            summary: "median > 20ms".into(),
+            series: vec![id],
+        }])
+        .with_silences(vec![silence]),
+    );
     alerts.set_active(vec![rl_alert::ActiveAlert {
         series: id,
         rule: "slow".into(),
         since_ms: T0 + 2 * STEP_MS,
         value: Some(31.25),
+        silenced_by: Some("always".into()),
+        suppressed_by: None,
     }]);
     alerts.count(true);
     let host = Arc::new(LatestHost::default());
@@ -510,6 +528,13 @@ async fn alerts_and_events() {
     assert_eq!(a["since"].as_i64(), Some(T0 + 2 * STEP_MS));
     assert_eq!(a["value"].as_f64(), Some(31.25));
     assert_eq!(v["rules"][0]["summary"], "median > 20ms");
+    assert_eq!(a["silenced_by"], "always");
+    assert!(a.get("suppressed_by").is_none());
+    let sl = &v["silences"][0];
+    assert_eq!(sl["name"], "always");
+    assert_eq!(sl["summary"], "FREQ=DAILY for 24h");
+    assert_eq!(sl["groups"][0], "g");
+    assert_eq!(sl["active"], true);
 
     let uri = format!("/api/v1/events?from={T0}&to={}", T0 + 86_400_000);
     let (st, _, body) = get(&f.router, &uri).await;

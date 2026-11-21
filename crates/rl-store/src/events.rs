@@ -82,6 +82,13 @@ pub struct Event {
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// For an alert, the silence it was raised under: logged, not sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silenced_by: Option<String>,
+    /// For an alert, the parent target that had an alert raised when this
+    /// one was: logged, not sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_by: Option<String>,
     /// One line for people.
     #[serde(default)]
     pub message: String,
@@ -102,6 +109,8 @@ impl Event {
             since: None,
             from: None,
             to: None,
+            silenced_by: None,
+            suppressed_by: None,
             message: message.into(),
         }
     }

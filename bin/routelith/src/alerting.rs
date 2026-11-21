@@ -7,19 +7,29 @@
 //! event log, and pattern rules get the newest stored rounds as history,
 //! so a restart neither raises an alert twice nor forgets one. An alert
 //! whose rule no longer applies to its series is cleared then.
+//!
+//! Baselines (F5) are computed from the hourly tier when the server starts
+//! and again with each series' first round of a new hour. An alert raised
+//! under a silence, or while the target's parent has an alert (F6), is
+//! marked so in the event log, as is its clear: outputs leave both unsent.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rl_alert::{Engine, RoundValues, Transition, active_from_events};
 use rl_core::alert::RuleKind;
 use rl_core::config::Config;
-use rl_store::{EVENT_DAYS, Event, EventKind, EventLog, Reader, SeriesKey, StoredRound};
+use rl_core::silence::Silence;
+use rl_store::{EVENT_DAYS, Event, EventKind, EventLog, Reader, SeriesKey, StoredRound, Tier};
 use rl_web::{AlertBoard, RuleInfo};
 
 const DAY_MS: i64 = 86_400_000;
+const HOUR_MS: i64 = 3_600_000;
+
+/// Why a raised alert is not sent: (silence, parent target).
+type Quiet = (Option<String>, Option<String>);
 
 /// One series as the alerts see it.
 #[derive(Debug, Clone)]
@@ -43,6 +53,16 @@ pub(crate) struct Alerting {
     /// Events that could not be written.
     pub(crate) write_errors: u64,
     last_error: Option<String>,
+    data_dir: PathBuf,
+    /// Opened on the first baseline refresh.
+    reader: Option<Reader>,
+    /// Start of the hour each series' baselines were last computed for.
+    baseline_hour: HashMap<u64, i64>,
+    silences: Vec<Silence>,
+    /// Group and parent of each target.
+    targets: HashMap<String, (String, Option<String>)>,
+    /// Silence and parent of each raised alert, by series and rule.
+    quiet: HashMap<(u64, String), Quiet>,
 }
 
 /// Build the engine and restore the last run's state.
@@ -77,18 +97,33 @@ pub(crate) fn start(
     let mut a = Alerting {
         engine: Engine::new(Vec::new(), []),
         log,
-        board: Arc::new(AlertBoard::new(rules)),
+        board: Arc::new(AlertBoard::new(rules).with_silences(cfg.silences.clone())),
         keys: series.iter().map(|s| (s.id, s.key.clone())).collect(),
         vantage: cfg.server.vantage.clone(),
         last_ip: HashMap::new(),
         write_errors: 0,
         last_error: None,
+        data_dir: data_dir.clone(),
+        reader: None,
+        baseline_hour: HashMap::new(),
+        silences: cfg.silences.clone(),
+        targets: cfg
+            .targets
+            .iter()
+            .map(|t| (t.id.clone(), (t.group.clone(), t.parent.clone())))
+            .collect(),
+        quiet: HashMap::new(),
     };
 
     // Alerts left raised: keep them, or clear those whose rule is gone.
     let mut stale = Vec::new();
     for active in active_from_events(&past) {
-        if !engine.restore(active.series, &active.rule, active.since_ms, active.value) {
+        if engine.restore(active.series, &active.rule, active.since_ms, active.value) {
+            a.quiet.insert(
+                (active.series, active.rule.clone()),
+                (active.silenced_by.clone(), active.suppressed_by.clone()),
+            );
+        } else {
             stale.push(active);
         }
     }
@@ -110,6 +145,8 @@ pub(crate) fn start(
         e.since = Some(s.since_ms);
         e.target = raised.and_then(|r| r.target.clone());
         e.family = raised.and_then(|r| r.family.clone());
+        e.silenced_by = s.silenced_by.clone();
+        e.suppressed_by = s.suppressed_by.clone();
         e.message = format!(
             "{}{} cleared: the rule no longer applies (configuration changed)",
             subject(e.target.as_deref(), e.family.as_deref()),
@@ -120,7 +157,10 @@ pub(crate) fn start(
 
     warm(&mut engine, data_dir, series, now_ms);
     a.engine = engine;
-    let active = a.engine.active();
+    for s in series {
+        a.refresh_baselines(s.id, now_ms);
+    }
+    let active = a.active();
     let e = Event::new(
         now_ms,
         EventKind::ServerStarted,
@@ -137,6 +177,18 @@ pub(crate) fn start(
     a.record(e);
     a.board.set_active(active);
     Ok(a)
+}
+
+/// `" (silenced by x)"`, `" (suppressed: parent y has an alert)"`, or both.
+fn quiet_note(q: &Quiet) -> String {
+    let mut s = String::new();
+    if let Some(name) = &q.0 {
+        s += &format!(" (silenced by {name})");
+    }
+    if let Some(parent) = &q.1 {
+        s += &format!(" (suppressed: parent {parent} has an alert)");
+    }
+    s
 }
 
 /// Give pattern rules the newest stored rounds as history.
@@ -200,14 +252,23 @@ fn subject(target: Option<&str>, family: Option<&str>) -> String {
 impl Alerting {
     /// Evaluate a round the store has just written.
     pub(crate) fn round(&mut self, series: u64, r: &StoredRound) {
+        self.refresh_baselines(series, r.ts_ms);
         let transitions = self.engine.observe(series, &values(r));
         if !transitions.is_empty() {
             for t in transitions {
                 self.board.count(t.raised);
-                let e = self.alert_event(&t);
+                let key = (t.series, t.rule.clone());
+                let quiet = if t.raised {
+                    let q = self.quiet_for(&t);
+                    self.quiet.insert(key, q.clone());
+                    q
+                } else {
+                    self.quiet.remove(&key).unwrap_or_default()
+                };
+                let e = self.alert_event(&t, &quiet);
                 self.record(e);
             }
-            self.board.set_active(self.engine.active());
+            self.board.set_active(self.active());
         }
         if let Some(ip) = r.resolved {
             if let Some(old) = self.last_ip.insert(series, ip) {
@@ -223,6 +284,77 @@ impl Alerting {
                 }
             }
         }
+    }
+
+    /// Active alerts with why each is not sent.
+    fn active(&self) -> Vec<rl_alert::ActiveAlert> {
+        let mut out = self.engine.active();
+        for a in &mut out {
+            if let Some((silence, parent)) = self.quiet.get(&(a.series, a.rule.clone())) {
+                a.silenced_by.clone_from(silence);
+                a.suppressed_by.clone_from(parent);
+            }
+        }
+        out
+    }
+
+    /// The silence an alert is raised under, and the parent target that
+    /// has an alert raised now.
+    fn quiet_for(&self, t: &Transition) -> Quiet {
+        let Some(key) = self.keys.get(&t.series) else {
+            return (None, None);
+        };
+        let Some((group, parent)) = self.targets.get(&key.target) else {
+            return (None, None);
+        };
+        let silence = self
+            .silences
+            .iter()
+            .find(|s| s.applies(&key.target, group, &t.rule) && s.active_at(t.ts_ms))
+            .map(|s| s.name.clone());
+        let parent = parent.as_ref().filter(|p| {
+            self.engine.active().iter().any(|a| {
+                a.series != t.series && self.keys.get(&a.series).is_some_and(|k| &k.target == *p)
+            })
+        });
+        (silence, parent.cloned())
+    }
+
+    /// Recompute the baselines of `series` once per hour, from its hourly
+    /// points of the last 28 days. A read that fails leaves them unknown.
+    fn refresh_baselines(&mut self, series: u64, now_ms: i64) {
+        let used = self.engine.baselines_used(series);
+        let Some(days) = used.iter().map(|(_, b)| b.days).max() else {
+            return;
+        };
+        let hour = now_ms - now_ms.rem_euclid(HOUR_MS);
+        if self.baseline_hour.get(&series).is_some_and(|&h| h >= hour) {
+            return;
+        }
+        self.baseline_hour.insert(series, hour);
+        if self.reader.is_none() {
+            match Reader::open(&self.data_dir) {
+                Ok(r) => self.reader = Some(r),
+                Err(e) => {
+                    eprintln!("routelith server: warning: baselines not computed: {e}");
+                }
+            }
+        }
+        let from = hour - i64::from(days) * 24 * HOUR_MS;
+        let points = match &self.reader {
+            Some(r) => r.read_tier(series, Tier::R1h, from, hour - 1),
+            None => Ok(Vec::new()),
+        };
+        let hourly: Vec<RoundValues> = match points {
+            Ok(p) => p.iter().map(|p| values(&p.to_round())).collect(),
+            Err(e) => {
+                eprintln!(
+                    "routelith server: warning: baselines of series {series} not computed: {e}"
+                );
+                Vec::new()
+            }
+        };
+        self.engine.set_hourly(series, &hourly, now_ms);
     }
 
     /// The store stopped cleanly.
@@ -250,7 +382,7 @@ impl Alerting {
         e
     }
 
-    fn alert_event(&self, t: &Transition) -> Event {
+    fn alert_event(&self, t: &Transition, quiet: &Quiet) -> Event {
         let kind = if t.raised {
             EventKind::AlertRaised
         } else {
@@ -260,10 +392,13 @@ impl Alerting {
         e.rule = Some(t.rule.clone());
         e.value = t.value.map(|v| (v * 1000.0).round() / 1000.0);
         e.since = Some(t.since_ms);
+        e.silenced_by.clone_from(&quiet.0);
+        e.suppressed_by.clone_from(&quiet.1);
         e.message = format!(
-            "{}{}",
+            "{}{}{}",
             subject(e.target.as_deref(), e.family.as_deref()),
-            t.message
+            t.message,
+            quiet_note(quiet)
         );
         e
     }
@@ -384,5 +519,125 @@ mod tests {
             "a (v4): slow cleared: the rule no longer applies (configuration changed)"
         );
         assert_eq!(events[3].kind, EventKind::ServerStarted);
+    }
+
+    const TWO: &str = "[server]\ndata_dir = DIR\n[defaults]\nalerts = [\"slow\"]\n\
+        [[alert]]\nname = \"slow\"\nmetric = \"median\"\ncondition = \"> 20ms\"\n\
+        [[silence]]\nname = \"works\"\ntargets = [\"a\"]\nstart = \"2027-01-15T08:00:00Z\"\n\
+        end = \"2027-01-15T09:00:00Z\"\n\
+        [[group]]\nname = \"g\"\n[[group.target]]\nname = \"a\"\nhost = \"192.0.2.1\"\n\
+        [[group.target]]\nname = \"b\"\nhost = \"192.0.2.2\"\nparent = \"a\"\n";
+
+    fn two(dir: &Path) -> (Config, Vec<SeriesAlerts>) {
+        let src = TWO.replace("DIR", &format!("{:?}", dir.display().to_string()));
+        let p = rl_core::config::parse(&src);
+        let cfg = p.config.unwrap_or_else(|| panic!("{:?}", p.diagnostics));
+        let s = |id, t: &str| SeriesAlerts {
+            id,
+            key: SeriesKey::new("local", t, "v4"),
+            step_ms: 60_000,
+            rules: vec!["slow".into()],
+        };
+        (cfg, vec![s(1, "a"), s(2, "b")])
+    }
+
+    #[test]
+    fn silences_and_parents_mark_alerts_not_to_send() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, series) = two(tmp.path());
+        // 2027-01-15T08:00:00Z, inside the silence.
+        let t0 = T0;
+        let at = |i: i64, ms: u32| StoredRound {
+            ts_ms: t0 + i * STEP,
+            ..round(0, ms, "192.0.2.1")
+        };
+        let mut a = start(&cfg, &series, t0).unwrap();
+        a.round(1, &at(1, 30));
+        // b fails while its parent a has an alert.
+        a.round(2, &at(1, 30));
+        let active = a.board.active();
+        assert_eq!(active[0].silenced_by.as_deref(), Some("works"));
+        assert_eq!(active[1].suppressed_by.as_deref(), Some("a"));
+        assert_eq!(active[1].silenced_by, None, "the silence names a only");
+        // A restart keeps the marks.
+        drop(a);
+        let mut a = start(&cfg, &series, t0 + 2 * STEP).unwrap();
+        assert_eq!(a.board.active()[1].suppressed_by.as_deref(), Some("a"));
+        // a clears; b raised again later is sent. The clears carry the marks.
+        a.round(1, &at(3, 10));
+        a.round(2, &at(3, 10));
+        a.round(2, &at(4, 30));
+        let events = rl_store::read_events(tmp.path(), 0, i64::MAX).unwrap();
+        let alerts: Vec<_> = events
+            .iter()
+            .filter(|e| e.rule.is_some())
+            .map(|e| {
+                (
+                    e.kind,
+                    e.target.as_deref().unwrap(),
+                    e.silenced_by.as_deref(),
+                    e.suppressed_by.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            alerts,
+            [
+                (EventKind::AlertRaised, "a", Some("works"), None),
+                (EventKind::AlertRaised, "b", None, Some("a")),
+                (EventKind::AlertCleared, "a", Some("works"), None),
+                (EventKind::AlertCleared, "b", None, Some("a")),
+                (EventKind::AlertRaised, "b", None, None),
+            ]
+        );
+        assert_eq!(
+            events[1].message,
+            "a (v4): slow raised: median 30ms > 20ms (silenced by works)"
+        );
+        assert_eq!(
+            events[2].message,
+            "b (v4): slow raised: median 30ms > 20ms (suppressed: parent a has an alert)"
+        );
+    }
+
+    #[test]
+    fn baselines_come_from_the_hourly_tier() {
+        use rl_store::{Writer, WriterOptions};
+        let tmp = tempfile::tempdir().unwrap();
+        let rule = "[defaults]\nalerts = [\"above\"]\n[[alert]]\nname = \"above\"\n\
+            metric = \"median\"\ncondition = \"> baseline_p50_1d * 2\"\n";
+        let cfg = config(tmp.path(), rule);
+        // 26 hours of 10 ms rounds every 10 minutes before T0.
+        let start_ms = T0 - 26 * HOUR_MS;
+        let (mut w, _) = Writer::open(tmp.path(), WriterOptions::default(), start_ms).unwrap();
+        let key = SeriesKey::new("local", "a", "v4");
+        let id = w.register(std::slice::from_ref(&key)).unwrap()[0];
+        for i in 0..26 * 6 {
+            let mut r = round(0, 10, "192.0.2.1");
+            r.ts_ms = start_ms + i * 600_000;
+            w.append(id, r).unwrap();
+        }
+        w.close().unwrap();
+        let series = vec![SeriesAlerts {
+            id,
+            key,
+            step_ms: 60_000,
+            rules: vec!["above".into()],
+        }];
+        let mut a = start(&cfg, &series, T0).unwrap();
+        a.round(id, &round(1, 15, "192.0.2.1"));
+        assert!(a.board.active().is_empty());
+        a.round(id, &round(2, 25, "192.0.2.1"));
+        let events = rl_store::read_events(tmp.path(), 0, i64::MAX).unwrap();
+        assert_eq!(
+            events.last().unwrap().message,
+            "a (v4): above raised: median 25ms > baseline_p50_1d * 2 (= 20ms)"
+        );
+        // Without enough history the rule cannot raise.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(tmp.path(), rule);
+        let mut a = start(&cfg, &series, T0).unwrap();
+        a.round(id, &round(1, 500, "192.0.2.1"));
+        assert!(a.board.active().is_empty());
     }
 }
