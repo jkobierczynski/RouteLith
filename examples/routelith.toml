@@ -62,6 +62,29 @@ groups   = ["Internet"]          # or targets = [...]; neither: every target
 rrule    = "FREQ=WEEKLY;BYDAY=SU;BYHOUR=2;BYMINUTE=0"
 duration = "2h"
 
+# Events sent on as they happen. Each output has its own queue and thread,
+# so one that is down never slows the others or the store. Filters (all
+# optional): events (alert_raised, alert_cleared, ip_changed,
+# server_started, server_stopped), targets, groups, alerts. Silenced and
+# suppressed alerts are not sent unless quiet = true. Uncomment to use.
+# [[output]]
+# name      = "siem"
+# type      = "syslog"
+# address   = "siem.example.net"    # host[:port]; port 514, or 6514 for tls
+# transport = "tls"                 # udp (default), tcp or tls
+# format    = "rfc3164"             # default rfc5424
+# facility  = "local0"              # the default
+# framing   = "lf"                  # tcp/tls; default octet-counting
+# ca_file   = "/etc/routelith/siem-ca.pem"  # added to the system's CAs
+# cert_file = "/etc/routelith/client.pem"   # client certificate, with
+# key_file  = "/etc/routelith/client.key"   # its key
+# events    = ["alert_raised", "alert_cleared"]
+#
+# [[output]]
+# name = "archive"
+# type = "jsonl"
+# path = "/var/log/routelith/events.jsonl"
+
 [[group]]
 name = "Core"
 alerts = ["down", "loss-burst"]

@@ -18,6 +18,7 @@ rl-sched.workspace = true
 rl-store.workspace = true
 rl-sys.workspace = true
 rl-web.workspace = true
+rl-out.workspace = true
 # 0.20: newer releases need a newer Rust than the 1.85 MSRV.
 roxmltree = "0.20"
 tokio = { workspace = true, features = ["signal"] }
@@ -26,6 +27,7 @@ tokio = { workspace = true, features = ["signal"] }
 windows-service.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

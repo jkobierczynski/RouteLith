@@ -12,11 +12,15 @@
 //! and again with each series' first round of a new hour. An alert raised
 //! under a silence, or while the target's parent has an alert (F6), is
 //! marked so in the event log, as is its clear: outputs leave both unsent.
+//!
+//! Every event is also handed to the outputs (F7: syslog, JSON lines),
+//! which queue it and send it from their own threads.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rl_alert::{Engine, RoundValues, Transition, active_from_events};
 use rl_core::alert::RuleKind;
@@ -27,6 +31,8 @@ use rl_web::{AlertBoard, RuleInfo};
 
 const DAY_MS: i64 = 86_400_000;
 const HOUR_MS: i64 = 3_600_000;
+/// How long the outputs may take to deliver what is queued at stop.
+const OUTPUT_GRACE: Duration = Duration::from_secs(5);
 
 /// Why a raised alert is not sent: (silence, parent target).
 type Quiet = (Option<String>, Option<String>);
@@ -63,6 +69,7 @@ pub(crate) struct Alerting {
     targets: HashMap<String, (String, Option<String>)>,
     /// Silence and parent of each raised alert, by series and rule.
     quiet: HashMap<(u64, String), Quiet>,
+    pub(crate) outputs: rl_out::Outputs,
 }
 
 /// Build the engine and restore the last run's state.
@@ -92,6 +99,13 @@ pub(crate) fn start(
         .collect();
     let log = EventLog::open(data_dir, EVENT_DAYS)
         .map_err(|e| format!("cannot open the event log: {e}"))?;
+    let outputs = rl_out::Outputs::start(
+        &cfg.outputs,
+        cfg.targets
+            .iter()
+            .map(|t| (t.id.clone(), t.group.clone()))
+            .collect(),
+    )?;
     let past = rl_store::read_events(data_dir, now_ms - (EVENT_DAYS + 1) * DAY_MS, i64::MAX)
         .map_err(|e| format!("cannot read the event log: {e}"))?;
     let mut a = Alerting {
@@ -113,6 +127,7 @@ pub(crate) fn start(
             .map(|t| (t.id.clone(), (t.group.clone(), t.parent.clone())))
             .collect(),
         quiet: HashMap::new(),
+        outputs,
     };
 
     // Alerts left raised: keep them, or clear those whose rule is gone.
@@ -366,7 +381,8 @@ impl Alerting {
         self.engine.set_hourly(series, &hourly, now_ms);
     }
 
-    /// The store stopped cleanly.
+    /// The store stopped cleanly: log it, and give the outputs a few
+    /// seconds to deliver what they hold.
     pub(crate) fn stopped(&mut self, now_ms: i64) {
         let active = self.engine.active().len();
         let e = Event::new(
@@ -379,6 +395,7 @@ impl Alerting {
             ),
         );
         self.record(e);
+        std::mem::replace(&mut self.outputs, rl_out::Outputs::none()).close(OUTPUT_GRACE);
     }
 
     fn series_event(&self, series: u64, t: i64, kind: EventKind) -> Event {
@@ -412,10 +429,12 @@ impl Alerting {
         e
     }
 
-    /// Write an event and say it on stderr. A write that fails is counted
-    /// and reported, but does not stop the store.
+    /// Write an event, say it on stderr and queue it for the outputs. A
+    /// write that fails is counted and reported, but does not stop the
+    /// store.
     fn record(&mut self, e: Event) {
         eprintln!("routelith server: event: {}", e.message);
+        self.outputs.send(&e);
         if let Err(err) = self.log.append(&e) {
             self.write_errors += 1;
             let msg = err.to_string();
@@ -507,6 +526,42 @@ mod tests {
             (events[4].from.as_deref(), events[4].to.as_deref()),
             (Some("192.0.2.1"), Some("192.0.2.9"))
         );
+    }
+
+    #[test]
+    fn events_reach_the_outputs_except_silenced_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.jsonl");
+        let rules = format!(
+            "{SLOW}[[alert]]\nname = \"fast\"\nmetric = \"median\"\ncondition = \"< 15ms\"\n\
+             [[silence]]\nname = \"m\"\nalerts = [\"fast\"]\n\
+             start = \"2020-01-01T00:00:00Z\"\nend = \"2099-01-01T00:00:00Z\"\n\
+             [[output]]\nname = \"file\"\ntype = \"jsonl\"\npath = {:?}\n",
+            out.display().to_string()
+        );
+        let mut cfg = config(tmp.path(), &rules);
+        cfg.targets[0].alerts.push("fast".into());
+        let mut a = start(&cfg, &series(&["slow", "fast"]), T0).unwrap();
+        a.round(1, &round(1, 30, "192.0.2.1")); // slow raised
+        a.round(1, &round(2, 10, "192.0.2.1")); // slow cleared, fast raised (silenced)
+        a.stopped(T0 + 3 * STEP);
+        let sent: Vec<(EventKind, Option<String>)> = std::fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<Event>(l).unwrap())
+            .map(|e| (e.kind, e.rule))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (EventKind::ServerStarted, None),
+                (EventKind::AlertRaised, Some("slow".into())),
+                (EventKind::AlertCleared, Some("slow".into())),
+                (EventKind::ServerStopped, None),
+            ]
+        );
+        // The event log has the silenced raise too.
+        assert!(kinds(tmp.path()).contains(&(EventKind::AlertRaised, Some("fast".into()))));
     }
 
     #[test]
