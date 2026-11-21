@@ -356,7 +356,7 @@
               ? [" ", el("span", { class: "badge quiet", text: "silenced: " + a.silenced_by, title: "Logged, not sent" })]
               : []),
             ...(a.suppressed_by
-              ? [" ", el("span", { class: "badge quiet", text: "parent " + a.suppressed_by + " down", title: "Logged, not sent" })]
+              ? [" ", el("span", { class: "badge quiet", text: "suppressed: parent " + a.suppressed_by + " had an alert", title: "Logged, not sent" })]
               : [])
           );
         })
