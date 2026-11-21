@@ -1053,6 +1053,8 @@ impl Validator<'_> {
     ) -> Vec<Output> {
         let mut out = Vec::new();
         let mut first_line: HashMap<String, usize> = HashMap::new();
+        // JSON-lines files, by the line of the output that writes each.
+        let mut files: HashMap<PathBuf, usize> = HashMap::new();
         for o in raw {
             let line = self.position(o.span().start).0;
             let errors_before = self.error_count();
@@ -1139,9 +1141,20 @@ impl Validator<'_> {
                     not_for(self, &syslog_keys, "syslog");
                     match &o.path {
                         Some(p) if !p.get_ref().trim().is_empty() => {
-                            Some(OutputKind::Jsonl(JsonlOutput {
-                                path: PathBuf::from(p.get_ref()),
-                            }))
+                            let path = PathBuf::from(p.get_ref());
+                            if let Some(first) = files.get(&path) {
+                                // Two writers would interleave their lines.
+                                self.error(
+                                    &p.span(),
+                                    format!(
+                                        "output {name:?}: the output on line {first} already \
+                                         writes this file"
+                                    ),
+                                );
+                            } else {
+                                files.insert(path.clone(), line);
+                            }
+                            Some(OutputKind::Jsonl(JsonlOutput { path }))
                         }
                         Some(p) => {
                             self.error(&p.span(), format!("output {name:?}: path is empty"));
@@ -2676,6 +2689,11 @@ alerts = ["loss"]
                 "quiet   = true",
                 "quiet = true\nsd_id = \"routelith\"",
                 "name@enterprise-number",
+            ),
+            (
+                "queue = 50",
+                "queue = 50\n[[output]]\nname = \"again\"\ntype = \"jsonl\"\npath = \"/var/log/routelith/events.jsonl\"",
+                "already writes this file",
             ),
         ] {
             assert!(OUTPUTS.contains(from), "{from}");
