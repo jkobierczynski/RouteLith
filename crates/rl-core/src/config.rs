@@ -1538,6 +1538,16 @@ impl Validator<'_> {
         if let Some(v) = &s.spread {
             self.duration("spread", v);
         }
+        // Names are checked where they are written, so a typo in
+        // [defaults] is reported even if every target overrides it.
+        if let Some(v) = &s.alerts {
+            for name in v.get_ref() {
+                if !self.alert_names.contains_key(name) {
+                    let msg = format!("unknown alert {name:?}; define it in an [[alert]] table");
+                    self.error(&v.span(), msg);
+                }
+            }
+        }
     }
 
     fn error_count(&self) -> usize {
@@ -1861,6 +1871,18 @@ name = "Core"
                 "{to:?}: want {want:?} in {errs:?}"
             );
         }
+        // A typo in [defaults] is reported even when every target
+        // overrides the list.
+        let src = ALERTS
+            .replacen("alerts = [\"loss-burst\"]", "alerts = [\"los-burst\"]", 1)
+            .replace("  name = \"a\"\n", "  name = \"a\"\n  alerts = []\n")
+            .replace("alerts = [\"loss-burst\", \"slow\"]", "alerts = []");
+        let errs = errors(&src);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("unknown alert \"los-burst\"")),
+            "{errs:?}"
+        );
         // A rule no target uses is only a warning.
         let src = ALERTS.replace(", \"slow\"]", "]");
         let p = parse(&src);

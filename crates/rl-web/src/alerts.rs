@@ -112,10 +112,13 @@ pub(crate) struct EventQuery {
     from: Option<i64>,
     to: Option<i64>,
     limit: Option<usize>,
+    /// Only this target's events (applied before `limit`).
+    target: Option<String>,
 }
 
 /// Events with `from <= t < to`, newest first, at most `limit` (default
-/// 200, at most 5000). Without `from`, the 7 days before `to`.
+/// 200, at most 5000), of one `target` if given. Without `from`, the 7
+/// days before `to`.
 pub(crate) async fn events(
     State(s): State<Arc<AppState>>,
     q: Result<Query<EventQuery>, QueryRejection>,
@@ -143,6 +146,9 @@ pub(crate) async fn events(
         Ok(Err(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+    if let Some(t) = &q.target {
+        events.retain(|e| e.target.as_deref() == Some(t.as_str()));
+    }
     events.reverse();
     let more = events.len() > limit;
     events.truncate(limit);

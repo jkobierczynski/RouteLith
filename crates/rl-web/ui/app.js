@@ -354,8 +354,8 @@
   }
 
   // Events of one target in the shown range, newest first.
-  function showEvents(panel, events, name, from, to) {
-    const mine = events.filter((e) => e.target === name && e.t >= from && e.t <= to);
+  function showEvents(panel, data, name, from, to) {
+    const mine = data.events.filter((e) => e.target === name && e.t >= from && e.t <= to);
     panel.hidden = mine.length === 0;
     if (!mine.length) return;
     panel.replaceChildren(
@@ -371,7 +371,23 @@
             e.message
           )
         )
-      )
+      ),
+      ...(mine.length > 50 || data.truncated
+        ? [
+            el(
+              "p",
+              { class: "muted" },
+              "Only the newest 50 events are shown. ",
+              el("a", {
+                href:
+                  "/api/v1/events?target=" + encodeURIComponent(name) +
+                  "&from=" + Math.floor(from) + "&to=" + (Math.floor(to) + 1) + "&limit=5000",
+                text: "Up to 5000 of this range",
+              }),
+              " are in the API; for more, ask for a shorter range."
+            ),
+          ]
+        : [])
     );
   }
 
@@ -413,9 +429,11 @@
       const to = Date.now();
       const from = to - RANGE_MS[range];
       try {
-        const d = await getJson("/api/v1/events?from=" + Math.floor(from) + "&to=" + (to + 1) + "&limit=5000");
+        const d = await getJson(
+          "/api/v1/events?from=" + Math.floor(from) + "&to=" + (to + 1) + "&limit=500&target=" + encodeURIComponent(name)
+        );
         if (gen !== generation) return;
-        showEvents(eventPanel, d.events, name, from, to);
+        showEvents(eventPanel, d, name, from, to);
       } catch (_) {
         eventPanel.hidden = true;
       }

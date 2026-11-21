@@ -112,7 +112,19 @@ fn fixture() -> Fixture {
     {
         let mut e = Event::new(T0 + i as i64 * STEP_MS, kind, "home", format!("event {i}"));
         e.series = Some(id);
+        e.target = Some("gw \"main\"".into());
         e.rule = Some("slow".into());
+        events.append(&e).unwrap();
+    }
+    // Another target's events after them.
+    for i in 0..3 {
+        let mut e = Event::new(
+            T0 + (3 + i) * STEP_MS,
+            EventKind::IpChanged,
+            "home",
+            "other",
+        );
+        e.target = Some("other".into());
         events.append(&e).unwrap();
     }
     let alerts = Arc::new(AlertBoard::new(vec![RuleInfo {
@@ -509,13 +521,19 @@ async fn alerts_and_events() {
         .iter()
         .map(|e| e["message"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(msgs, ["event 2", "event 1", "event 0"], "newest first");
-    assert_eq!(v["events"][0]["kind"], "alert_raised");
+    assert_eq!(msgs[3..], ["event 2", "event 1", "event 0"], "newest first");
+    assert_eq!(v["events"][3]["kind"], "alert_raised");
     assert_eq!(v["truncated"], false);
 
     let (_, _, body) = get(&f.router, &format!("{uri}&limit=1")).await;
     let v = json(&body);
     assert_eq!(v["events"].as_array().unwrap().len(), 1);
+    assert_eq!(v["truncated"], true);
+
+    // The target filter applies before the limit.
+    let (_, _, body) = get(&f.router, &format!("{uri}&limit=1&target=gw%20%22main%22")).await;
+    let v = json(&body);
+    assert_eq!(v["events"][0]["message"], "event 2");
     assert_eq!(v["truncated"], true);
 
     for bad in ["/api/v1/events?from=x", "/api/v1/events?from=10&to=5"] {

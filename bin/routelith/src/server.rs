@@ -665,6 +665,17 @@ fn nearest_rank(sorted: &[u32], p: usize) -> Option<u32> {
     Some(sorted[rank.min(n) - 1])
 }
 
+/// The median as SmokePing (and alert rules) take it: the mean of the two
+/// middle values for an even count.
+fn median(sorted: &[u32]) -> Option<u32> {
+    let n = sorted.len();
+    match n {
+        0 => None,
+        _ if n % 2 == 1 => Some(sorted[n / 2]),
+        _ => u32::try_from((u64::from(sorted[n / 2 - 1]) + u64::from(sorted[n / 2])) / 2).ok(),
+    }
+}
+
 /// The newest round as `/metrics` shows it.
 fn latest_round(c: &Completed, r: &StoredRound) -> LatestRound {
     let q = |p: usize| nearest_rank(&r.rtts_us, p);
@@ -691,7 +702,7 @@ fn latest_round(c: &Completed, r: &StoredRound) -> LatestRound {
         sent: u32::from(r.sent),
         received: u32::try_from(r.rtts_us.len()).unwrap_or(u32::MAX),
         min_us: q(0),
-        median_us: q(50),
+        median_us: median(&r.rtts_us),
         p90_us: q(90),
         max_us: q(100),
         errors: r.errors.total(),
@@ -942,6 +953,13 @@ mod tests {
         };
         let l = latest_round(&c, &stored(&c).unwrap());
         assert_eq!((l.median_us, l.http_phases_us), (None, None));
+    }
+
+    #[test]
+    fn the_median_of_an_even_round_is_the_middle_pair_mean() {
+        assert_eq!(median(&[1000, 39_000]), Some(20_000));
+        assert_eq!(median(&[100, 200, 300]), Some(200));
+        assert_eq!(median(&[]), None);
     }
 
     #[test]
