@@ -236,6 +236,15 @@ fn warm(engine: &mut Engine, data_dir: &Path, series: &[SeriesAlerts], now_ms: i
     }
 }
 
+/// An hourly point as a round: its quantiles as the replies, with its
+/// real sent and received counts (not the graph's scaled ones), so the
+/// loss is exact.
+fn hour_values(p: &rl_store::RollupPoint) -> RoundValues {
+    let mut v = RoundValues::from_sorted(p.ts_ms, p.sent, &p.quantiles_us);
+    v.received = p.received.min(p.sent);
+    v
+}
+
 fn values(r: &StoredRound) -> RoundValues {
     RoundValues::from_sorted(r.ts_ms, u32::from(r.sent), &r.rtts_us)
 }
@@ -346,7 +355,7 @@ impl Alerting {
             None => Ok(Vec::new()),
         };
         let hourly: Vec<RoundValues> = match points {
-            Ok(p) => p.iter().map(|p| values(&p.to_round())).collect(),
+            Ok(p) => p.iter().map(hour_values).collect(),
             Err(e) => {
                 eprintln!(
                     "routelith server: warning: baselines of series {series} not computed: {e}"
@@ -598,6 +607,21 @@ mod tests {
             events[2].message,
             "b (v4): slow raised: median 30ms > 20ms (suppressed: parent a has an alert)"
         );
+    }
+
+    #[test]
+    fn hourly_loss_uses_the_real_counts() {
+        let p = rl_store::RollupPoint {
+            ts_ms: T0,
+            rounds: 60,
+            sent: 1200,
+            received: 1141,
+            quantiles_us: (1..=rl_store::QUANTILES as u32).map(|i| i * 1000).collect(),
+        };
+        let v = hour_values(&p);
+        let loss = v.metric(rl_core::alert::Metric::Loss).unwrap();
+        assert!((loss - 100.0 * 59.0 / 1200.0).abs() < 1e-9, "{loss}");
+        assert_eq!(v.min_us, Some(1000));
     }
 
     #[test]

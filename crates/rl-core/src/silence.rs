@@ -247,8 +247,20 @@ pub fn parse_time(s: &str) -> Result<i64, String> {
         [h, m, s] => (h, m, s),
         _ => return Err(bad()),
     };
+    // Fractional seconds are allowed; milliseconds are kept.
+    let (sec, frac_ms) = match sec.split_once('.') {
+        None => (sec, 0),
+        Some((sec, frac)) if !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit()) => {
+            let digits: String = frac.chars().chain("00".chars()).take(3).collect();
+            (sec, digits.parse::<i64>().map_err(|_| bad())?)
+        }
+        Some(_) => return Err(bad()),
+    };
     let (h, mi, sec) = (num(h, 0, 23)?, num(mi, 0, 59)?, num(sec, 0, 59)?);
-    Ok(days_from_civil(y, mo, da) * DAY_MS + h * HOUR_MS + mi * MINUTE_MS + sec * 1000 - offset_ms)
+    Ok(
+        days_from_civil(y, mo, da) * DAY_MS + h * HOUR_MS + mi * MINUTE_MS + sec * 1000 + frac_ms
+            - offset_ms,
+    )
 }
 
 /// `2026-12-01 22:00 UTC`.

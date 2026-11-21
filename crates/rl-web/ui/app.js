@@ -324,8 +324,13 @@
 
   function showAlerts(panel, data) {
     const list = data.active;
-    panel.hidden = list.length === 0;
-    if (!list.length) return;
+    const silences = activeSilences(data);
+    panel.hidden = list.length === 0 && silences.length === 0;
+    if (panel.hidden) return;
+    if (!list.length) {
+      panel.replaceChildren(...silences);
+      return;
+    }
     panel.replaceChildren(
       el("h2", { text: list.length === 1 ? "1 alert raised" : list.length + " alerts raised" }),
       el(
@@ -356,7 +361,7 @@
           );
         })
       ),
-      ...activeSilences(data)
+      ...silences
     );
   }
 
