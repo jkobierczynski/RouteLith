@@ -190,6 +190,7 @@ pub(crate) async fn serve(
         }
     };
     let board = alerting.board.clone();
+    let output_stats = alerting.outputs.stats();
 
     // The HTTP side: bind now, so a port in use stops start-up.
     let latest = Arc::new(Latest::default());
@@ -221,7 +222,11 @@ pub(crate) async fn serve(
                 latest: latest.clone(),
                 vantage: cfg.server.vantage.clone(),
                 started: Instant::now(),
-                extra_metrics: Some(extra_metrics(stats.clone(), store_stats.clone())),
+                extra_metrics: Some(extra_metrics(
+                    stats.clone(),
+                    store_stats.clone(),
+                    output_stats.clone(),
+                )),
                 alerts: board.clone(),
             };
             Some((addr, listener, rl_web::router(Arc::new(state))))
@@ -714,7 +719,11 @@ fn latest_round(c: &Completed, r: &StoredRound) -> LatestRound {
 }
 
 /// Scheduler and store counters for `/metrics`.
-fn extra_metrics(stats: Arc<Stats>, store: Arc<Mutex<StoreCounters>>) -> rl_web::ExtraMetrics {
+fn extra_metrics(
+    stats: Arc<Stats>,
+    store: Arc<Mutex<StoreCounters>>,
+    outputs: Vec<Arc<rl_out::OutputStats>>,
+) -> rl_web::ExtraMetrics {
     Arc::new(move |m: &mut MetricsWriter| {
         let s = stats.snapshot(false);
         let st = *store.lock().unwrap_or_else(PoisonError::into_inner);
@@ -808,7 +817,60 @@ fn extra_metrics(stats: Arc<Stats>, store: Arc<Mutex<StoreCounters>>) -> rl_web:
                 );
             }
         }
+        output_metrics(m, &outputs);
     })
+}
+
+/// Per-output counters (§21.5 F7), labelled with the output's name and type.
+fn output_metrics(m: &mut MetricsWriter, outputs: &[Arc<rl_out::OutputStats>]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if outputs.is_empty() {
+        return;
+    }
+    type Get = fn(&rl_out::OutputStats) -> u64;
+    let families: [(&str, &str, &str, Get); 5] = [
+        (
+            "routelith_output_events_sent_total",
+            "counter",
+            "Events an output delivered.",
+            |o| o.sent.load(Relaxed),
+        ),
+        (
+            "routelith_output_events_dropped_total",
+            "counter",
+            "Events an output dropped: its queue was full, or the server stopped first.",
+            |o| o.dropped.load(Relaxed),
+        ),
+        (
+            "routelith_output_errors_total",
+            "counter",
+            "Failed delivery attempts of an output (each retry counts).",
+            |o| o.errors.load(Relaxed),
+        ),
+        (
+            "routelith_output_queue_length",
+            "gauge",
+            "Events waiting in an output's queue.",
+            |o| o.queued.load(Relaxed),
+        ),
+        (
+            "routelith_output_up",
+            "gauge",
+            "1 unless the output's last delivery attempt failed.",
+            |o| u64::from(o.up.load(Relaxed)),
+        ),
+    ];
+    for (name, kind, help, get) in families {
+        m.family(name, kind, help);
+        for o in outputs {
+            #[allow(clippy::cast_precision_loss)]
+            m.sample(
+                name,
+                &[("output", &o.name), ("type", o.kind)],
+                get(o) as f64,
+            );
+        }
+    }
 }
 
 fn stats_line(s: &Snapshot, window: &str) -> String {
