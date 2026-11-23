@@ -1,6 +1,6 @@
 //! Outputs (architecture doc §11.2, §11.3, §21.5 F7, F8, F10): events sent
-//! on from the event log to syslog receivers, JSON-lines files, webhooks
-//! and (on Windows) the Windows Event Log.
+//! on from the event log to syslog receivers, JSON-lines files, webhooks,
+//! e-mail and (on Windows) the Windows Event Log.
 //!
 //! Each output has its own bounded queue and its own thread. [`Outputs::send`]
 //! only filters and queues, so it never waits on the network or a disk: a
@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+mod email;
 #[cfg(windows)]
 pub mod eventlog;
 mod jsonl;
@@ -33,6 +34,7 @@ use std::time::{Duration, Instant};
 use rl_core::output::{EventFilter, Output, OutputKind};
 use rl_store::Event;
 
+pub use email::GraphFn;
 pub use syslog::{Header, format_rfc3164, format_rfc5424, machine_hostname};
 
 /// The first pause after a failed send; it doubles up to [`MAX_BACKOFF`].
@@ -45,7 +47,7 @@ pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct OutputStats {
     pub name: String,
-    /// `syslog`, `jsonl`, `webhook` or `eventlog`.
+    /// `syslog`, `jsonl`, `webhook`, `email` or `eventlog`.
     pub kind: &'static str,
     /// Events delivered.
     pub sent: AtomicU64,
@@ -157,9 +159,14 @@ impl Outputs {
     }
 
     /// Start a thread for each output. `groups` maps each target to its
-    /// group. Fails on what can be checked now: unreadable certificate
-    /// files, a JSON-lines file that cannot be opened.
-    pub fn start(outputs: &[Output], groups: HashMap<String, String>) -> Result<Self, String> {
+    /// group; `graph` draws the PNG e-mails attach. Fails on what can be
+    /// checked now: unreadable certificate files, a JSON-lines file that
+    /// cannot be opened, an e-mail address the mail library refuses.
+    pub fn start(
+        outputs: &[Output],
+        groups: HashMap<String, String>,
+        graph: Option<GraphFn>,
+    ) -> Result<Self, String> {
         let hostname = machine_hostname();
         let mut sinks: Vec<(&Output, Box<dyn Sink>)> = Vec::new();
         // The file each JSON-lines output writes, as the system resolves it:
@@ -174,6 +181,10 @@ impl Outputs {
                 ),
                 OutputKind::Webhook(w) => Box::new(
                     webhook::WebhookSink::new(w)
+                        .map_err(|e| format!("output {:?}: {e}", o.name))?,
+                ),
+                OutputKind::Email(m) => Box::new(
+                    email::EmailSink::new(m, hostname.as_deref(), graph.clone())
                         .map_err(|e| format!("output {:?}: {e}", o.name))?,
                 ),
                 OutputKind::Jsonl(j) => {

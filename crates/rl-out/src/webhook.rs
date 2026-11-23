@@ -416,24 +416,31 @@ pub(crate) fn title(e: &Event) -> String {
     }
 }
 
+/// The event's fields for people, in a fixed order.
+pub(crate) fn facts(e: &Event) -> Vec<(&'static str, String)> {
+    [
+        ("Target", e.target.clone()),
+        ("Family", e.family.clone()),
+        ("Rule", e.rule.clone()),
+        ("Value", e.value.map(|v| v.to_string())),
+        ("Since", e.since.map(rfc3339)),
+        ("From", e.from.clone()),
+        ("To", e.to.clone()),
+        ("Vantage", Some(e.vantage.clone())),
+        ("Time", Some(rfc3339(e.t))),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| Some((k, v?)))
+    .collect()
+}
+
 /// A Teams message holding an Adaptive Card: the title, the message and
 /// the event's fields.
 fn teams_card(e: &Event, title: &str) -> Value {
-    let mut facts = Vec::new();
-    let mut fact = |name: &str, v: Option<String>| {
-        if let Some(v) = v {
-            facts.push(json!({ "title": name, "value": v }));
-        }
-    };
-    fact("Target", e.target.clone());
-    fact("Family", e.family.clone());
-    fact("Rule", e.rule.clone());
-    fact("Value", e.value.map(|v| v.to_string()));
-    fact("Since", e.since.map(rfc3339));
-    fact("From", e.from.clone());
-    fact("To", e.to.clone());
-    fact("Vantage", Some(e.vantage.clone()));
-    fact("Time", Some(rfc3339(e.t)));
+    let facts: Vec<Value> = facts(e)
+        .into_iter()
+        .map(|(name, v)| json!({ "title": name, "value": v }))
+        .collect();
     json!({
         "type": "message",
         "attachments": [{

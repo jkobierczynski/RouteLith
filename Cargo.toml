@@ -29,6 +29,9 @@ clap = { version = "4.5", features = ["derive"] }
 http-body-util = "0.1"
 hyper = { version = "1.6", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "0.1.10", default-features = false, features = ["tokio"] }
+# SMTP for e-mail outputs (§21.5 F10): rustls with ring and the system's
+# CA certificates, no native-tls or OpenSSL.
+lettre = { version = "0.11.24", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "rustls-native-certs"] }
 libc = "0.2"
 proptest = "1.11"
 rcgen = "0.14"

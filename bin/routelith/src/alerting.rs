@@ -105,6 +105,7 @@ pub(crate) fn start(
             .iter()
             .map(|t| (t.id.clone(), t.group.clone()))
             .collect(),
+        Some(crate::render::email_graph(data_dir.clone())),
     )?;
     let past = rl_store::read_events(data_dir, now_ms - (EVENT_DAYS + 1) * DAY_MS, i64::MAX)
         .map_err(|e| format!("cannot read the event log: {e}"))?;

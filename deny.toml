@@ -33,6 +33,8 @@ ignore = [
 [licenses]
 # Licences compatible with GPL-3.0-or-later.
 allow = [
+    # quoted_printable (lettre, e-mail outputs): public-domain-like, GPL-compatible.
+    "0BSD",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",

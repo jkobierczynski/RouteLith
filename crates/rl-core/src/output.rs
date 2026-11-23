@@ -1,11 +1,11 @@
 //! Outputs (architecture doc §11.2, §21.5 F7): where events go besides
 //! the event log. Each `[[output]]` table names one, with a filter on the
 //! events it takes. This version sends to syslog, to a JSON-lines file,
-//! to webhooks and (on Windows) to the Windows Event Log; e-mail comes later
-//! in M2.
+//! to webhooks, by e-mail and (on Windows) to the Windows Event Log.
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::config::HttpUrl;
 use crate::secret::Secret;
@@ -35,6 +35,7 @@ pub enum OutputKind {
     /// The Windows Application log, source `Routelith` (doc §11.3, F8).
     EventLog,
     Webhook(WebhookOutput),
+    Email(EmailOutput),
 }
 
 impl OutputKind {
@@ -44,6 +45,7 @@ impl OutputKind {
             OutputKind::Jsonl(_) => "jsonl",
             OutputKind::EventLog => "eventlog",
             OutputKind::Webhook(_) => "webhook",
+            OutputKind::Email(_) => "email",
         }
     }
 }
@@ -228,3 +230,55 @@ impl WebhookFormat {
         ("gotify", WebhookFormat::Gotify),
     ];
 }
+
+/// An e-mail per event over SMTP (doc §11.4, F10), with a PNG of the
+/// series' smoke graph attached when the event has a series.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailOutput {
+    /// The SMTP server (a relay or submission server).
+    pub host: String,
+    pub port: u16,
+    pub security: SmtpSecurity,
+    /// Log in with these; the password comes from `${env:}` or `${file:}`.
+    pub username: Option<String>,
+    pub password: Option<Secret>,
+    /// `addr@example.net` or `Name <addr@example.net>`.
+    pub from: String,
+    pub to: Vec<String>,
+    /// Added to the system's CAs.
+    pub ca_file: Option<PathBuf>,
+    /// The time span of the attached graph, ending when the mail is sent;
+    /// `None`: no graph.
+    pub graph: Option<Duration>,
+}
+
+/// How the SMTP connection is protected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmtpSecurity {
+    /// Plain connection upgraded with STARTTLS, which must succeed (port 587).
+    StartTls,
+    /// TLS from the first byte (port 465).
+    Tls,
+    /// No TLS (port 25); only allowed without a password or to a loopback
+    /// server.
+    None,
+}
+
+impl SmtpSecurity {
+    pub const NAMES: [(&'static str, SmtpSecurity); 3] = [
+        ("starttls", SmtpSecurity::StartTls),
+        ("tls", SmtpSecurity::Tls),
+        ("none", SmtpSecurity::None),
+    ];
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            SmtpSecurity::StartTls => 587,
+            SmtpSecurity::Tls => 465,
+            SmtpSecurity::None => 25,
+        }
+    }
+}
+
+/// The attached graph covers this much unless `graph` says otherwise.
+pub const DEFAULT_EMAIL_GRAPH: Duration = Duration::from_secs(3 * 3600);

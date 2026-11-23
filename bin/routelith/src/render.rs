@@ -283,6 +283,65 @@ fn pick_series(
     }
 }
 
+/// The graph e-mail outputs attach (§21.5 F10): the event's series over
+/// the span before now, as a PNG, drawn like `ctl render`. The store is
+/// opened for each mail (they are rare), so a series created since the
+/// server started is found.
+pub(crate) fn email_graph(data_dir: PathBuf) -> rl_out::GraphFn {
+    std::sync::Arc::new(move |e, span| {
+        let Some(id) = e.series else {
+            return Ok(None);
+        };
+        let span_ms = i64::try_from(span.as_millis()).unwrap_or(i64::MAX);
+        let to_ms = now_ms();
+        let from_ms = to_ms.saturating_sub(span_ms);
+        let reader = Reader::open(&data_dir).map_err(|e| format!("cannot open the store: {e}"))?;
+        let rl_store::GraphRounds {
+            resolution,
+            rounds,
+            sent,
+            received,
+        } = reader
+            .read_graph(id, from_ms, to_ms)
+            .map_err(|e| format!("cannot read series {id}: {e}"))?;
+        let view: Vec<Round<'_>> = rounds
+            .iter()
+            .map(|r| Round {
+                ts_ms: r.ts_ms,
+                sent: r.sent,
+                rtts_us: &r.rtts_us,
+            })
+            .collect();
+        let title = match (&e.target, &e.family) {
+            (Some(t), Some(f)) => format!("{t} ({f}, from {})", e.vantage),
+            (Some(t), None) => format!("{t} (from {})", e.vantage),
+            _ => format!("series {id}"),
+        };
+        let svg = rl_render::render(
+            &view,
+            &Graph {
+                title: &title,
+                from_ms,
+                to_ms,
+                step_ms: match resolution {
+                    Resolution::Rollup(tier) => Some(tier.width_ms()),
+                    Resolution::Buckets(width) => Some(width),
+                    Resolution::Raw => bucket_step(
+                        reader.step_ms(id).and_then(|s| i64::try_from(s).ok()),
+                        smallest_gap(&rounds),
+                    ),
+                },
+                width: Graph::DEFAULT_WIDTH,
+                height: Graph::DEFAULT_HEIGHT,
+                totals: Some((sent, received)),
+            },
+        );
+        rl_render::svg_to_png(&svg, 1.0)
+            .map(Some)
+            .map_err(|e| format!("PNG: {e}"))
+    })
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -382,6 +441,43 @@ mod tests {
         assert_eq!(smallest_gap(&rounds), Some(500));
         assert_eq!(smallest_gap(&rounds[..3]), Some(300_000));
         assert_eq!(smallest_gap(&rounds[..1]), None);
+    }
+
+    #[test]
+    fn email_graph_draws_the_event_series() {
+        use rl_store::{ErrorCounts, Event, EventKind, StoredRound, Writer, WriterOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let end_ms = now_ms();
+        let (mut w, _) = Writer::open(dir.path(), WriterOptions::default(), end_ms).unwrap();
+        let id = w.register(&[SeriesKey::new("local", "gw", "v4")]).unwrap()[0];
+        for i in 0..12 {
+            let round = StoredRound {
+                ts_ms: end_ms - 3_600_000 + i * 300_000,
+                sent: 5,
+                rtts_us: vec![900, 1000, 1100, 1200],
+                errors: ErrorCounts::default(),
+                resolved: None,
+                timing: None,
+                flags: 0,
+            };
+            w.append(id, round).unwrap();
+        }
+        w.close().unwrap();
+        let graph = email_graph(dir.path().to_path_buf());
+        let mut e = Event::new(end_ms, EventKind::AlertRaised, "local", "gw: loss raised");
+        e.target = Some("gw".into());
+        e.family = Some("v4".into());
+        e.series = Some(id);
+        let png = graph(&e, std::time::Duration::from_secs(3 * 3600))
+            .unwrap()
+            .unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        // No series, no graph.
+        let started = Event::new(end_ms, EventKind::ServerStarted, "local", "started");
+        assert_eq!(
+            graph(&started, std::time::Duration::from_secs(3600)),
+            Ok(None)
+        );
     }
 
     #[test]
