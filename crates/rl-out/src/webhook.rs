@@ -95,6 +95,17 @@ impl WebhookSink {
         if addrs.is_empty() {
             return Err(format!("{host} has no address"));
         }
+        // The config lets a token go over plain HTTP only to a loopback
+        // host; a name such as localhost must also resolve to one.
+        if self.cfg.token.is_some() && !self.cfg.url.tls {
+            let addrs = loopback_only(addrs);
+            if addrs.is_empty() {
+                return Err(format!(
+                    "{host} is not a loopback address; the token is sent only over https"
+                ));
+            }
+            return Ok(addrs);
+        }
         Ok(addrs)
     }
 
@@ -165,6 +176,11 @@ impl WebhookSink {
         out.extend_from_slice(&r.body);
         out
     }
+}
+
+/// The loopback addresses of `addrs`.
+fn loopback_only(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    addrs.into_iter().filter(|a| a.ip().is_loopback()).collect()
 }
 
 /// A plain or TLS connection.
@@ -587,6 +603,17 @@ mod tests {
         assert!(!sink.is_empty());
         drop(t);
         let _ = peer.join();
+    }
+
+    #[test]
+    fn a_clear_text_token_goes_only_to_loopback() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            loopback_only(vec![a("192.0.2.7:80"), a("127.0.0.1:80"), a("[::1]:80")]),
+            vec![a("127.0.0.1:80"), a("[::1]:80")]
+        );
+        // A resolver answering a public address for "localhost": refused.
+        assert!(loopback_only(vec![a("192.0.2.7:80")]).is_empty());
     }
 
     #[test]
