@@ -1,10 +1,14 @@
 //! Outputs (architecture doc §11.2, §21.5 F7): where events go besides
 //! the event log. Each `[[output]]` table names one, with a filter on the
-//! events it takes. This version sends to syslog, to a JSON-lines file and
-//! (on Windows) to the Windows Event Log; webhooks and e-mail come later in
-//! M2.
+//! events it takes. This version sends to syslog, to a JSON-lines file,
+//! to webhooks and (on Windows) to the Windows Event Log; e-mail comes later
+//! in M2.
 
+use std::fmt;
 use std::path::PathBuf;
+
+use crate::config::HttpUrl;
+use crate::secret::Secret;
 
 /// One `[[output]]` table, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +34,7 @@ pub enum OutputKind {
     Jsonl(JsonlOutput),
     /// The Windows Application log, source `Routelith` (doc §11.3, F8).
     EventLog,
+    Webhook(WebhookOutput),
 }
 
 impl OutputKind {
@@ -38,6 +43,7 @@ impl OutputKind {
             OutputKind::Syslog(_) => "syslog",
             OutputKind::Jsonl(_) => "jsonl",
             OutputKind::EventLog => "eventlog",
+            OutputKind::Webhook(_) => "webhook",
         }
     }
 }
@@ -168,4 +174,57 @@ pub const FACILITIES: [(&str, u8); 24] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonlOutput {
     pub path: PathBuf,
+}
+
+/// An HTTP POST per event (doc §11.4, F10).
+#[derive(Clone, PartialEq, Eq)]
+pub struct WebhookOutput {
+    /// Where to POST; may hold a secret (a Slack URL is one), so messages
+    /// name only its host.
+    pub url: HttpUrl,
+    pub format: WebhookFormat,
+    /// `json` only: the key for the `X-Routelith-Signature` HMAC.
+    pub secret: Option<Secret>,
+    /// `ntfy` (bearer token) and `gotify` (application token) only.
+    pub token: Option<Secret>,
+    /// Added to the system's CAs for an `https` URL.
+    pub ca_file: Option<PathBuf>,
+}
+
+impl fmt::Debug for WebhookOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebhookOutput")
+            .field("host", &self.url.host)
+            .field("port", &self.url.port)
+            .field("tls", &self.url.tls)
+            .field("format", &self.format)
+            .field("secret", &self.secret)
+            .field("token", &self.token)
+            .field("ca_file", &self.ca_file)
+            .finish()
+    }
+}
+
+/// The body a webhook gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookFormat {
+    /// The event as in the event log, optionally signed.
+    Json,
+    Slack,
+    /// A Teams workflow ("When a Teams webhook request is received").
+    Teams,
+    Mattermost,
+    Ntfy,
+    Gotify,
+}
+
+impl WebhookFormat {
+    pub const NAMES: [(&'static str, WebhookFormat); 6] = [
+        ("json", WebhookFormat::Json),
+        ("slack", WebhookFormat::Slack),
+        ("teams", WebhookFormat::Teams),
+        ("mattermost", WebhookFormat::Mattermost),
+        ("ntfy", WebhookFormat::Ntfy),
+        ("gotify", WebhookFormat::Gotify),
+    ];
 }

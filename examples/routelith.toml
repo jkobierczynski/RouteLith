@@ -85,6 +85,21 @@ duration = "2h"
 # type = "jsonl"
 # path = "/var/log/routelith/events.jsonl"
 #
+# [[output]]
+# name   = "ops"
+# type   = "webhook"
+# url    = "https://hooks.example.net/routelith"
+# format = "json"                   # or slack, teams, mattermost, ntfy, gotify
+# secret = "${env:RL_HOOK_SECRET}"  # json: sign with HMAC-SHA256
+# events = ["alert_raised", "alert_cleared"]
+#
+# [[output]]
+# name   = "phone"
+# type   = "webhook"
+# format = "ntfy"
+# url    = "https://ntfy.sh/${file:/etc/routelith/ntfy-topic}"
+# token  = "${env:NTFY_TOKEN}"      # ntfy or gotify; optional for ntfy
+#
 # [[output]]                        # Windows only: the Application log,
 # name = "eventlog"                 # source Routelith
 # type = "eventlog"

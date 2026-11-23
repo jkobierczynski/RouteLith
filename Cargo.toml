@@ -34,6 +34,7 @@ proptest = "1.11"
 rcgen = "0.14"
 redb = "2.6"
 regex = "1.11"
+ring = "0.17"
 rustls = { version = "0.23.20", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = { version = "1.10", features = ["std"] }

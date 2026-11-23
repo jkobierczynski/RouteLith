@@ -1,6 +1,6 @@
 [package]
 name = "rl-out"
-description = "Routelith: outputs that send events on (syslog, JSON lines, Windows Event Log)."
+description = "Routelith: outputs that send events on (syslog, JSON lines, webhooks, Windows Event Log)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 rl-core.workspace = true
 rl-store.workspace = true
+ring.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 rustls-pki-types.workspace = true

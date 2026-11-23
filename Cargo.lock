@@ -1306,6 +1306,7 @@ name = "rl-out"
 version = "0.0.0"
 dependencies = [
  "rcgen",
+ "ring",
  "rl-core",
  "rl-store",
  "rl-sys",

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use rl_core::output::{
     EventFilter, Framing, JsonlOutput, Output, OutputKind, SyslogFormat, SyslogOutput, Transport,
+    WebhookFormat, WebhookOutput,
 };
 use rl_store::{Event, EventKind};
 
@@ -413,7 +414,7 @@ fn queued_events_are_delivered_at_close() {
 struct Slow;
 
 impl Sink for Slow {
-    fn deliver(&mut self, _: &Event) -> Result<(), String> {
+    fn deliver(&mut self, _: &Event) -> Result<(), Failure> {
         std::thread::sleep(Duration::from_millis(20));
         Ok(())
     }
@@ -486,4 +487,238 @@ fn a_tls_receiver_that_trickles_cannot_hold_the_handshake() {
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
     drop(sock);
     let _ = trickle.join();
+}
+
+/// One HTTP request as a test server saw it.
+#[derive(Debug)]
+struct Seen {
+    head: String,
+    body: Vec<u8>,
+}
+
+impl Seen {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.head.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+}
+
+/// Read one request (head and Content-Length body) and answer `code`.
+fn serve_one(s: &mut (impl std::io::Read + std::io::Write), code: u16) -> Seen {
+    let mut r = BufReader::new(&mut *s);
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        head += &line;
+    }
+    let seen = Seen {
+        head,
+        body: Vec::new(),
+    };
+    let len: usize = seen.header("content-length").unwrap().parse().unwrap();
+    let mut body = vec![0u8; len];
+    std::io::Read::read_exact(&mut r, &mut body).unwrap();
+    drop(r);
+    write!(
+        s,
+        "HTTP/1.1 {code} Whatever\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    s.flush().unwrap();
+    Seen { body, ..seen }
+}
+
+/// A plain HTTP server that answers each connection with the next code.
+fn http_server(codes: Vec<u16>) -> (u16, std::thread::JoinHandle<Vec<Seen>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let t = std::thread::spawn(move || {
+        codes
+            .into_iter()
+            .map(|code| {
+                let (mut s, _) = l.accept().unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                serve_one(&mut s, code)
+            })
+            .collect()
+    });
+    (port, t)
+}
+
+fn webhook(url: &str, format: WebhookFormat) -> WebhookOutput {
+    WebhookOutput {
+        url: rl_core::config::parse_http_url(url).unwrap(),
+        format,
+        secret: None,
+        token: None,
+        ca_file: None,
+    }
+}
+
+#[test]
+fn webhook_retries_a_busy_receiver_and_signs() {
+    let (port, server) = http_server(vec![503, 200]);
+    let mut w = webhook(
+        &format!("http://127.0.0.1:{port}/hook?k=1"),
+        WebhookFormat::Json,
+    );
+    w.secret = Some(rl_core::secret::Secret::new("s3cr3t"));
+    let outs = Outputs::start(&[output(OutputKind::Webhook(w), 10)], HashMap::new()).unwrap();
+    let stats = outs.stats();
+    outs.send(&raised());
+    let seen = server.join().unwrap();
+    wait_for("sent", || stats[0].sent.load(Ordering::Relaxed) == 1);
+    outs.close(Duration::from_secs(1));
+    assert_eq!(stats[0].errors.load(Ordering::Relaxed), 1);
+    assert_eq!(stats[0].dropped.load(Ordering::Relaxed), 0);
+    assert_eq!(seen.len(), 2);
+    let req = &seen[1];
+    assert!(
+        req.head.starts_with("POST /hook?k=1 HTTP/1.1\r\n"),
+        "{}",
+        req.head
+    );
+    assert_eq!(
+        req.header("host"),
+        Some(format!("127.0.0.1:{port}").as_str())
+    );
+    assert_eq!(req.header("content-type"), Some("application/json"));
+    assert_eq!(req.header("x-routelith-event"), Some("alert_raised"));
+    let back: Event = serde_json::from_slice(&req.body).unwrap();
+    assert_eq!(back.rule.as_deref(), Some("loss"));
+    // The receiver's check: HMAC of "{timestamp}.{body}".
+    let ts = req.header("x-routelith-timestamp").unwrap();
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cr3t");
+    let sig = req.header("x-routelith-signature").unwrap();
+    let sig = sig.strip_prefix("sha256=").unwrap();
+    let raw: Vec<u8> = (0..sig.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&sig[i..i + 2], 16).unwrap())
+        .collect();
+    let signed = [ts.as_bytes(), b".", &req.body].concat();
+    ring::hmac::verify(&key, &signed, &raw).unwrap();
+}
+
+#[test]
+fn webhook_drops_what_the_receiver_refuses() {
+    let (port, server) = http_server(vec![400, 200]);
+    let w = webhook(&format!("http://127.0.0.1:{port}/"), WebhookFormat::Slack);
+    let outs = Outputs::start(&[output(OutputKind::Webhook(w), 10)], HashMap::new()).unwrap();
+    let stats = outs.stats();
+    let mut second = raised();
+    second.message = "second <b>&".into();
+    outs.send(&raised());
+    outs.send(&second);
+    let seen = server.join().unwrap();
+    wait_for("sent", || stats[0].sent.load(Ordering::Relaxed) == 1);
+    outs.close(Duration::from_secs(1));
+    // The refused event was not tried again: the next request is the
+    // second event.
+    assert_eq!(stats[0].dropped.load(Ordering::Relaxed), 1);
+    assert_eq!(stats[0].errors.load(Ordering::Relaxed), 1);
+    let v: serde_json::Value = serde_json::from_slice(&seen[1].body).unwrap();
+    assert_eq!(
+        v["text"],
+        "*Routelith: gw alert raised (loss)*\nsecond &lt;b&gt;&amp;"
+    );
+}
+
+#[test]
+fn webhook_over_https() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, ck.cert.pem()).unwrap();
+    let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![CertificateDer::from(ck.cert.der().to_vec())],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der())),
+    )
+    .unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let receiver = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut c = rustls::ServerConnection::new(Arc::new(server)).unwrap();
+        let mut tls = rustls::Stream::new(&mut c, &mut s);
+        let seen = serve_one(&mut tls, 200);
+        c.send_close_notify();
+        let _ = c.write_tls(&mut s);
+        seen
+    });
+    let mut w = webhook(
+        &format!("https://localhost:{port}/message"),
+        WebhookFormat::Gotify,
+    );
+    w.ca_file = Some(ca);
+    w.token = Some(rl_core::secret::Secret::new("AbC.123"));
+    let outs = Outputs::start(&[output(OutputKind::Webhook(w), 10)], HashMap::new()).unwrap();
+    let stats = outs.stats();
+    outs.send(&raised());
+    let seen = receiver.join().unwrap();
+    wait_for("sent", || stats[0].sent.load(Ordering::Relaxed) == 1);
+    outs.close(Duration::from_secs(1));
+    assert_eq!(
+        seen.header("host"),
+        Some(format!("localhost:{port}").as_str())
+    );
+    assert_eq!(seen.header("x-gotify-key"), Some("AbC.123"));
+    let v: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
+    assert_eq!(v["priority"], 8);
+    assert_eq!(v["title"], "Routelith: gw alert raised (loss)");
+}
+
+#[test]
+fn webhook_formats() {
+    let e = raised();
+    let mut w = webhook("http://ntfy.lan/alerts", WebhookFormat::Ntfy);
+    w.token = Some(rl_core::secret::Secret::new("tk"));
+    let r = webhook::request(&w, &e, 0);
+    assert_eq!(r.body, e.message.as_bytes());
+    assert!(r.headers.contains(&("Priority", "4".into())));
+    assert!(r.headers.contains(&("Tags", "warning".into())));
+    assert!(r.headers.contains(&("Authorization", "Bearer tk".into())));
+    let mut cleared = Event::new(T, EventKind::AlertCleared, "local", "ok");
+    cleared.target = Some("r\u{e9}seau".into());
+    let r = webhook::request(&w, &cleared, 0);
+    assert!(r.headers.contains(&("Priority", "3".into())));
+    // Not ASCII: an RFC 2047 encoded word.
+    let title = &r.headers.iter().find(|h| h.0 == "Title").unwrap().1;
+    assert!(
+        title.starts_with("=?UTF-8?B?") && title.is_ascii(),
+        "{title}"
+    );
+
+    let r = webhook::request(&webhook("http://x/", WebhookFormat::Teams), &e, 0);
+    let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    let card = &v["attachments"][0]["content"];
+    assert_eq!(card["type"], "AdaptiveCard");
+    let facts = card["body"][2]["facts"].as_array().unwrap();
+    assert!(
+        facts
+            .iter()
+            .any(|f| f["title"] == "Rule" && f["value"] == "loss")
+    );
+
+    let r = webhook::request(&webhook("http://x/", WebhookFormat::Mattermost), &e, 0);
+    let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(v["username"], "Routelith");
+
+    // Unsigned JSON has no signature headers.
+    let r = webhook::request(&webhook("http://x/", WebhookFormat::Json), &e, 0);
+    assert!(r.headers.iter().all(|h| !h.0.contains("Signature")));
 }

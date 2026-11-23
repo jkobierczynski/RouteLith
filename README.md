@@ -54,8 +54,25 @@ vantage, target, family, series, rule, value, since, from, to; empty when
 the event has none). The MSI and `routelith service install` register the
 source, whose message table is built into `routelith.exe`; without that,
 Event Viewer still shows the strings but says the description is missing.
-The MSI's configuration has an Event Log output. Webhooks and e-mail come
-next.
+The MSI's configuration has an Event Log output.
+
+`type = "webhook"` POSTs each event to a URL, over HTTP or HTTPS
+(`ca_file` adds a CA for a private one). `format` picks the body: `json`
+(the default; the event as in the event log) or a message for `slack`,
+`teams` (an Adaptive Card, for a Teams workflow webhook), `mattermost`,
+`ntfy` or `gotify`. With `secret` set, a JSON request is signed:
+`X-Routelith-Signature: sha256=<hex>` is the HMAC-SHA256 of
+`<X-Routelith-Timestamp>.<body>` under the secret, so the receiver can
+check it and refuse stale timestamps. `token` is the ntfy access token or
+the Gotify application token; it needs an `https://` URL unless the
+receiver is on the same machine (localhost or a loopback address). A 2xx answer is success; 408, 429, 5xx and
+network errors are retried; any other answer drops the event and is
+counted, as retrying would not help. `url`, `secret` and `token` can name
+where the secret is instead of holding it: `${env:NAME}` reads an
+environment variable and `${file:/path}` a file, so the configuration file
+can be shared. Messages
+name only the URL's host, as some URLs are secrets themselves. E-mail
+comes next.
 
 A condition can follow the target's own history instead of a fixed value:
 `condition = "> baseline_p50_7d * 2 + 5ms"` compares with the median of the
