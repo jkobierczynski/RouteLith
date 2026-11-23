@@ -1,7 +1,8 @@
 //! Outputs (architecture doc §11.2, §21.5 F7): where events go besides
 //! the event log. Each `[[output]]` table names one, with a filter on the
-//! events it takes. This version sends to syslog and to a JSON-lines file;
-//! the Windows Event Log, webhooks and e-mail come later in M2.
+//! events it takes. This version sends to syslog, to a JSON-lines file and
+//! (on Windows) to the Windows Event Log; webhooks and e-mail come later in
+//! M2.
 
 use std::path::PathBuf;
 
@@ -27,6 +28,8 @@ pub const MAX_QUEUE: usize = 100_000;
 pub enum OutputKind {
     Syslog(SyslogOutput),
     Jsonl(JsonlOutput),
+    /// The Windows Application log, source `Routelith` (doc §11.3, F8).
+    EventLog,
 }
 
 impl OutputKind {
@@ -34,6 +37,7 @@ impl OutputKind {
         match self {
             OutputKind::Syslog(_) => "syslog",
             OutputKind::Jsonl(_) => "jsonl",
+            OutputKind::EventLog => "eventlog",
         }
     }
 }

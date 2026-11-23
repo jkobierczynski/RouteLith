@@ -1,5 +1,5 @@
 //! All unsafe and OS FFI: ping sockets, Windows ICMP API, timestamps, host
-//! health readings, service glue.
+//! health readings, service glue, the Windows Event Log.
 //!
 //! This is the only crate in the workspace allowed to contain `unsafe`.
 //! Every `unsafe` block must carry a `// SAFETY:` comment
@@ -12,6 +12,9 @@ pub mod linux;
 
 #[cfg(windows)]
 pub mod windows;
+
+#[cfg(windows)]
+pub mod eventlog;
 
 #[cfg(windows)]
 pub mod service;

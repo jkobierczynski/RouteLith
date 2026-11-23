@@ -26,6 +26,10 @@ tokio = { workspace = true, features = ["signal"] }
 [target.'cfg(windows)'.dependencies]
 windows-service.workspace = true
 
+[build-dependencies]
+# Builds the Event Log message table into routelith.exe (build.rs).
+embed-resource = "3.0.12"
+
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true

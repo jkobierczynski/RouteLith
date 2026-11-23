@@ -14,6 +14,13 @@ data_dir = 'C:\ProgramData\Routelith\data'
 step  = "300s"   # one round per step; must divide a day
 pings = 20       # samples per round
 
+# Alerts and server starts and stops go to the Windows Application log
+# (Event Viewer, source Routelith), from where WEF can forward them.
+# Syslog and JSON-lines outputs are in examples/routelith.toml.
+[[output]]
+name = "eventlog"
+type = "eventlog"
+
 [[group]]
 name = "Local"
 

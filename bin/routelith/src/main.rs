@@ -146,4 +146,48 @@ mod tests {
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
     }
+
+    mod messages {
+        include!("../build/messages.rs");
+
+        fn u32_at(b: &[u8], i: usize) -> u32 {
+            u32::from_le_bytes(b[i..i + 4].try_into().unwrap())
+        }
+
+        /// The table reads back as Windows reads it: each block's IDs map to
+        /// an entry whose text is the template.
+        #[test]
+        fn the_message_table_reads_back() {
+            let b = message_table();
+            assert_eq!(u32_at(&b, 0), 3);
+            let mut ids = 0;
+            for blk in 0..3 {
+                let (low, high, off) = (
+                    u32_at(&b, 4 + 12 * blk),
+                    u32_at(&b, 8 + 12 * blk),
+                    u32_at(&b, 12 + 12 * blk) as usize,
+                );
+                let mut at = off;
+                for _ in low..=high {
+                    let len = usize::from(u16::from_le_bytes([b[at], b[at + 1]]));
+                    assert_eq!(len % 4, 0);
+                    assert_eq!(u16::from_le_bytes([b[at + 2], b[at + 3]]), 1);
+                    let text: Vec<u16> = b[at + 4..at + len]
+                        .chunks(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .take_while(|&c| c != 0)
+                        .collect();
+                    assert_eq!(String::from_utf16(&text).unwrap(), "%1!s!\r\n");
+                    at += len;
+                    ids += 1;
+                }
+                if blk == 2 {
+                    assert_eq!(at, b.len());
+                }
+            }
+            assert_eq!(ids, 300);
+            assert!(RANGES.iter().any(|&(l, h)| (l..=h).contains(&1000)));
+            assert!(RANGES.iter().any(|&(l, h)| (l..=h).contains(&3001)));
+        }
+    }
 }

@@ -43,8 +43,19 @@ clean stop the outputs get 5 seconds to send what they hold. RFC 5424
 messages put the event's fields in structured data under the SD-ID
 `routelith@32473` (32473 is the example enterprise number of RFC 5612;
 set `sd_id` if your site has its own) and MSGID is the event kind; RFC
-3164 messages have only the old header and the event's text. The
-Event Log, webhooks and e-mail come next.
+3164 messages have only the old header and the event's text.
+
+On Windows, `type = "eventlog"` writes events to the Application log as
+source `Routelith`, for Event Viewer and for forwarding with WEF: event ID
+1000 alert raised (warning), 1001 alert cleared, 1002 address changed,
+3000 server started, 3001 server stopped. The event's text is its first
+insertion string; the others are its fields in a fixed order (kind, time,
+vantage, target, family, series, rule, value, since, from, to; empty when
+the event has none). The MSI and `routelith service install` register the
+source, whose message table is built into `routelith.exe`; without that,
+Event Viewer still shows the strings but says the description is missing.
+The MSI's configuration has an Event Log output. Webhooks and e-mail come
+next.
 
 A condition can follow the target's own history instead of a fixed value:
 `condition = "> baseline_p50_7d * 2 + 5ms"` compares with the median of the
