@@ -28,8 +28,23 @@ changes and server starts and stops go to an event log in `data/events/`
 (kept 400 days). The overview lists the alerts raised now and the target view
 the target's events; `/api/v1/alerts` lists the alerts raised now,
 `/api/v1/events` the event history, and `/metrics` has a gauge per raised
-alert plus raise and clear counters. Sending them to syslog, the Event Log, webhooks and e-mail comes
-next.
+alert plus raise and clear counters.
+
+`[[output]]` tables send events on as they happen: to syslog (`type =
+"syslog"`, RFC 5424 or RFC 3164, over UDP, TCP or TLS with octet-counting
+framing per RFC 5425) or to a JSON-lines file (`type = "jsonl"`, one event
+per line in the event log's shape; the file is reopened for each event, so
+logrotate may move it). Each output can take only some event kinds,
+targets, groups or rules. Each has its own queue (`queue`, default 1000)
+and thread: an unreachable receiver fills only its queue, which then drops
+events and counts them (`routelith_output_events_dropped_total`), and the
+event in hand is retried with a pause that grows from 1 s to a minute. On a
+clean stop the outputs get 5 seconds to send what they hold. RFC 5424
+messages put the event's fields in structured data under the SD-ID
+`routelith@32473` (32473 is the example enterprise number of RFC 5612;
+set `sd_id` if your site has its own) and MSGID is the event kind; RFC
+3164 messages have only the old header and the event's text. The
+Event Log, webhooks and e-mail come next.
 
 A condition can follow the target's own history instead of a fixed value:
 `condition = "> baseline_p50_7d * 2 + 5ms"` compares with the median of the
@@ -43,7 +58,8 @@ clear keeps it; a parent alert raised later does not mark it. `[[silence]]` tabl
 mark alerts raised in a window (`start` and `end`) or a recurring one (an
 `rrule` with FREQ=DAILY or WEEKLY, BYDAY, BYHOUR and BYMINUTE, in UTC, plus a
 `duration`), for some targets, groups or rules. Suppressed and silenced
-alerts are still logged and shown, and outputs will not send them. See
+alerts are still logged and shown, and outputs do not send them unless an
+output sets `quiet = true`. See
 `examples/routelith.toml`.
 
 History from SmokePing comes over with `routelith ctl import smokeping`,
@@ -113,8 +129,9 @@ not signed yet.
 | `crates/rl-render` | Smoke-graph algorithm, SVG rendering and PNG (resvg, embedded Liberation Sans under `fonts/`) |
 | `crates/rl-alert` | Alert engine: thresholds with hysteresis, SmokePing patterns |
 | `crates/rl-web` | HTTP server: REST API, `/metrics`, the web UI (plain JS in `ui/`) |
+| `crates/rl-out` | Outputs: syslog (UDP, TCP, TLS) and JSON-lines files, each with its own queue |
 
-Later milestones add `rl-path`, `rl-fed`, `rl-out` and `rl-reflector`.
+Later milestones add `rl-path`, `rl-fed` and `rl-reflector`.
 
 ## Building
 

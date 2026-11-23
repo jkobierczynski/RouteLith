@@ -89,6 +89,10 @@ fn summary(cfg: &Config, warnings: usize) -> String {
             0 => String::new(),
             1 => "1 alert rule, ".to_string(),
             n => format!("{n} alert rules, "),
+        } + &match cfg.outputs.len() {
+            0 => String::new(),
+            1 => "1 output, ".to_string(),
+            n => format!("{n} outputs, "),
         },
         cfg.server.max_pps,
         cfg.server.vantage,

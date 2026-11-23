@@ -1,0 +1,25 @@
+[package]
+name = "rl-out"
+description = "Routelith: outputs that send events on (syslog, JSON lines)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rl-core.workspace = true
+rl-store.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+rustls-pki-types.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+syslog_rfc5424.workspace = true
+tempfile.workspace = true
