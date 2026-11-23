@@ -3399,7 +3399,10 @@ graph    = "off"
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("smtp");
         std::fs::write(&file, "hunter2\n").unwrap();
-        let src = EMAILS.replace("/nonexistent/routelith-smtp", file.to_str().unwrap());
+        // Forward slashes: a Windows path's backslashes would be escapes in
+        // a TOML string, and Windows takes either.
+        let path = file.to_str().unwrap().replace('\\', "/");
+        let src = EMAILS.replace("/nonexistent/routelith-smtp", &path);
         let p = parse(&src);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
