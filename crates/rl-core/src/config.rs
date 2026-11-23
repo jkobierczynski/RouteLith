@@ -35,8 +35,9 @@ use crate::alert::{self, AlertRule, Metric, PatternType, RuleKind, Threshold};
 use crate::duration;
 use crate::output::{
     self, EventFilter, Framing, JsonlOutput, Output, OutputKind, SyslogFormat, SyslogOutput,
-    Transport,
+    Transport, WebhookFormat, WebhookOutput,
 };
+use crate::secret::Secret;
 use crate::silence::{Silence, When};
 
 /// Seconds in a day; steps must divide it so rounds stay aligned to UTC days.
@@ -531,6 +532,10 @@ struct RawOutput {
     server_name: Option<Spanned<String>>,
     // jsonl
     path: Option<Spanned<String>>,
+    // webhook (also format and ca_file)
+    url: Option<Spanned<String>>,
+    secret: Option<Spanned<String>>,
+    token: Option<Spanned<String>>,
     /// Free text for people; not used.
     #[allow(dead_code)]
     comment: Option<Spanned<String>>,
@@ -1107,27 +1112,35 @@ impl Validator<'_> {
                 },
             };
 
-            let syslog_keys = [
+            // Keys of syslog only; format and ca_file also apply to webhooks.
+            let syslog_only_keys = [
                 ("address", o.address.as_ref().map(Spanned::span)),
                 ("transport", o.transport.as_ref().map(Spanned::span)),
-                ("format", o.format.as_ref().map(Spanned::span)),
                 ("facility", o.facility.as_ref().map(Spanned::span)),
                 ("hostname", o.hostname.as_ref().map(Spanned::span)),
                 ("app_name", o.app_name.as_ref().map(Spanned::span)),
                 ("sd_id", o.sd_id.as_ref().map(Spanned::span)),
                 ("framing", o.framing.as_ref().map(Spanned::span)),
-                ("ca_file", o.ca_file.as_ref().map(Spanned::span)),
                 ("cert_file", o.cert_file.as_ref().map(Spanned::span)),
                 ("key_file", o.key_file.as_ref().map(Spanned::span)),
                 ("server_name", o.server_name.as_ref().map(Spanned::span)),
             ];
+            let shared_keys = [
+                ("format", o.format.as_ref().map(Spanned::span)),
+                ("ca_file", o.ca_file.as_ref().map(Spanned::span)),
+            ];
             let jsonl_keys = [("path", o.path.as_ref().map(Spanned::span))];
+            let webhook_keys = [
+                ("url", o.url.as_ref().map(Spanned::span)),
+                ("secret", o.secret.as_ref().map(Spanned::span)),
+                ("token", o.token.as_ref().map(Spanned::span)),
+            ];
             let not_for = |me: &mut Self, keys: &[(&str, Option<Range<usize>>)], ty: &str| {
                 for (key, span) in keys {
                     if let Some(span) = span {
                         me.error(
                             span,
-                            format!("output {name:?}: {key} applies to type = {ty:?} only"),
+                            format!("output {name:?}: {key} applies to type = \"{ty}\" only"),
                         );
                     }
                 }
@@ -1135,10 +1148,13 @@ impl Validator<'_> {
             let kind = match o.type_.get_ref().as_str() {
                 "syslog" => {
                     not_for(self, &jsonl_keys, "jsonl");
+                    not_for(self, &webhook_keys, "webhook");
                     self.syslog_output(&name, o).map(OutputKind::Syslog)
                 }
                 "jsonl" => {
-                    not_for(self, &syslog_keys, "syslog");
+                    not_for(self, &syslog_only_keys, "syslog");
+                    not_for(self, &shared_keys, "syslog\" or \"webhook");
+                    not_for(self, &webhook_keys, "webhook");
                     match &o.path {
                         Some(p) if !p.get_ref().trim().is_empty() => {
                             let path = PathBuf::from(p.get_ref());
@@ -1170,8 +1186,10 @@ impl Validator<'_> {
                     }
                 }
                 "eventlog" => {
-                    not_for(self, &syslog_keys, "syslog");
+                    not_for(self, &syslog_only_keys, "syslog");
+                    not_for(self, &shared_keys, "syslog\" or \"webhook");
                     not_for(self, &jsonl_keys, "jsonl");
+                    not_for(self, &webhook_keys, "webhook");
                     if cfg!(windows) {
                         Some(OutputKind::EventLog)
                     } else {
@@ -1184,13 +1202,16 @@ impl Validator<'_> {
                         None
                     }
                 }
-                t @ ("webhook" | "email") => {
+                "webhook" => {
+                    not_for(self, &syslog_only_keys, "syslog");
+                    not_for(self, &jsonl_keys, "jsonl");
+                    self.webhook_output(&name, o).map(OutputKind::Webhook)
+                }
+                "email" => {
                     self.error(
                         &o.type_.span(),
-                        format!(
-                            "output type {t:?} is not available yet; \
-                             this version sends to \"syslog\", \"jsonl\" and \"eventlog\""
-                        ),
+                        "output type \"email\" is not available yet; this version sends to \
+                         \"syslog\", \"jsonl\", \"eventlog\" and \"webhook\"",
                     );
                     None
                 }
@@ -1199,7 +1220,7 @@ impl Validator<'_> {
                         &o.type_.span(),
                         format!(
                             "unknown output type {t:?}; this version sends to \"syslog\", \
-                             \"jsonl\" and \"eventlog\""
+                             \"jsonl\", \"eventlog\" and \"webhook\""
                         ),
                     );
                     None
@@ -1219,6 +1240,112 @@ impl Validator<'_> {
     }
 
     /// The syslog settings of an `[[output]]`.
+    /// A `${env:…}`/`${file:…}` value, expanded; errors at its span.
+    fn secret_value(&mut self, name: &str, key: &str, v: &Spanned<String>) -> Option<String> {
+        match crate::secret::expand(v.get_ref()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                self.error(&v.span(), format!("output {name:?}: {key} {e}"));
+                None
+            }
+        }
+    }
+
+    fn webhook_output(&mut self, name: &str, o: &RawOutput) -> Option<WebhookOutput> {
+        let errors_before = self.error_count();
+        let format = match &o.format {
+            None => WebhookFormat::Json,
+            Some(f) => match WebhookFormat::NAMES.iter().find(|(n, _)| n == f.get_ref()) {
+                Some(&(_, w)) => w,
+                None => {
+                    self.error(
+                        &f.span(),
+                        format!(
+                            "output {name:?}: format {:?} is not one of json, slack, teams, \
+                             mattermost, ntfy, gotify",
+                            f.get_ref()
+                        ),
+                    );
+                    WebhookFormat::Json
+                }
+            },
+        };
+        let url = match &o.url {
+            None => {
+                self.error(
+                    &o.type_.span(),
+                    format!("output {name:?} needs the url to POST to"),
+                );
+                None
+            }
+            // The URL may hold a secret (a Slack or Teams URL is one), so
+            // errors do not repeat it.
+            Some(u) => self
+                .secret_value(name, "url", u)
+                .and_then(|v| match parse_http_url(&v) {
+                    Ok(url) => Some(url),
+                    Err(e) => {
+                        self.error(&u.span(), format!("output {name:?}: url {e}"));
+                        None
+                    }
+                }),
+        };
+        let secret = o.secret.as_ref().and_then(|s| {
+            if format != WebhookFormat::Json {
+                self.error(
+                    &s.span(),
+                    format!("output {name:?}: secret applies to format = \"json\" only"),
+                );
+            }
+            self.secret_value(name, "secret", s)
+        });
+        if let Some(s) = &secret {
+            if s.is_empty() {
+                self.error(
+                    &o.secret.as_ref().map(Spanned::span).unwrap_or_default(),
+                    format!("output {name:?}: secret is empty"),
+                );
+            }
+        }
+        let token = o.token.as_ref().and_then(|t| {
+            if !matches!(format, WebhookFormat::Ntfy | WebhookFormat::Gotify) {
+                self.error(
+                    &t.span(),
+                    format!(
+                        "output {name:?}: token applies to format = \"ntfy\" or \"gotify\" only"
+                    ),
+                );
+            }
+            let v = self.secret_value(name, "token", t)?;
+            // It goes into an HTTP header.
+            if v.is_empty() || v.chars().any(|c| c.is_control() || !c.is_ascii()) {
+                self.error(
+                    &t.span(),
+                    format!("output {name:?}: token must be non-empty printable ASCII"),
+                );
+            }
+            Some(v)
+        });
+        if let (Some(c), Some(u)) = (&o.ca_file, &url) {
+            if !u.tls {
+                self.error(
+                    &c.span(),
+                    format!("output {name:?}: ca_file applies to an https:// url only"),
+                );
+            }
+        }
+        if self.error_count() != errors_before {
+            return None;
+        }
+        Some(WebhookOutput {
+            url: url?,
+            format,
+            secret: secret.map(Secret::new),
+            token: token.map(Secret::new),
+            ca_file: o.ca_file.as_ref().map(|c| PathBuf::from(c.get_ref())),
+        })
+    }
+
     fn syslog_output(&mut self, name: &str, o: &RawOutput) -> Option<SyslogOutput> {
         let errors_before = self.error_count();
         let transport = match o.transport.as_ref().map(|t| (t, t.get_ref().as_str())) {
@@ -2646,7 +2773,7 @@ name = "G"
             ),
             (
                 "type  = \"jsonl\"",
-                "type  = \"webhook\"",
+                "type  = \"email\"",
                 "is not available yet",
             ),
             (
@@ -2762,6 +2889,148 @@ name = "G"
         }
     }
 
+    const WEBHOOKS: &str = r#"
+[server]
+data_dir = "/tmp/rl"
+
+[[output]]
+name   = "ops"
+type   = "webhook"
+url    = "https://hooks.example.net:8443/routelith?x=1"
+secret = "s3cr3t-${env:RL_TEST_SURELY_UNSET_SUFFIX}"
+ca_file = "/etc/routelith/hooks-ca.pem"
+
+[[output]]
+name   = "phone"
+type   = "webhook"
+format = "ntfy"
+url    = "http://ntfy.lan/alerts"
+token  = "tk_abc"
+
+[[output]]
+name   = "chat"
+type   = "webhook"
+format = "slack"
+url    = "https://hooks.slack.example/services/T0/B0/XYZ"
+"#;
+
+    #[test]
+    fn webhooks_parse() {
+        use crate::output::{OutputKind, WebhookFormat};
+        let src = WEBHOOKS.replace("-${env:RL_TEST_SURELY_UNSET_SUFFIX}", "");
+        let p = parse(&src);
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let c = p.config.unwrap();
+        assert_eq!(c.outputs.len(), 3);
+        let OutputKind::Webhook(w) = &c.outputs[0].kind else {
+            panic!("{:?}", c.outputs[0]);
+        };
+        assert_eq!(w.format, WebhookFormat::Json);
+        assert!(w.url.tls);
+        assert_eq!(
+            (w.url.host.as_str(), w.url.port),
+            ("hooks.example.net", 8443)
+        );
+        assert_eq!(w.url.path, "/routelith?x=1");
+        assert_eq!(w.secret.as_ref().unwrap().expose(), "s3cr3t");
+        assert!(w.ca_file.is_some());
+        // Neither the secret nor the URL path shows up in Debug output.
+        let shown = format!("{:?}", c.outputs[0]);
+        assert!(
+            !shown.contains("s3cr3t") && !shown.contains("routelith?x"),
+            "{shown}"
+        );
+        let OutputKind::Webhook(w) = &c.outputs[1].kind else {
+            panic!("{:?}", c.outputs[1]);
+        };
+        assert_eq!(w.format, WebhookFormat::Ntfy);
+        assert!(!w.url.tls);
+        assert_eq!(w.url.port, 80);
+        assert_eq!(w.token.as_ref().unwrap().expose(), "tk_abc");
+        let OutputKind::Webhook(w) = &c.outputs[2].kind else {
+            panic!("{:?}", c.outputs[2]);
+        };
+        assert_eq!(w.format, WebhookFormat::Slack);
+        assert_eq!(c.outputs[2].kind.type_name(), "webhook");
+    }
+
+    #[test]
+    fn webhook_mistakes_are_reported() {
+        let ok = WEBHOOKS.replace("-${env:RL_TEST_SURELY_UNSET_SUFFIX}", "");
+        for (src, message, hidden) in [
+            (
+                WEBHOOKS.to_string(),
+                "environment variable RL_TEST_SURELY_UNSET_SUFFIX is not set",
+                "",
+            ),
+            (
+                ok.replace("url    = \"http://ntfy.lan/alerts\"\n", ""),
+                "needs the url",
+                "",
+            ),
+            (
+                ok.replace("http://ntfy.lan/alerts", "ftp://ntfy.lan/alerts-k3y"),
+                "output \"phone\": url",
+                "alerts-k3y",
+            ),
+            (
+                ok.replace("format = \"ntfy\"", "format = \"pager\""),
+                "format \"pager\" is not one of",
+                "",
+            ),
+            (
+                ok.replace("format = \"ntfy\"", "format = \"slack\""),
+                "token applies to format",
+                "",
+            ),
+            (
+                ok.replace("format = \"slack\"", "format = \"teams\"\nsecret = \"x\""),
+                "secret applies to format = \"json\" only",
+                "",
+            ),
+            (ok.replace("\"s3cr3t\"", "\"\""), "secret is empty", ""),
+            (
+                ok.replace("\"tk_abc\"", "\"tk abc\u{e9}\""),
+                "printable ASCII",
+                "tk abc",
+            ),
+            (
+                ok.replace(
+                    "format = \"ntfy\"",
+                    "format = \"ntfy\"\nca_file = \"/ca.pem\"",
+                ),
+                "ca_file applies to an https:// url only",
+                "",
+            ),
+            (
+                ok.replace("format = \"ntfy\"", "format = \"ntfy\"\naddress = \"x\""),
+                "address applies to type = \"syslog\" only",
+                "",
+            ),
+            (
+                ok.replace("format = \"ntfy\"", "format = \"ntfy\"\npath = \"/x\""),
+                "path applies to type = \"jsonl\" only",
+                "",
+            ),
+            (
+                ok.replace(
+                    "secret = \"s3cr3t\"",
+                    "secret = \"${file:/nonexistent/routelith-secret}\"",
+                ),
+                "cannot read /nonexistent/routelith-secret",
+                "",
+            ),
+        ] {
+            let errs = errors(&src);
+            assert!(
+                errs.iter().any(|e| e.contains(message)),
+                "{message}: {errs:?}"
+            );
+            if !hidden.is_empty() {
+                assert!(errs.iter().all(|e| !e.contains(hidden)), "{errs:?}");
+            }
+        }
+    }
     #[test]
     fn parents_and_silences_parse() {
         use crate::silence::When;

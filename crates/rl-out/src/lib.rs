@@ -1,13 +1,14 @@
-//! Outputs (architecture doc §11.2, §11.3, §21.5 F7, F8): events sent on
-//! from the event log to syslog receivers, JSON-lines files and (on
-//! Windows) the Windows Event Log.
+//! Outputs (architecture doc §11.2, §11.3, §21.5 F7, F8, F10): events sent
+//! on from the event log to syslog receivers, JSON-lines files, webhooks
+//! and (on Windows) the Windows Event Log.
 //!
 //! Each output has its own bounded queue and its own thread. [`Outputs::send`]
 //! only filters and queues, so it never waits on the network or a disk: a
 //! receiver that is down fills its own queue, and further events for it are
 //! dropped and counted, while the store and the other outputs go on. The
 //! thread retries the event in hand with a growing pause (1 s up to a
-//! minute) until it goes through.
+//! minute) until it goes through, unless the receiver refused it for
+//! good (a webhook answering 400, say): then it is dropped.
 //!
 //! Alerts raised under a silence or while the target's parent had an alert
 //! (§21.5 F6), and their clears, are not sent unless the output sets
@@ -20,6 +21,7 @@ pub mod eventlog;
 mod jsonl;
 mod syslog;
 mod tls;
+mod webhook;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -43,12 +45,12 @@ pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct OutputStats {
     pub name: String,
-    /// `syslog`, `jsonl` or `eventlog`.
+    /// `syslog`, `jsonl`, `webhook` or `eventlog`.
     pub kind: &'static str,
     /// Events delivered.
     pub sent: AtomicU64,
-    /// Events dropped: the queue was full, or the server stopped before
-    /// they could be delivered.
+    /// Events dropped: the queue was full, the receiver refused them for
+    /// good, or the server stopped before they could be delivered.
     pub dropped: AtomicU64,
     /// Failed delivery attempts (each retry counts).
     pub errors: AtomicU64,
@@ -72,10 +74,26 @@ impl OutputStats {
     }
 }
 
+/// Why a delivery failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Failure {
+    /// It may work later: the receiver is down, busy or slow.
+    Retry(String),
+    /// It will fail the same way every time (the receiver refused the
+    /// event itself), so the event is dropped.
+    Drop(String),
+}
+
+impl From<String> for Failure {
+    fn from(s: String) -> Self {
+        Self::Retry(s)
+    }
+}
+
 /// Where an output delivers to. `deliver` may block; it runs on the
 /// output's own thread.
 pub(crate) trait Sink: Send {
-    fn deliver(&mut self, e: &Event) -> Result<(), String>;
+    fn deliver(&mut self, e: &Event) -> Result<(), Failure>;
     /// Drop any connection after a failure, so the next try starts fresh.
     fn reset(&mut self) {}
 }
@@ -152,6 +170,10 @@ impl Outputs {
             let sink: Box<dyn Sink> = match &o.kind {
                 OutputKind::Syslog(s) => Box::new(
                     syslog::SyslogSink::new(s, hostname.as_deref())
+                        .map_err(|e| format!("output {:?}: {e}", o.name))?,
+                ),
+                OutputKind::Webhook(w) => Box::new(
+                    webhook::WebhookSink::new(w)
                         .map_err(|e| format!("output {:?}: {e}", o.name))?,
                 ),
                 OutputKind::Jsonl(j) => {
@@ -299,7 +321,7 @@ pub fn passes(f: &EventFilter, e: &Event, groups: &HashMap<String, String>) -> b
 }
 
 /// An output's thread: deliver each queued event, retrying until it goes
-/// through or the server stops.
+/// through, is refused for good, or the server stops.
 fn work(rx: &Receiver<Arc<Event>>, mut sink: Box<dyn Sink>, stats: &OutputStats, stop: &Stop) {
     let mut last_error: Option<String> = None;
     // Set once the stop deadline has passed: the rest is dropped.
@@ -326,7 +348,21 @@ fn work(rx: &Receiver<Arc<Event>>, mut sink: Box<dyn Sink>, stats: &OutputStats,
                     }
                     break;
                 }
-                Err(msg) => {
+                Err(Failure::Drop(msg)) => {
+                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    stats.up.store(false, Ordering::Relaxed);
+                    sink.reset();
+                    if last_error.as_deref() != Some(msg.as_str()) {
+                        eprintln!(
+                            "routelith server: output {}: event refused, dropped: {msg}",
+                            stats.name
+                        );
+                        last_error = Some(msg);
+                    }
+                    break;
+                }
+                Err(Failure::Retry(msg)) => {
                     stats.errors.fetch_add(1, Ordering::Relaxed);
                     stats.up.store(false, Ordering::Relaxed);
                     sink.reset();

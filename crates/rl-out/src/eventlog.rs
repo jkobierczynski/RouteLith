@@ -11,7 +11,7 @@
 use rl_store::{Event, EventKind};
 use rl_sys::eventlog::{EventSource, Level};
 
-use crate::Sink;
+use crate::{Failure, Sink};
 
 /// The event source routelith writes as.
 pub const SOURCE: &str = "Routelith";
@@ -69,7 +69,7 @@ impl EventLogSink {
 }
 
 impl Sink for EventLogSink {
-    fn deliver(&mut self, e: &Event) -> Result<(), String> {
+    fn deliver(&mut self, e: &Event) -> Result<(), Failure> {
         let source = match &mut self.source {
             Some(s) => s,
             None => self.source.insert(
@@ -82,7 +82,7 @@ impl Sink for EventLogSink {
         let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
         source
             .report(level, id, &refs)
-            .map_err(|err| format!("cannot write to the event log: {err}"))
+            .map_err(|err| Failure::Retry(format!("cannot write to the event log: {err}")))
     }
 
     fn reset(&mut self) {

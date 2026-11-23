@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use rl_store::Event;
 
-use crate::Sink;
+use crate::{Failure, Sink};
 
 #[derive(Debug)]
 pub(crate) struct JsonlSink {
@@ -61,7 +61,7 @@ fn ends_mid_line(file: &mut std::fs::File) -> std::io::Result<bool> {
 impl Sink for JsonlSink {
     /// Opens the file for each event (events are rare), so a log rotator
     /// may move the file away between events.
-    fn deliver(&mut self, e: &Event) -> Result<(), String> {
+    fn deliver(&mut self, e: &Event) -> Result<(), Failure> {
         // The worker retries the same event until it goes through, so a
         // pending line is this event's.
         let mut p = match self.pending.take() {
@@ -73,7 +73,9 @@ impl Sink for JsonlSink {
                 let mut line = match ends_mid_line(&mut file) {
                     Ok(true) => vec![b'\n'],
                     Ok(false) => Vec::new(),
-                    Err(err) => return Err(format!("cannot read {}: {err}", self.path.display())),
+                    Err(err) => {
+                        return Err(format!("cannot read {}: {err}", self.path.display()).into());
+                    }
                 };
                 serde_json::to_writer(&mut line, e).map_err(|err| err.to_string())?;
                 line.push(b'\n');
@@ -88,13 +90,13 @@ impl Sink for JsonlSink {
             match p.file.write(&p.line[p.done..]) {
                 Ok(0) => {
                     self.pending = Some(p);
-                    return Err(format!("cannot write {}: no space", self.path.display()));
+                    return Err(format!("cannot write {}: no space", self.path.display()).into());
                 }
                 Ok(n) => p.done += n,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(err) => {
                     self.pending = Some(p);
-                    return Err(format!("cannot write {}: {err}", self.path.display()));
+                    return Err(format!("cannot write {}: {err}", self.path.display()).into());
                 }
             }
         }

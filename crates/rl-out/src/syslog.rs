@@ -20,7 +20,7 @@ use rl_store::{Event, EventKind};
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use rustls_pki_types::ServerName;
 
-use crate::{IO_TIMEOUT, Sink};
+use crate::{Failure, IO_TIMEOUT, Sink};
 
 const DAY_MS: i64 = 86_400_000;
 /// The longest UDP message sent: what every receiver must take
@@ -380,7 +380,7 @@ fn still_open<S: Read>(s: &mut S, sock: &TcpStream) -> bool {
 }
 
 impl Sink for SyslogSink {
-    fn deliver(&mut self, e: &Event) -> Result<(), String> {
+    fn deliver(&mut self, e: &Event) -> Result<(), Failure> {
         let bytes = self.frame(e);
         let open = match &mut self.conn {
             Some(Conn::Tcp(s)) => {
@@ -405,10 +405,10 @@ impl Sink for SyslogSink {
             None => Ok(()),
         };
         r.map_err(|err| {
-            format!(
+            Failure::Retry(format!(
                 "cannot send to {to} ({}): {err}",
                 self.cfg.transport.as_str()
-            )
+            ))
         })
     }
 
