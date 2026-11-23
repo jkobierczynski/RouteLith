@@ -98,27 +98,29 @@ impl WebhookSink {
         Ok(addrs)
     }
 
-    fn connect_to(&self, a: SocketAddr) -> Result<Box<dyn Stream>, String> {
+    /// Connect to `a`; the request and its answer must be done by the
+    /// time [`ANSWER_TIMEOUT`] after the connection is up.
+    fn connect_to(&self, a: SocketAddr) -> Result<(Box<dyn Stream>, Instant), String> {
         let mut sock = TcpStream::connect_timeout(&a, IO_TIMEOUT)
             .map_err(|e| format!("cannot connect to {a}: {e}"))?;
         let _ = sock.set_nodelay(true);
-        let timeouts = |s: &TcpStream| {
-            s.set_write_timeout(Some(IO_TIMEOUT))
-                .and_then(|()| s.set_read_timeout(Some(IO_TIMEOUT)))
-                .map_err(|e| e.to_string())
-        };
-        timeouts(&sock)?;
+        sock.set_write_timeout(Some(IO_TIMEOUT))
+            .and_then(|()| sock.set_read_timeout(Some(IO_TIMEOUT)))
+            .map_err(|e| e.to_string())?;
         let Some((config, name)) = self.tls.clone() else {
-            return Ok(Box::new(sock));
+            let until = Instant::now() + ANSWER_TIMEOUT;
+            return Ok((Box::new(Timed { sock, until }), until));
         };
         let mut c = ClientConnection::new(config, name).map_err(|e| format!("TLS: {e}"))?;
         handshake(&mut c, &mut sock, Instant::now() + HANDSHAKE_TIMEOUT)
             .map_err(|e| format!("TLS handshake with {a}: {e}"))?;
-        timeouts(&sock)?;
-        Ok(Box::new(StreamOwned::new(c, sock)))
+        // The deadline sits under TLS: one TLS read may take many socket
+        // reads (records with no data for us), and each one is bounded.
+        let until = Instant::now() + ANSWER_TIMEOUT;
+        Ok((Box::new(StreamOwned::new(c, Timed { sock, until })), until))
     }
 
-    fn connect(&self) -> Result<Box<dyn Stream>, String> {
+    fn connect(&self) -> Result<(Box<dyn Stream>, Instant), String> {
         let mut last = String::new();
         for a in self.addresses()? {
             match self.connect_to(a) {
@@ -169,6 +171,50 @@ impl WebhookSink {
 trait Stream: Read + Write {}
 impl<T: Read + Write> Stream for T {}
 
+/// A socket whose reads and writes all fail with `TimedOut` once `until`
+/// has passed; each still waits at most [`IO_TIMEOUT`].
+struct Timed {
+    sock: TcpStream,
+    until: Instant,
+}
+
+impl Timed {
+    fn left(&self) -> io::Result<Duration> {
+        self.until
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .map(|d| d.min(IO_TIMEOUT))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "timed out"))
+    }
+}
+
+/// A socket timeout shows as WouldBlock on Unix and TimedOut on Windows.
+fn timed_out(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::WouldBlock {
+        io::Error::new(io::ErrorKind::TimedOut, "timed out")
+    } else {
+        e
+    }
+}
+
+impl Read for Timed {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.sock.set_read_timeout(Some(self.left()?))?;
+        self.sock.read(buf).map_err(timed_out)
+    }
+}
+
+impl Write for Timed {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.sock.set_write_timeout(Some(self.left()?))?;
+        self.sock.write(buf).map_err(timed_out)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sock.flush()
+    }
+}
+
 impl Sink for WebhookSink {
     fn deliver(&mut self, e: &Event) -> Result<(), Failure> {
         let now = SystemTime::now()
@@ -176,14 +222,14 @@ impl Sink for WebhookSink {
             .map_or(0, |d| d.as_secs());
         let req = request(&self.cfg, e, now);
         let bytes = self.bytes(&req);
-        let mut conn = self.connect()?;
+        let (mut conn, until) = self.connect()?;
         conn.write_all(&bytes)
             .and_then(|()| conn.flush())
             .map_err(|err| format!("cannot send to {}: {err}", self.to))?;
         // Only the code: the reason phrase is the receiver's text, which
         // could echo the (secret) path into the log.
-        let code = status(&mut conn, Instant::now() + ANSWER_TIMEOUT)
-            .map_err(|err| format!("no answer from {}: {err}", self.to))?;
+        let code =
+            status(&mut conn, until).map_err(|err| format!("no answer from {}: {err}", self.to))?;
         let what = format!("{} answered {code}", self.to);
         match code {
             200..=299 => Ok(()),
@@ -507,6 +553,40 @@ mod tests {
             self.0 += 1;
             Ok(1)
         }
+    }
+
+    /// A peer that sends a byte every 50 ms forever, as one sending TLS
+    /// records with no data would: reading through the socket must still
+    /// end at the deadline, however many reads it takes.
+    #[test]
+    fn a_trickling_peer_cannot_outlast_the_deadline() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(50));
+                if s.write_all(&[0]).is_err() {
+                    return;
+                }
+            }
+        });
+        let started = Instant::now();
+        let mut t = Timed {
+            sock: TcpStream::connect(addr).unwrap(),
+            until: started + Duration::from_millis(300),
+        };
+        let mut sink = Vec::new();
+        let err = t.read_to_end(&mut sink).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!sink.is_empty());
+        drop(t);
+        let _ = peer.join();
     }
 
     #[test]
