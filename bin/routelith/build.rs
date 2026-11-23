@@ -23,6 +23,8 @@ fn main() {
     );
     std::fs::write(&rc, script).expect("write messages.rc");
     embed_resource::compile(&rc, embed_resource::NONE)
-        .manifest_optional()
+        // Fails when no resource compiler is found: an executable without
+        // the table would show every event as "description not found".
+        .manifest_required()
         .expect("compile the message table resource");
 }

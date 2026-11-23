@@ -6,12 +6,18 @@
 /// string, the event's message, as its text.
 const RANGES: [(u32, u32); 3] = [(1000, 1099), (2000, 2099), (3000, 3099)];
 
+/// The text of every ID. `!s!` (a string of the function's own width, so
+/// UTF-16 here) marks the insertion as literal text: without a format,
+/// a `%12` inside the message (a scoped IPv6 address) would be read as
+/// another insertion.
+const TEMPLATE: &str = "%1!s!\r\n";
+
 /// A MESSAGE_RESOURCE_DATA block, as `mc.exe` would build it: a block count,
 /// one (low ID, high ID, offset) triple per range, then one
 /// MESSAGE_RESOURCE_ENTRY per ID (length, flags = 1 for UTF-16, text with
 /// its NUL, padded to 4 bytes).
 fn message_table() -> Vec<u8> {
-    let mut text: Vec<u8> = "%1\r\n\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut text: Vec<u8> = TEMPLATE.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
     while (text.len() + 4) % 4 != 0 {
         text.push(0);
     }

@@ -215,6 +215,15 @@ jobs:
           if (-not $ev) { throw 'no server_started event in the Application log' }
           "event $($ev.Id), $($ev.LevelDisplayName): $($ev.Message)"
           if ($ev.Message -notlike 'server started*') { throw 'the event does not show its message' }
+          # The text is shown as written: a scoped IPv6 address's %12 is not
+          # read as another insertion, and non-ASCII text survives.
+          # (Write-EventLog exists only in Windows PowerShell 5.1.)
+          $text = "gw (v6): address changed to fe80::1%12 $([char]0x00E9)t$([char]0x00E9)"
+          powershell.exe -NoProfile -Command "Write-EventLog -LogName Application -Source Routelith -EventId 1002 -EntryType Information -Message '$text'"
+          if ($LASTEXITCODE -ne 0) { throw 'Write-EventLog failed' }
+          $ev = Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Routelith'; Id=1002; StartTime=$since} -MaxEvents 1
+          "event $($ev.Id): $($ev.Message)"
+          if ($ev.Message.Trim() -ne $text) { throw "the event text was changed: $($ev.Message)" }
           Msi '/x' 'uninstall.log'
           if (Test-Path HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\Routelith) { throw 'the event source is still registered' }
           if (Get-Service Routelith -ErrorAction SilentlyContinue) { throw 'the service is still installed' }

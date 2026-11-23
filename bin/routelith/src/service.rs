@@ -234,7 +234,9 @@ mod windows {
         // Mark for deletion first: the service manager removes it as soon
         // as it has stopped and no handles remain.
         service.delete().map_err(to_io)?;
-        rl_sys::eventlog::unregister_source(rl_out::eventlog::SOURCE)?;
+        // Reported after the stop, so a registry error cannot leave the
+        // service running.
+        let source = rl_sys::eventlog::unregister_source(rl_out::eventlog::SOURCE);
         if service.query_status().map_err(to_io)?.current_state != ServiceState::Stopped {
             service.stop().map_err(to_io)?;
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -247,6 +249,7 @@ mod windows {
                 std::thread::sleep(Duration::from_millis(250));
             }
         }
+        source?;
         println!("Removed service {NAME}");
         Ok(())
     }

@@ -155,7 +155,7 @@ mod tests {
         }
 
         /// The table reads back as Windows reads it: each block's IDs map to
-        /// an entry whose text is "%1".
+        /// an entry whose text is the template.
         #[test]
         fn the_message_table_reads_back() {
             let b = message_table();
@@ -177,7 +177,7 @@ mod tests {
                         .map(|c| u16::from_le_bytes([c[0], c[1]]))
                         .take_while(|&c| c != 0)
                         .collect();
-                    assert_eq!(String::from_utf16(&text).unwrap(), "%1\r\n");
+                    assert_eq!(String::from_utf16(&text).unwrap(), "%1!s!\r\n");
                     at += len;
                     ids += 1;
                 }
