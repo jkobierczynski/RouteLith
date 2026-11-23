@@ -36,6 +36,8 @@ use crate::{Failure, IO_TIMEOUT, Sink};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest status line (or interim header block line) read.
 const MAX_LINE: usize = 8 * 1024;
+/// How long the receiver has to answer, 1xx interim answers included.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One request, ready to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,9 +180,11 @@ impl Sink for WebhookSink {
         conn.write_all(&bytes)
             .and_then(|()| conn.flush())
             .map_err(|err| format!("cannot send to {}: {err}", self.to))?;
-        let (code, reason) =
-            status(&mut conn).map_err(|err| format!("no answer from {}: {err}", self.to))?;
-        let what = format!("{} answered {code} {reason}", self.to);
+        // Only the code: the reason phrase is the receiver's text, which
+        // could echo the (secret) path into the log.
+        let code = status(&mut conn, Instant::now() + ANSWER_TIMEOUT)
+            .map_err(|err| format!("no answer from {}: {err}", self.to))?;
+        let what = format!("{} answered {code}", self.to);
         match code {
             200..=299 => Ok(()),
             408 | 425 | 429 | 500..=599 => Err(Failure::Retry(what)),
@@ -189,12 +193,11 @@ impl Sink for WebhookSink {
     }
 }
 
-/// Read the final status line: its code and (shortened) reason. Interim
-/// 1xx answers are skipped.
-fn status(r: &mut dyn Read) -> io::Result<(u16, String)> {
+/// Read the final status code, skipping interim 1xx answers, by `until`.
+fn status(r: &mut dyn Read, until: Instant) -> io::Result<u16> {
     let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
     loop {
-        let line = read_line(r)?;
+        let line = read_line(r, until)?;
         let mut parts = line.splitn(3, ' ');
         let version = parts.next().unwrap_or_default();
         if !version.starts_with("HTTP/1.") {
@@ -207,25 +210,23 @@ fn status(r: &mut dyn Read) -> io::Result<(u16, String)> {
             .ok_or_else(|| bad("no status code"))?;
         if (100..200).contains(&code) {
             // Its headers end with an empty line.
-            while !read_line(r)?.is_empty() {}
+            while !read_line(r, until)?.is_empty() {}
             continue;
         }
-        let reason: String = parts
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(80)
-            .collect();
-        return Ok((code, reason));
+        return Ok(code);
     }
 }
 
-/// One line up to CRLF (or LF), without it.
-fn read_line(r: &mut dyn Read) -> io::Result<String> {
+/// One line up to CRLF (or LF), without it. Each read may take the
+/// socket's timeout, but none starts after `until`, so a receiver that
+/// trickles bytes cannot hold the output.
+fn read_line(r: &mut dyn Read, until: Instant) -> io::Result<String> {
     let mut line = Vec::new();
     let mut b = [0u8; 1];
     loop {
+        if Instant::now() >= until {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
+        }
         match r.read(&mut b) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -483,13 +484,36 @@ mod tests {
 
     #[test]
     fn status_lines() {
+        let later = Instant::now() + Duration::from_secs(10);
         let mut r: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 503 Service Unavailable\r\n";
-        assert_eq!(status(&mut r).unwrap(), (503, "Service Unavailable".into()));
+        assert_eq!(status(&mut r, later).unwrap(), 503);
         let mut r: &[u8] = b"HTTP/1.0 204\n";
-        assert_eq!(status(&mut r).unwrap(), (204, String::new()));
+        assert_eq!(status(&mut r, later).unwrap(), 204);
         let mut r: &[u8] = b"SSH-2.0-OpenSSH\r\n";
-        assert!(status(&mut r).is_err());
+        assert!(status(&mut r, later).is_err());
         let mut r: &[u8] = b"HTTP/1.1 200";
-        assert!(status(&mut r).is_err());
+        assert!(status(&mut r, later).is_err());
+    }
+
+    /// Endless 1xx answers, a byte every 2 ms: each read is well within
+    /// the socket timeout.
+    struct Interim(usize);
+
+    impl Read for Interim {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            const TEXT: &[u8] = b"HTTP/1.1 103 Early Hints\r\n\r\n";
+            std::thread::sleep(Duration::from_millis(2));
+            buf[0] = TEXT[self.0 % TEXT.len()];
+            self.0 += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn endless_interim_answers_time_out() {
+        let started = Instant::now();
+        let err = status(&mut Interim(0), started + Duration::from_millis(200)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

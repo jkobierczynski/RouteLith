@@ -64,7 +64,8 @@ The MSI's configuration has an Event Log output.
 `X-Routelith-Signature: sha256=<hex>` is the HMAC-SHA256 of
 `<X-Routelith-Timestamp>.<body>` under the secret, so the receiver can
 check it and refuse stale timestamps. `token` is the ntfy access token or
-the Gotify application token. A 2xx answer is success; 408, 429, 5xx and
+the Gotify application token; it needs an `https://` URL unless the
+receiver is on the same machine (localhost or a loopback address). A 2xx answer is success; 408, 429, 5xx and
 network errors are retried; any other answer drops the event and is
 counted, as retrying would not help. `url`, `secret` and `token` can name
 where the secret is instead of holding it: `${env:NAME}` reads an

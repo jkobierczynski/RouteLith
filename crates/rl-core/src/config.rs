@@ -1285,7 +1285,17 @@ impl Validator<'_> {
                 .and_then(|v| match parse_http_url(&v) {
                     Ok(url) => Some(url),
                     Err(e) => {
-                        self.error(&u.span(), format!("output {name:?}: url {e}"));
+                        // Parser errors may quote part of the value; one
+                        // read from a reference is not repeated.
+                        let msg = if v == *u.get_ref() {
+                            format!("output {name:?}: url {e}")
+                        } else {
+                            format!(
+                                "output {name:?}: url is not a valid http:// or https:// URL \
+                                 once its references are filled in"
+                            )
+                        };
+                        self.error(&u.span(), msg);
                         None
                     }
                 }),
@@ -1326,6 +1336,23 @@ impl Validator<'_> {
             }
             Some(v)
         });
+        // A token sent in clear can be read and reused by anyone on the
+        // path; only a loopback receiver is exempt.
+        if let (Some(t), Some(u)) = (&o.token, &url) {
+            let loopback = u.host.eq_ignore_ascii_case("localhost")
+                || u.host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|a| a.is_loopback());
+            if !u.tls && !loopback {
+                self.error(
+                    &t.span(),
+                    format!(
+                        "output {name:?}: token needs an https:// url (or a loopback \
+                         host), so it is not sent in clear"
+                    ),
+                );
+            }
+        }
         if let (Some(c), Some(u)) = (&o.ca_file, &url) {
             if !u.tls {
                 self.error(
@@ -2904,7 +2931,7 @@ ca_file = "/etc/routelith/hooks-ca.pem"
 name   = "phone"
 type   = "webhook"
 format = "ntfy"
-url    = "http://ntfy.lan/alerts"
+url    = "https://ntfy.lan/alerts"
 token  = "tk_abc"
 
 [[output]]
@@ -2944,8 +2971,8 @@ url    = "https://hooks.slack.example/services/T0/B0/XYZ"
             panic!("{:?}", c.outputs[1]);
         };
         assert_eq!(w.format, WebhookFormat::Ntfy);
-        assert!(!w.url.tls);
-        assert_eq!(w.url.port, 80);
+        assert!(w.url.tls);
+        assert_eq!(w.url.port, 443);
         assert_eq!(w.token.as_ref().unwrap().expose(), "tk_abc");
         let OutputKind::Webhook(w) = &c.outputs[2].kind else {
             panic!("{:?}", c.outputs[2]);
@@ -2964,14 +2991,19 @@ url    = "https://hooks.slack.example/services/T0/B0/XYZ"
                 "",
             ),
             (
-                ok.replace("url    = \"http://ntfy.lan/alerts\"\n", ""),
+                ok.replace("url    = \"https://ntfy.lan/alerts\"\n", ""),
                 "needs the url",
                 "",
             ),
             (
-                ok.replace("http://ntfy.lan/alerts", "ftp://ntfy.lan/alerts-k3y"),
+                ok.replace("https://ntfy.lan/alerts", "ftp://ntfy.lan/alerts-k3y"),
                 "output \"phone\": url",
                 "alerts-k3y",
+            ),
+            (
+                ok.replace("https://ntfy.lan/alerts", "http://ntfy.lan/alerts"),
+                "token needs an https:// url",
+                "",
             ),
             (
                 ok.replace("format = \"ntfy\"", "format = \"pager\""),
@@ -2996,9 +3028,10 @@ url    = "https://hooks.slack.example/services/T0/B0/XYZ"
             ),
             (
                 ok.replace(
-                    "format = \"ntfy\"",
-                    "format = \"ntfy\"\nca_file = \"/ca.pem\"",
-                ),
+                    "format = \"slack\"",
+                    "format = \"slack\"\nca_file = \"/ca.pem\"",
+                )
+                .replace("https://hooks.slack.example", "http://hooks.slack.example"),
                 "ca_file applies to an https:// url only",
                 "",
             ),
@@ -3029,6 +3062,21 @@ url    = "https://hooks.slack.example/services/T0/B0/XYZ"
             if !hidden.is_empty() {
                 assert!(errs.iter().all(|e| !e.contains(hidden)), "{errs:?}");
             }
+        }
+        // A URL built from a reference: the parser's complaint would quote
+        // the value, so it is not repeated.
+        let path = std::env::var("PATH").unwrap();
+        let errs = errors(&ok.replace("https://ntfy.lan/alerts", "https://ntfy.lan:${env:PATH}"));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("once its references are filled in")),
+            "{errs:?}"
+        );
+        assert!(errs.iter().all(|e| !e.contains(&path)), "{errs:?}");
+        // A token may go in clear to a receiver on this machine.
+        for host in ["localhost:8080", "127.0.0.1", "[::1]"] {
+            let src = ok.replace("https://ntfy.lan/alerts", &format!("http://{host}/alerts"));
+            assert!(errors(&src).is_empty(), "{host}: {:?}", errors(&src));
         }
     }
     #[test]
