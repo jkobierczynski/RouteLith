@@ -1169,12 +1169,27 @@ impl Validator<'_> {
                         }
                     }
                 }
-                t @ ("eventlog" | "webhook" | "email") => {
+                "eventlog" => {
+                    not_for(self, &syslog_keys, "syslog");
+                    not_for(self, &jsonl_keys, "jsonl");
+                    if cfg!(windows) {
+                        Some(OutputKind::EventLog)
+                    } else {
+                        self.error(
+                            &o.type_.span(),
+                            format!(
+                                "output {name:?}: the Windows Event Log exists only on Windows"
+                            ),
+                        );
+                        None
+                    }
+                }
+                t @ ("webhook" | "email") => {
                     self.error(
                         &o.type_.span(),
                         format!(
                             "output type {t:?} is not available yet; \
-                             this version sends to \"syslog\" and \"jsonl\""
+                             this version sends to \"syslog\", \"jsonl\" and \"eventlog\""
                         ),
                     );
                     None
@@ -1183,7 +1198,8 @@ impl Validator<'_> {
                     self.error(
                         &o.type_.span(),
                         format!(
-                            "unknown output type {t:?}; this version sends to \"syslog\" and \"jsonl\""
+                            "unknown output type {t:?}; this version sends to \"syslog\", \
+                             \"jsonl\" and \"eventlog\""
                         ),
                     );
                     None
@@ -2578,6 +2594,46 @@ alerts = ["loss"]
         assert!(matches!(&c.outputs[2].kind, OutputKind::Jsonl(j)
             if j.path == std::path::Path::new("/var/log/routelith/events.jsonl")));
         assert_eq!(c.outputs[2].queue, 50);
+    }
+
+    #[test]
+    fn eventlog_outputs_are_for_windows() {
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+[[output]]
+name = "events"
+type = "eventlog"
+events = ["alert_raised"]
+[[output]]
+name = "wrong"
+type = "eventlog"
+path = "x.jsonl"
+[[group]]
+name = "G"
+  [[group.target]]
+  name = "t"
+  host = "10.0.0.1"
+"#;
+        let e = errors(src);
+        if cfg!(windows) {
+            assert_eq!(e.len(), 1, "{e:?}");
+            assert!(
+                e[0].contains("path applies to type = \"jsonl\" only"),
+                "{e:?}"
+            );
+            let ok = src
+                .split("[[output]]\nname = \"wrong\"")
+                .next()
+                .unwrap()
+                .to_string()
+                + "[[group]]\nname = \"G\"\n  [[group.target]]\n  name = \"t\"\n  host = \"10.0.0.1\"\n";
+            let c = parse(&ok).config.unwrap();
+            assert_eq!(c.outputs[0].kind, crate::output::OutputKind::EventLog);
+            assert_eq!(c.outputs[0].filter.events, ["alert_raised"]);
+        } else {
+            assert_eq!(e.len(), 3, "{e:?}");
+            assert!(e[0].contains("exists only on Windows"), "{e:?}");
+        }
     }
 
     #[test]

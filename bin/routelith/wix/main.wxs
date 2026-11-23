@@ -73,6 +73,12 @@
               </ServiceInstall>
               <ServiceControl Id="RoutelithServiceControl" Name="Routelith"
                               Start="install" Stop="both" Remove="uninstall" Wait="yes"/>
+              <!-- The Routelith event source for type = "eventlog" outputs; its
+                   messages are the table built into routelith.exe. -->
+              <util:EventSource Log="Application" Name="Routelith"
+                                EventMessageFile="[#RoutelithExe]"
+                                SupportsErrors="yes" SupportsWarnings="yes"
+                                SupportsInformationals="yes"/>
             </Component>
             <Component Id="Path" Guid="737CE5E5-5D8D-4C11-9D4E-881A039AB142" KeyPath="yes">
               <Environment Id="PATH" Name="PATH" Value="[Bin]" Permanent="no"

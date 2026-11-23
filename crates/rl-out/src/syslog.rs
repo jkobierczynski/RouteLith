@@ -51,7 +51,7 @@ fn severity(kind: EventKind) -> u8 {
 }
 
 /// `2026-11-21T10:05:00.123Z`.
-fn rfc3339(ms: i64) -> String {
+pub(crate) fn rfc3339(ms: i64) -> String {
     let (y, m, d) = civil_from_days(ms.div_euclid(DAY_MS));
     let t = ms.rem_euclid(DAY_MS);
     format!(

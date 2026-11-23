@@ -84,6 +84,10 @@ duration = "2h"
 # name = "archive"
 # type = "jsonl"
 # path = "/var/log/routelith/events.jsonl"
+#
+# [[output]]                        # Windows only: the Application log,
+# name = "eventlog"                 # source Routelith
+# type = "eventlog"
 
 [[group]]
 name = "Core"

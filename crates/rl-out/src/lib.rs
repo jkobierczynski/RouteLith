@@ -1,5 +1,6 @@
-//! Outputs (architecture doc §11.2, §21.5 F7): events sent on from the
-//! event log to syslog receivers and JSON-lines files.
+//! Outputs (architecture doc §11.2, §11.3, §21.5 F7, F8): events sent on
+//! from the event log to syslog receivers, JSON-lines files and (on
+//! Windows) the Windows Event Log.
 //!
 //! Each output has its own bounded queue and its own thread. [`Outputs::send`]
 //! only filters and queues, so it never waits on the network or a disk: a
@@ -14,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(windows)]
+pub mod eventlog;
 mod jsonl;
 mod syslog;
 mod tls;
@@ -40,7 +43,7 @@ pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct OutputStats {
     pub name: String,
-    /// `syslog` or `jsonl`.
+    /// `syslog`, `jsonl` or `eventlog`.
     pub kind: &'static str,
     /// Events delivered.
     pub sent: AtomicU64,
@@ -170,6 +173,18 @@ impl Outputs {
                         ));
                     }
                     Box::new(sink)
+                }
+                #[cfg(windows)]
+                OutputKind::EventLog => Box::new(
+                    eventlog::EventLogSink::new(eventlog::SOURCE)
+                        .map_err(|e| format!("output {:?}: {e}", o.name))?,
+                ),
+                #[cfg(not(windows))]
+                OutputKind::EventLog => {
+                    return Err(format!(
+                        "output {:?}: the Windows Event Log exists only on Windows",
+                        o.name
+                    ));
                 }
             };
             sinks.push((o, sink));

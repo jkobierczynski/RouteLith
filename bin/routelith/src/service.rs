@@ -6,7 +6,8 @@
 //! by the service manager 30 s after a failure (the count resets after a
 //! day without failures), as the MSI sets it up. The MSI installs the same
 //! service through Windows Installer; these commands are for a plain copy
-//! of the executable.
+//! of the executable. Both register the `Routelith` event source, whose
+//! messages are in routelith.exe, for `type = "eventlog"` outputs.
 //!
 //! On other systems the commands only explain where the service files are.
 
@@ -202,6 +203,8 @@ mod windows {
         service
             .set_failure_actions_on_non_crash_failures(true)
             .map_err(to_io)?;
+        // Before the start, so the server_started event already shows as text.
+        rl_sys::eventlog::register_source(rl_out::eventlog::SOURCE, &exe)?;
         println!("Installed service {NAME}; it logs to {}", log.display());
         if !args.no_start {
             service.start::<&OsStr>(&[]).map_err(|e| {
@@ -231,6 +234,7 @@ mod windows {
         // Mark for deletion first: the service manager removes it as soon
         // as it has stopped and no handles remain.
         service.delete().map_err(to_io)?;
+        rl_sys::eventlog::unregister_source(rl_out::eventlog::SOURCE)?;
         if service.query_status().map_err(to_io)?.current_state != ServiceState::Stopped {
             service.stop().map_err(to_io)?;
             let deadline = Instant::now() + Duration::from_secs(30);
