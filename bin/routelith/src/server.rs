@@ -288,6 +288,7 @@ pub(crate) async fn serve(
                 )),
                 alerts: board.clone(),
                 auth: auth.clone(),
+                slas: cfg.slas.clone(),
             };
             Some((addr, listener, rl_web::router(Arc::new(state)), tls, auth))
         }

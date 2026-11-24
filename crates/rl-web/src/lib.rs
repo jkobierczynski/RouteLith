@@ -15,6 +15,7 @@ pub mod auth;
 mod host;
 mod metrics;
 pub mod silences;
+pub mod sla;
 mod ui;
 pub mod users;
 
@@ -151,6 +152,8 @@ pub struct AppState {
     pub alerts: Arc<AlertBoard>,
     /// Users and sessions.
     pub auth: Arc<Auth>,
+    /// The `[[sla]]` tables, for the SLA report.
+    pub slas: Vec<rl_core::config::Sla>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -175,6 +178,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(host::history))
         .route("/api/v1/alerts", get(alerts::alerts))
         .route("/api/v1/events", get(alerts::events))
+        .route("/api/v1/reports/sla", get(sla::handler))
         .route("/api/v1/silences", post(silences::create))
         .route("/api/v1/silences/{name}", delete(silences::end_now))
         .route("/api/v1/render/{file}", get(api::render))

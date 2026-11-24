@@ -11,6 +11,7 @@ mod check;
 mod health;
 mod import;
 mod render;
+mod report;
 mod server;
 mod service;
 mod user;
@@ -78,6 +79,17 @@ enum CtlAction {
     },
     /// Add, change and remove the web UI's users.
     User(user::UserArgs),
+    /// Reports from the store.
+    Report {
+        #[command(subcommand)]
+        kind: ReportKind,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ReportKind {
+    /// A month's SLA report, as print-ready HTML or CSV.
+    Sla(report::SlaArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -121,6 +133,11 @@ fn main() -> ExitCode {
         Command::Ctl {
             action: CtlAction::User(args),
         } => user::run(args),
+        Command::Ctl {
+            action: CtlAction::Report {
+                kind: ReportKind::Sla(args),
+            },
+        } => report::run(&args),
     }
 }
 

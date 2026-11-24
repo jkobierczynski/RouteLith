@@ -405,18 +405,21 @@
       tbody
     );
     const alertPanel = el("section", { class: "alerts", hidden: true });
+    const reports = el("p", { class: "muted reports", hidden: true });
     app.replaceChildren(
       el("h1", { text: "Overview" }),
       el("p", { class: "muted", text: series.length + " series. Each cell is the newest round's median." }),
       alertPanel,
       lossLegend(),
-      el("div", { class: "scroll" }, table)
+      el("div", { class: "scroll" }, table),
+      reports
     );
 
     async function refresh() {
       const [data, alerts] = await Promise.all([getJson("/api/v1/latest"), getJson("/api/v1/alerts")]);
       if (gen !== generation) return;
       showAlerts(alertPanel, alerts);
+      if (reports.hidden && alerts.slas && alerts.slas.length) showReports(reports, alerts.now);
       const alerting = new Map();
       for (const a of alerts.active) {
         if (!alerting.has(a.series)) alerting.set(a.series, []);
@@ -449,6 +452,25 @@
       }
     }
     poll(gen, refresh, OVERVIEW_REFRESH_MS);
+  }
+
+  // Links to the SLA reports (UTC months): last month and this one so far.
+  function showReports(p, now) {
+    const d = new Date(now);
+    const month = (y, m) => {
+      const t = new Date(Date.UTC(y, m, 1));
+      return t.getUTCFullYear() + "-" + String(t.getUTCMonth() + 1).padStart(2, "0");
+    };
+    const last = month(d.getUTCFullYear(), d.getUTCMonth() - 1);
+    const current = month(d.getUTCFullYear(), d.getUTCMonth());
+    const link = (m, format, text) =>
+      el("a", { href: "/api/v1/reports/sla?month=" + m + "&format=" + format, target: "_blank", rel: "noopener", text });
+    p.replaceChildren(
+      "SLA report: ",
+      link(last, "html", last), " (", link(last, "csv", "CSV"), ") · ",
+      link(current, "html", current + " so far"), " (", link(current, "csv", "CSV"), ")"
+    );
+    p.hidden = false;
   }
 
   // ---------- alerts (§12) ----------

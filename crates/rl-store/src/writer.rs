@@ -1069,6 +1069,7 @@ mod tests {
             sent: rounds * 20,
             received: rounds * 20,
             quantiles_us: rollup::quantiles(&samples),
+            down: Some(0),
         }
     }
 

@@ -105,6 +105,7 @@ fn fixture(users: &[(&str, Role, &str)], anonymous: bool) -> Fixture {
             )),
         ),
         auth: Arc::new(auth),
+        slas: Vec::new(),
     };
     Fixture {
         router: rl_web::router(Arc::new(state)),

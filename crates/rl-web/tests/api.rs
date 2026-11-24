@@ -192,6 +192,16 @@ fn fixture() -> Fixture {
         })),
         alerts,
         auth: Arc::new(rl_web::Auth::open()),
+        slas: vec![rl_core::config::Sla {
+            name: "lan".into(),
+            targets: Vec::new(),
+            groups: vec!["lan".into()],
+            availability: Some(99.9),
+            loss: None,
+            latency_us: None,
+            percentile: 95,
+            line: 1,
+        }],
     };
     Fixture {
         _dir: dir,
@@ -577,4 +587,43 @@ async fn alerts_and_events() {
     );
     assert!(body.contains("routelith_alerts_raised_total 1"));
     assert!(body.contains("routelith_alerts_cleared_total 0"));
+}
+
+#[tokio::test]
+async fn sla_reports_come_as_html_or_csv() {
+    let f = fixture();
+    // A past month the fixture has no rounds in.
+    let (st, h, body) = get(&f.router, "/api/v1/reports/sla?month=2026-10").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(h["content-type"].to_str().unwrap().starts_with("text/html"));
+    assert!(
+        h["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("default-src 'none'")
+    );
+    assert!(body.contains("SLA report, October 2026"), "{body}");
+    assert!(body.contains("gw &quot;main&quot;"), "the target, escaped");
+    assert!(body.contains("badge none"), "no data that month");
+
+    let (st, h, body) = get(&f.router, "/api/v1/reports/sla?month=2026-10&format=csv").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(h["content-type"], "text/csv; charset=utf-8");
+    assert!(
+        h["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains("routelith-sla-2026-10.csv")
+    );
+    let line = body.lines().nth(1).unwrap();
+    assert!(
+        line.starts_with("2026-10,lan,\"gw \"\"main\"\"\",v4,lan,"),
+        "{line}"
+    );
+    assert!(line.ends_with(",no data"), "{line}");
+
+    for bad in ["month=2026-13", "month=9999-01", "format=pdf"] {
+        let (st, _, body) = get(&f.router, &format!("/api/v1/reports/sla?{bad}")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
 }

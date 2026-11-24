@@ -112,6 +112,10 @@ pub struct RollupPoint {
     /// samples, from the minimum to the maximum; empty when nothing was
     /// received.
     pub quantiles_us: Vec<u32>,
+    /// Rounds that got no reply at all, for availability (SLA reports).
+    /// `None` in points stored before it was counted, and in imported
+    /// ones, whose source cannot tell.
+    pub down: Option<u32>,
 }
 
 impl RollupPoint {
@@ -124,9 +128,10 @@ impl RollupPoint {
             let bucket = rounds[i].ts_ms.div_euclid(width_ms) * width_ms;
             let mut j = i;
             let mut samples = Vec::new();
-            let (mut sent, mut received) = (0u32, 0u32);
+            let (mut sent, mut received, mut down) = (0u32, 0u32, 0u32);
             while j < rounds.len() && rounds[j].ts_ms.div_euclid(width_ms) * width_ms == bucket {
                 let r = &rounds[j];
+                down += u32::from(r.rtts_us.is_empty());
                 // Saturate rather than wrap: pings per round are capped
                 // far below this, but a direct write is not.
                 sent = sent.saturating_add(u32::from(r.sent));
@@ -142,6 +147,7 @@ impl RollupPoint {
                 sent,
                 received,
                 quantiles_us: quantiles(&samples),
+                down: Some(down),
             });
             i = j;
         }
@@ -205,6 +211,7 @@ impl RollupPoint {
             sent: u32::from(r.sent),
             received: u32::try_from(r.rtts_us.len()).unwrap_or(u32::MAX),
             quantiles_us: quantiles(&r.rtts_us),
+            down: Some(u32::from(r.rtts_us.is_empty())),
         }
     }
 }
@@ -216,7 +223,10 @@ impl RollupPoint {
     pub fn merge(points: &[RollupPoint], ts_ms: i64) -> RollupPoint {
         let mut weighted: Vec<(u32, f64)> = Vec::new();
         let (mut rounds, mut sent, mut received) = (0u32, 0u32, 0u32);
+        // Known only if known for every point.
+        let mut down = Some(0u32);
         for p in points {
+            down = down.zip(p.down).map(|(a, b)| a.saturating_add(b));
             rounds = rounds.saturating_add(p.rounds);
             sent = sent.saturating_add(p.sent);
             received = received.saturating_add(p.received);
@@ -253,6 +263,7 @@ impl RollupPoint {
             sent,
             received: if quantiles_us.is_empty() { 0 } else { received },
             quantiles_us,
+            down,
         }
     }
 
@@ -261,6 +272,7 @@ impl RollupPoint {
     /// received.
     pub(crate) fn is_valid(&self) -> bool {
         self.received <= self.sent
+            && self.down.is_none_or(|d| d <= self.rounds)
             && if self.received == 0 {
                 self.quantiles_us.is_empty()
             } else {
@@ -281,8 +293,15 @@ pub fn quantiles(sorted: &[u32]) -> Vec<u32> {
         .collect()
 }
 
+/// Records start with a point count, never 0; a 0 followed by a version
+/// marks a later layout. Version 2 adds [`RollupPoint::down`] (plus one,
+/// 0 for unknown) after `received`.
+const RECORD_V2: u64 = 2;
+
 fn encode(points: &[RollupPoint]) -> Vec<u8> {
     let mut out = Vec::new();
+    varint::put_u64(&mut out, 0);
+    varint::put_u64(&mut out, RECORD_V2);
     varint::put_u64(&mut out, points.len() as u64);
     let mut prev_ts = 0i64;
     for p in points {
@@ -291,6 +310,7 @@ fn encode(points: &[RollupPoint]) -> Vec<u8> {
         varint::put_u64(&mut out, u64::from(p.rounds));
         varint::put_u64(&mut out, u64::from(p.sent));
         varint::put_u64(&mut out, u64::from(p.received));
+        varint::put_u64(&mut out, p.down.map_or(0, |d| u64::from(d) + 1));
         // Sorted: the first value, then non-negative rank-to-rank deltas.
         let mut prev = 0u32;
         for &q in &p.quantiles_us {
@@ -303,7 +323,14 @@ fn encode(points: &[RollupPoint]) -> Vec<u8> {
 
 fn decode(body: &[u8]) -> Option<Vec<RollupPoint>> {
     let mut r = Reader::new(body);
-    let n = usize::try_from(r.u64()?).ok()?;
+    let mut n = usize::try_from(r.u64()?).ok()?;
+    let v2 = n == 0;
+    if v2 {
+        if r.u64()? != RECORD_V2 {
+            return None;
+        }
+        n = usize::try_from(r.u64()?).ok()?;
+    }
     let mut out = Vec::with_capacity(n.min(1024));
     let mut ts = 0i64;
     for _ in 0..n {
@@ -314,6 +341,15 @@ fn decode(body: &[u8]) -> Option<Vec<RollupPoint>> {
         if received > sent {
             return None;
         }
+        let down = match (v2, if v2 { r.u32()? } else { 0 }) {
+            (true, d) if d > 0 => {
+                if d - 1 > rounds {
+                    return None;
+                }
+                Some(d - 1)
+            }
+            _ => None,
+        };
         let mut quantiles_us = Vec::new();
         if received > 0 {
             let mut prev = 0u32;
@@ -328,6 +364,7 @@ fn decode(body: &[u8]) -> Option<Vec<RollupPoint>> {
             sent,
             received,
             quantiles_us,
+            down,
         });
     }
     r.is_empty().then_some(out)
@@ -624,6 +661,40 @@ mod tests {
         }
     }
 
+    /// Records written before `down` was counted still read, as unknown.
+    #[test]
+    fn first_layout_records_read_with_down_unknown() {
+        let mut v1 = Vec::new();
+        varint::put_u64(&mut v1, 1);
+        varint::put_i64(&mut v1, 3_600_000);
+        for n in [12, 240, 0] {
+            varint::put_u64(&mut v1, n);
+        }
+        let p = decode(&v1).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].rounds, p[0].sent, p[0].down), (12, 240, None));
+        // A later layout than this one knows is refused, not misread.
+        let mut v9 = Vec::new();
+        varint::put_u64(&mut v9, 0);
+        varint::put_u64(&mut v9, 9);
+        assert_eq!(decode(&v9), None);
+    }
+
+    #[test]
+    fn down_counts_rounds_without_a_reply() {
+        let r = |i: i64, n: usize| StoredRound {
+            ts_ms: i * 60_000,
+            sent: 4,
+            rtts_us: vec![1000; n],
+            errors: ErrorCounts::default(),
+            resolved: None,
+            timing: None,
+            flags: 0,
+        };
+        let p = RollupPoint::build(&[r(0, 4), r(1, 0), r(2, 1), r(3, 0)], HOUR_MS);
+        assert_eq!(p[0].down, Some(2));
+    }
+
     #[test]
     fn quantiles_span_min_to_max() {
         let v: Vec<u32> = (1..=100).collect();
@@ -647,6 +718,7 @@ mod tests {
             } else {
                 Vec::new()
             },
+            down: None,
         };
         let r = point(240, 238).to_round();
         assert_eq!((r.sent, r.rtts_us.len()), (240, 238));
@@ -696,7 +768,7 @@ mod tests {
                 ts += gap;
                 s.sort_unstable();
                 let received = s.len() as u32;
-                RollupPoint { ts_ms: ts, rounds, sent: received + extra, received, quantiles_us: quantiles(&s) }
+                RollupPoint { ts_ms: ts, rounds, sent: received + extra, received, quantiles_us: quantiles(&s), down: (ts % 3 > 0).then_some(rounds / 2) }
             }).collect();
             prop_assert_eq!(decode(&encode(&points)), Some(points));
         }
@@ -728,6 +800,7 @@ mod tests {
             sent: 240,
             received: 239,
             quantiles_us: vec![1000; QUANTILES],
+            down: Some(0),
         };
         append_day(d, 7, Tier::R1h, day, &[p(0), p(1)]).unwrap();
         // A rebuild of the same day is skipped.
@@ -764,6 +837,7 @@ mod tests {
                 sent: 5760,
                 received: 5760,
                 quantiles_us: vec![5; QUANTILES],
+                down: Some(0),
             };
             append_day(d, 1, Tier::R1d, day, &[pt]).unwrap();
         }
@@ -819,8 +893,19 @@ mod tests {
             sent: 20,
             received: 0,
             quantiles_us: Vec::new(),
+            down: Some(1),
         };
-        let m = RollupPoint::merge(&[lost.clone(), lost], 0);
+        let m = RollupPoint::merge(&[lost.clone(), lost.clone()], 0);
         assert_eq!((m.sent, m.received, m.quantiles_us.len()), (40, 0, 0));
+        assert_eq!(m.down, Some(2));
+        let old = RollupPoint {
+            down: None,
+            ..lost.clone()
+        };
+        assert_eq!(
+            RollupPoint::merge(&[lost, old], 0).down,
+            None,
+            "unknown stays unknown"
+        );
     }
 }
