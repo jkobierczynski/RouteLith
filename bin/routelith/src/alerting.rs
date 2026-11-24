@@ -396,6 +396,12 @@ impl Alerting {
             ),
         );
         self.record(e);
+        self.close_outputs();
+    }
+
+    /// Give the outputs a few seconds to deliver what they hold, and end
+    /// them: the process exiting would cut a delivery off midway.
+    pub(crate) fn close_outputs(&mut self) {
         std::mem::replace(&mut self.outputs, rl_out::Outputs::none()).close(OUTPUT_GRACE);
     }
 

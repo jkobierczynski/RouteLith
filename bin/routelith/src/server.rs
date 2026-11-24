@@ -171,6 +171,47 @@ pub(crate) async fn serve(
         return ExitCode::from(2);
     }
 
+    // What can still stop start-up comes before the alert engine, which
+    // logs "server started" and hands it to the outputs: an exit after it
+    // would cut their delivery short and leave no "server stopped".
+    let limiter = Arc::new(RateLimiter::new(cfg.server.max_pps));
+    let mut probes: HashMap<ProbeConfig, Arc<dyn Probe>> = HashMap::new();
+    let mut plan_probes = Vec::with_capacity(plans.len());
+    for plan in &plans {
+        let probe = match probes.get(&plan.probe) {
+            Some(p) => p.clone(),
+            None => match make_probe(&plan.probe, &limiter) {
+                Ok(p) => probes.entry(plan.probe.clone()).or_insert(p).clone(),
+                Err(e) => {
+                    eprintln!("routelith server: target {}: {e}", plan.target);
+                    return ExitCode::from(1);
+                }
+            },
+        };
+        plan_probes.push(probe);
+    }
+    // The HTTP side: bind now, so a port in use stops start-up.
+    let ui = match cfg.server.listen_ui {
+        None => None,
+        Some(addr) => {
+            let reader = match Reader::open(&cfg.server.data_dir) {
+                Ok(r) => Arc::new(r),
+                Err(e) => {
+                    eprintln!("routelith server: cannot read the store: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("routelith server: cannot listen on {addr} (listen_ui): {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            Some((addr, listener, reader))
+        }
+    };
+
     // Alerts: the engine, its event log, and the state of the last run.
     let alert_series: Vec<crate::alerting::SeriesAlerts> = plans
         .iter()
@@ -192,28 +233,13 @@ pub(crate) async fn serve(
     let board = alerting.board.clone();
     let output_stats = alerting.outputs.stats();
 
-    // The HTTP side: bind now, so a port in use stops start-up.
     let latest = Arc::new(Latest::default());
     let host = Arc::new(LatestHost::default());
     let store_stats = Arc::new(Mutex::new(StoreCounters::default()));
     let stats = Arc::new(Stats::default());
-    let web = match cfg.server.listen_ui {
+    let web = match ui {
         None => None,
-        Some(addr) => {
-            let reader = match Reader::open(&cfg.server.data_dir) {
-                Ok(r) => Arc::new(r),
-                Err(e) => {
-                    eprintln!("routelith server: cannot read the store: {e}");
-                    return ExitCode::from(2);
-                }
-            };
-            let listener = match tokio::net::TcpListener::bind(addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("routelith server: cannot listen on {addr} (listen_ui): {e}");
-                    return ExitCode::from(2);
-                }
-            };
+        Some((addr, listener, reader)) => {
             let state = AppState {
                 reader,
                 data_dir: cfg.server.data_dir.clone(),
@@ -260,21 +286,9 @@ pub(crate) async fn serve(
         }
     };
 
-    let limiter = Arc::new(RateLimiter::new(cfg.server.max_pps));
-    let mut probes: HashMap<ProbeConfig, Arc<dyn Probe>> = HashMap::new();
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut jobs = tokio::task::JoinSet::new();
-    for (plan, series) in plans.into_iter().zip(ids) {
-        let probe = match probes.get(&plan.probe) {
-            Some(p) => p.clone(),
-            None => match make_probe(&plan.probe, &limiter) {
-                Ok(p) => probes.entry(plan.probe.clone()).or_insert(p).clone(),
-                Err(e) => {
-                    eprintln!("routelith server: target {}: {e}", plan.target);
-                    return ExitCode::from(1);
-                }
-            },
-        };
+    for ((plan, series), probe) in plans.into_iter().zip(ids).zip(plan_probes) {
         let job = Job {
             // Only ICMP depends on this process's socket permissions.
             v6_usable: usable[1] || !matches!(plan.probe, ProbeConfig::Icmp { .. }),
@@ -564,9 +578,14 @@ fn store_loop(
             "routelith server: store: {late} round(s) were not newer than the last one and were dropped"
         );
     }
-    result?;
-    w.close()?;
-    alerting.stopped(now_ms());
+    match result.and_then(|()| w.close()) {
+        Ok(()) => alerting.stopped(now_ms()),
+        Err(e) => {
+            // Still hand on what is queued, as an exit cuts the outputs off.
+            alerting.close_outputs();
+            return Err(e);
+        }
+    }
     Ok(rejected)
 }
 
