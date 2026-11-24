@@ -59,7 +59,9 @@ condition = "> baseline_p50_7d * 2 + 5ms"
 for       = "3 rounds"
 
 # Alerts raised in a silence are logged and shown, but marked as not to be
-# sent. Times are UTC. One window: start and end. Recurring: an rrule
+# sent; so is the clear of one raised before the silence began. Operators
+# add one-off silences in the web UI too (kept in silences.json in the
+# data directory). Times are UTC. One window: start and end. Recurring: an rrule
 # (FREQ=DAILY or WEEKLY, BYDAY, BYHOUR, BYMINUTE) and a duration.
 [[silence]]
 name     = "sunday-maintenance"

@@ -28,8 +28,19 @@ Prometheus can send HTTP Basic credentials instead. Ten failed logins in
 five minutes from one address, or for one name, lock it out for the rest
 of that window. `anonymous = true` lets callers without a login read, for a
 wall display. `tls_cert` and `tls_key` (PEM files) serve the UI over HTTPS.
-Roles: viewers read, operators will also silence alerts, admins can do
+Roles: viewers read, operators also add and end silences, admins can do
 everything.
+
+Operators silence a raised alert from the overview (its rule on its
+target, for 1 hour to 7 days, with a comment saying why), and end added
+silences there. Scripts use `POST /api/v1/silences` with JSON
+`{"targets": [...], "groups": [...], "alerts": [...], "minutes": 60,
+"comment": "..."}` (or `start` and `end` in Unix milliseconds, at most 90
+days; `name` is optional), and `DELETE /api/v1/silences/<name>` to end one
+now. Added silences are kept in `silences.json` in the data directory, with
+who added and ended them, until a week after they end; those in the
+configuration file can only be changed there. Without users no one can add
+silences, as anyone could reach the UI.
 Once a minute the server also records a health snapshot of its own machine
 (CPU, NIC errors and drops, default gateways, DNS servers) in
 `data/health/`; the target view shows it beside the graphs, so a slow minute
@@ -111,7 +122,9 @@ suppressed. The mark is decided when the child's alert is raised, and its
 clear keeps it; a parent alert raised later does not mark it. `[[silence]]` tables
 mark alerts raised in a window (`start` and `end`) or a recurring one (an
 `rrule` with FREQ=DAILY or WEEKLY, BYDAY, BYHOUR and BYMINUTE, in UTC, plus a
-`duration`), for some targets, groups or rules. Suppressed and silenced
+`duration`), for some targets, groups or rules. A silence that comes into
+force while an alert is raised marks that alert from then on, so its clear
+is not sent either. Suppressed and silenced
 alerts are still logged and shown, and outputs do not send them unless an
 output sets `quiet = true`. See
 `examples/routelith.toml`.

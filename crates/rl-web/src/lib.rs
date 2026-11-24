@@ -14,6 +14,7 @@ mod api;
 pub mod auth;
 mod host;
 mod metrics;
+pub mod silences;
 mod ui;
 pub mod users;
 
@@ -28,7 +29,7 @@ use axum::Router;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rl_store::{Reader, SeriesKey};
 use tokio::net::TcpListener;
@@ -174,6 +175,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(host::history))
         .route("/api/v1/alerts", get(alerts::alerts))
         .route("/api/v1/events", get(alerts::events))
+        .route("/api/v1/silences", post(silences::create))
+        .route("/api/v1/silences/{name}", delete(silences::end_now))
         .route("/api/v1/render/{file}", get(api::render))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

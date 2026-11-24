@@ -1,4 +1,5 @@
-//! Logins, roles and TLS on the web side (doc §21.5 F11).
+//! Logins, roles and TLS on the web side, and silences added from the UI
+//! (doc §21.5 F11, §21.6).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -7,8 +8,9 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
+use rl_web::silences::Silences;
 use rl_web::users::{Role, User, Users, hash_password};
-use rl_web::{AlertBoard, AppState, Auth, AuthConfig, LatestHost};
+use rl_web::{AlertBoard, AppState, Auth, AuthConfig, LatestHost, RuleInfo, SeriesInfo};
 use tower::ServiceExt;
 
 struct Fixture {
@@ -35,6 +37,31 @@ fn write_users(dir: &Path, users: &[(&str, Role, &str)]) {
     .unwrap();
 }
 
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// A silence in the configuration file, which the UI cannot end.
+fn configured_silence() -> rl_core::silence::Silence {
+    rl_core::silence::Silence {
+        name: "cfg".into(),
+        targets: Vec::new(),
+        groups: Vec::new(),
+        alerts: Vec::new(),
+        when: rl_core::silence::When::Once {
+            start_ms: 0,
+            end_ms: i64::MAX / 2,
+        },
+        line: 1,
+    }
+}
+
 fn fixture(users: &[(&str, Role, &str)], anonymous: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     // An empty store, made by the writer so the reader can open it.
@@ -52,12 +79,31 @@ fn fixture(users: &[(&str, Role, &str)], anonymous: bool) -> Fixture {
         reader: Arc::new(rl_store::Reader::open(dir.path()).unwrap()),
         data_dir: dir.path().to_path_buf(),
         host: Arc::new(LatestHost::default()),
-        series: Vec::new(),
+        series: vec![SeriesInfo {
+            id: 1,
+            key: rl_store::SeriesKey::new("local", "gw", "v4"),
+            group: "lan".into(),
+            probe: "icmp".into(),
+            host: "192.0.2.1".into(),
+            url: None,
+            step_ms: 60_000,
+            pings: 4,
+        }],
         latest: Arc::default(),
         vantage: "local".into(),
         started: Instant::now(),
         extra_metrics: None,
-        alerts: Arc::new(AlertBoard::new(Vec::new())),
+        alerts: Arc::new(
+            AlertBoard::new(vec![RuleInfo {
+                name: "down".into(),
+                kind: "threshold".into(),
+                summary: "loss > 50%".into(),
+                series: vec![1],
+            }])
+            .with_shared_silences(Arc::new(
+                Silences::load(vec![configured_silence()], dir.path(), now_ms()).unwrap(),
+            )),
+        ),
         auth: Arc::new(auth),
     };
     Fixture {
@@ -459,4 +505,190 @@ async fn the_ui_is_served_over_tls() {
     })
     .unwrap();
     assert!(auth.config().secure);
+}
+
+/// A JSON write with a session cookie and CSRF token.
+fn write(
+    method: &str,
+    uri: &str,
+    cookie: &str,
+    csrf: &str,
+    body: serde_json::Value,
+) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::COOKIE, cookie)
+        .header("x-csrf-token", csrf)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn operators_add_and_end_silences_viewers_cannot() {
+    let f = fixture(
+        &[
+            ("vic", Role::Viewer, "correct horse battery"),
+            ("ann", Role::Operator, "correct horse battery"),
+        ],
+        false,
+    );
+    let body = serde_json::json!({
+        "targets": ["gw"], "alerts": ["down"], "minutes": 60, "comment": "ISP works",
+    });
+
+    let a = login(&f.router, "vic", "correct horse battery").await;
+    let (vic, vic_csrf) = (cookie(&a), a.body["csrf"].as_str().unwrap().to_string());
+    let a = call(
+        &f.router,
+        write("POST", "/api/v1/silences", &vic, &vic_csrf, body.clone()),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
+
+    let a = login(&f.router, "ann", "correct horse battery").await;
+    let (ann, csrf) = (cookie(&a), a.body["csrf"].as_str().unwrap().to_string());
+    // Without the CSRF token, refused.
+    let a = call(
+        &f.router,
+        write("POST", "/api/v1/silences", &ann, "", body.clone()),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN);
+    for (bad, why) in [
+        (
+            serde_json::json!({"targets": ["nope"], "minutes": 60, "comment": "x"}),
+            "no target",
+        ),
+        (
+            serde_json::json!({"alerts": ["nope"], "minutes": 60, "comment": "x"}),
+            "no alert rule",
+        ),
+        (
+            serde_json::json!({"targets": ["gw"], "minutes": 60, "comment": " "}),
+            "comment",
+        ),
+        (
+            serde_json::json!({"targets": ["gw"], "comment": "x"}),
+            "end or minutes",
+        ),
+        (
+            serde_json::json!({"targets": ["gw"], "minutes": 200_000, "comment": "x"}),
+            "90 days",
+        ),
+        (
+            serde_json::json!({"name": "cfg", "minutes": 5, "comment": "x"}),
+            "exists",
+        ),
+        (
+            serde_json::json!({"name": "-x", "minutes": 5, "comment": "x"}),
+            "name",
+        ),
+    ] {
+        let a = call(
+            &f.router,
+            write("POST", "/api/v1/silences", &ann, &csrf, bad),
+        )
+        .await;
+        assert!(a.status.is_client_error(), "{why}: {}", a.status);
+        let msg = a.body["error"].as_str().unwrap();
+        assert!(msg.contains(why), "{why}: {msg}");
+    }
+
+    let a = call(
+        &f.router,
+        write("POST", "/api/v1/silences", &ann, &csrf, body),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let name = a.body["name"].as_str().unwrap().to_string();
+    assert!(name.starts_with("ui-"), "{name}");
+    assert_eq!(a.body["by"], "ann");
+    assert_eq!(a.body["active"], true);
+    assert!(f.dir.path().join("silences.json").exists());
+
+    let list = call(
+        &f.router,
+        get("/api/v1/alerts")
+            .header(header::COOKIE, &vic)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let s = &list.body["silences"];
+    assert_eq!(s[0]["source"], "config");
+    assert_eq!(s[1]["name"].as_str(), Some(name.as_str()));
+    assert_eq!(s[1]["comment"], "ISP works");
+
+    let uri = format!("/api/v1/silences/{name}");
+    let null = serde_json::Value::Null;
+    let a = call(
+        &f.router,
+        write("DELETE", &uri, &vic, &vic_csrf, null.clone()),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN);
+    let a = call(&f.router, write("DELETE", &uri, &ann, &csrf, null.clone())).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT);
+    let a = call(&f.router, write("DELETE", &uri, &ann, &csrf, null.clone())).await;
+    assert_eq!(a.status, StatusCode::CONFLICT);
+    let a = call(
+        &f.router,
+        write("DELETE", "/api/v1/silences/cfg", &ann, &csrf, null.clone()),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::CONFLICT);
+    let a = call(
+        &f.router,
+        write("DELETE", "/api/v1/silences/nope", &ann, &csrf, null),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND);
+
+    let list = call(
+        &f.router,
+        get("/api/v1/alerts")
+            .header(header::COOKIE, &ann)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list.body["silences"][1]["active"], false);
+    assert_eq!(list.body["silences"][1]["ended_by"], "ann");
+
+    // Scripts use basic credentials, without a CSRF token.
+    let a = call(
+        &f.router,
+        Request::post("/api/v1/silences")
+            .header(header::AUTHORIZATION, basic("ann", "correct horse battery"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"name": "night", "groups": ["lan"], "minutes": 5, "comment": "script"}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+}
+
+#[tokio::test]
+async fn without_users_no_one_adds_silences() {
+    let f = fixture(&[], false);
+    let a = call(
+        &f.router,
+        Request::post("/api/v1/silences")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"minutes": 5, "comment": "x"}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN);
+    assert!(
+        a.body["error"].as_str().unwrap().contains("ctl user"),
+        "{}",
+        a.body
+    );
 }
