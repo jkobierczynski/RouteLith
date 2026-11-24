@@ -5,6 +5,12 @@
 data_dir = "/var/lib/routelith"
 # vantage = "local"   # name of this measuring point
 # max_pps = 1000      # packets-per-second ceiling for all targets together
+# listen_ui = "0.0.0.0:8443"  # web UI and API; default 127.0.0.1:8080
+# tls_cert  = "/etc/routelith/ui.pem"  # HTTPS for the UI: certificate chain
+# tls_key   = "/etc/routelith/ui.key"  # and its key
+# users_file = "/etc/routelith/users.toml"  # default: users.toml in data_dir;
+#                     # add users with `routelith ctl user add NAME --role ROLE`
+# anonymous = true    # with users: read without logging in (wall displays)
 
 # Settings here apply to every target unless a group or target overrides them.
 [defaults]

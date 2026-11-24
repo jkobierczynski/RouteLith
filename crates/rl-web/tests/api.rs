@@ -191,6 +191,7 @@ fn fixture() -> Fixture {
             m.sample("routelith_test_total", &[], 7.0);
         })),
         alerts,
+        auth: Arc::new(rl_web::Auth::open()),
     };
     Fixture {
         _dir: dir,

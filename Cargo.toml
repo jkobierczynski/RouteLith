@@ -23,6 +23,8 @@ rl-out = { path = "crates/rl-out" }
 crc32c = "0.6"
 # 0.26 needs Rust 1.88, above the 1.85 MSRV.
 hickory-proto = { version = "0.25.2", default-features = false, features = ["std"] }
+# Password hashes for UI users (§21.5 F11); salts come from ring.
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
@@ -72,3 +74,9 @@ todo = "warn"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Argon2 is far too slow unoptimised; tests hash and check passwords.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

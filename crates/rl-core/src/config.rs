@@ -91,7 +91,26 @@ pub struct ServerConfig {
     /// Address of the web UI, API and /metrics; `None` when turned off
     /// with `listen_ui = "off"`. Default 127.0.0.1:8080 (§21.3 E9).
     pub listen_ui: Option<std::net::SocketAddr>,
+    /// The UI's users (§21.5 F11); `users.toml` in `data_dir` unless set.
+    /// No file, or no users in it: no login.
+    pub users_file: PathBuf,
+    /// With users, callers who do not log in may still read (a wall
+    /// display); they never write.
+    pub anonymous: bool,
+    /// Certificate and key for TLS on `listen_ui`.
+    pub tls: Option<UiTls>,
 }
+
+/// PEM files for TLS on the web UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiTls {
+    /// The certificate chain, server certificate first.
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
+/// The users file's name in `data_dir` unless `users_file` is set.
+pub const DEFAULT_USERS_FILE: &str = "users.toml";
 
 /// Where the web UI listens unless `listen_ui` says otherwise.
 pub const DEFAULT_LISTEN_UI: &str = "127.0.0.1:8080";
@@ -598,6 +617,10 @@ struct RawServer {
     // Accepted so the doc's example loads; unused until M1.
     listen_ui: Option<Spanned<String>>,
     listen_agents: Option<Spanned<String>>,
+    users_file: Option<Spanned<String>>,
+    anonymous: Option<Spanned<bool>>,
+    tls_cert: Option<Spanned<String>>,
+    tls_key: Option<Spanned<String>>,
 }
 
 /// Settings that cascade. Repeated in each table below because serde's
@@ -2003,12 +2026,13 @@ impl Validator<'_> {
             Some(v) if v.get_ref().trim() == "off" => None,
             Some(v) => match v.get_ref().trim().parse::<std::net::SocketAddr>() {
                 Ok(a) => {
-                    if !a.ip().is_loopback() {
+                    if !a.ip().is_loopback() && raw.tls_cert.is_none() {
                         self.warning(
                             &v.span(),
                             format!(
-                                "listen_ui {a} is reachable from other hosts, and the web UI has \
-                                 no login yet: anyone who can connect sees every target and graph"
+                                "listen_ui {a} is reachable from other hosts without TLS: \
+                                 pages, and passwords once users log in, cross the network \
+                                 unencrypted (set tls_cert and tls_key)"
                             ),
                         );
                     }
@@ -2025,11 +2049,44 @@ impl Validator<'_> {
                 }
             },
         };
+        let mut path = |v: &Spanned<String>, key: &str| -> Option<PathBuf> {
+            let p = v.get_ref();
+            if p.trim().is_empty() || p.contains('\0') {
+                self.error(&v.span(), format!("{key} must be a file path"));
+                ok = false;
+                None
+            } else {
+                Some(PathBuf::from(p))
+            }
+        };
+        let users_file = match &raw.users_file {
+            Some(v) => path(v, "users_file"),
+            None => Some(PathBuf::from(data_dir).join(DEFAULT_USERS_FILE)),
+        };
+        let tls = match (&raw.tls_cert, &raw.tls_key) {
+            (None, None) => None,
+            (Some(c), Some(k)) => match (path(c, "tls_cert"), path(k, "tls_key")) {
+                (Some(cert), Some(key)) => Some(UiTls { cert, key }),
+                _ => None,
+            },
+            (Some(v), None) | (None, Some(v)) => {
+                self.error(&v.span(), "tls_cert and tls_key go together");
+                ok = false;
+                None
+            }
+        };
+        if let (None, Some(v)) = (listen_ui, raw.tls_cert.as_ref()) {
+            self.warning(&v.span(), "tls_cert is unused while listen_ui is \"off\"");
+        }
+        let anonymous = raw.anonymous.as_ref().is_some_and(|v| *v.get_ref());
         ok.then(|| ServerConfig {
             data_dir: PathBuf::from(data_dir),
             vantage,
             max_pps,
             listen_ui,
+            users_file: users_file.unwrap_or_default(),
+            anonymous,
+            tls,
         })
     }
 
@@ -4394,6 +4451,48 @@ vantages = ["hasselt"]
         assert_eq!(p.errors().count(), 0);
         assert_eq!(p.diagnostics.len(), 2, "{:?}", p.diagnostics);
         assert!(p.config.unwrap().targets.is_empty());
+    }
+
+    #[test]
+    fn ui_login_and_tls_settings() {
+        let base = "[server]\ndata_dir = \"/var/lib/rl\"\n";
+        let c = parse(base).config.unwrap().server;
+        assert_eq!(c.users_file, PathBuf::from("/var/lib/rl/users.toml"));
+        assert!(!c.anonymous);
+        assert_eq!(c.tls, None);
+
+        let src = format!(
+            "{base}listen_ui = \"0.0.0.0:8443\"\nusers_file = \"/etc/rl/users.toml\"\n\
+             anonymous = true\ntls_cert = \"/etc/rl/ui.pem\"\ntls_key = \"/etc/rl/ui.key\"\n"
+        );
+        let p = parse(&src);
+        // TLS is set, so a public address draws no warning.
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let c = p.config.unwrap().server;
+        assert_eq!(c.users_file, PathBuf::from("/etc/rl/users.toml"));
+        assert!(c.anonymous);
+        assert_eq!(
+            c.tls,
+            Some(UiTls {
+                cert: "/etc/rl/ui.pem".into(),
+                key: "/etc/rl/ui.key".into()
+            })
+        );
+
+        let p = parse(&format!("{base}listen_ui = \"0.0.0.0:8080\"\n"));
+        let w: Vec<_> = p.diagnostics.iter().map(ToString::to_string).collect();
+        assert!(w.len() == 1 && w[0].contains("without TLS"), "{w:?}");
+
+        let e = errors(&format!("{base}tls_cert = \"/a.pem\"\n"));
+        assert!(
+            e.len() == 1 && e[0].contains("tls_cert and tls_key go together"),
+            "{e:?}"
+        );
+        let e = errors(&format!("{base}users_file = \" \"\n"));
+        assert!(
+            e.len() == 1 && e[0].contains("users_file must be a file path"),
+            "{e:?}"
+        );
     }
 
     #[test]

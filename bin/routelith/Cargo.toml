@@ -21,6 +21,8 @@ rl-web.workspace = true
 rl-out.workspace = true
 # 0.20: newer releases need a newer Rust than the 1.85 MSRV.
 roxmltree = "0.20"
+# Asks for passwords in `ctl user` without echoing them.
+rpassword = "7.3"
 tokio = { workspace = true, features = ["signal"] }
 
 [target.'cfg(windows)'.dependencies]

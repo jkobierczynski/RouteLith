@@ -3,30 +3,39 @@
 //! the web UI, whose few static files are compiled into the binary.
 //!
 //! It runs inside `routelith server` and reads the store directly, so it
-//! shows exactly what the server stored. Everything is read-only: nothing
-//! here can change the configuration or the data. There is no login yet,
-//! which is why the server listens on loopback unless told otherwise.
+//! shows exactly what the server stored. Once a users file names users,
+//! the API needs a login (doc §21.5 F11, [`auth`]); the UI can be served
+//! over TLS with certificate and key files.
 
 #![forbid(unsafe_code)]
 
 mod alerts;
 mod api;
+pub mod auth;
 mod host;
 mod metrics;
 mod ui;
+pub mod users;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::extract::ConnectInfo;
 use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use rl_store::{Reader, SeriesKey};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+use tower::ServiceExt;
+
+pub use auth::{Auth, AuthConfig, Caller};
 
 pub use alerts::{AlertBoard, RuleInfo};
 pub use host::{HostHealth, LatestHost, NicTotal};
@@ -139,6 +148,8 @@ pub struct AppState {
     pub extra_metrics: Option<ExtraMetrics>,
     /// Alert rules and the alerts raised now.
     pub alerts: Arc<AlertBoard>,
+    /// Users and sessions.
+    pub auth: Arc<Auth>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -150,13 +161,13 @@ impl std::fmt::Debug for AppState {
     }
 }
 
-/// The routes, with the security headers every response carries.
+/// The routes, with the security headers every response carries. The
+/// page, its files, `/healthz` and the session and login endpoints are
+/// open; everything else goes through [`auth::guard`].
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/healthz", get(api::health))
+    let guarded = Router::new()
         .route("/metrics", get(metrics::handler))
-        .route("/", get(ui::index))
-        .route("/ui/{file}", get(ui::asset))
+        .route("/api/v1/logout", post(auth::logout))
         .route("/api/v1/latest", get(api::latest))
         .route("/api/v1/series", get(api::series))
         .route("/api/v1/series/{id}/data", get(api::data))
@@ -164,6 +175,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/alerts", get(alerts::alerts))
         .route("/api/v1/events", get(alerts::events))
         .route("/api/v1/render/{file}", get(api::render))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::guard,
+        ));
+    Router::new()
+        .route("/healthz", get(api::health))
+        .route("/", get(ui::index))
+        .route("/ui/{file}", get(ui::asset))
+        .route("/api/v1/session", get(auth::session))
+        .route("/api/v1/login", post(auth::login))
+        .merge(guarded)
         .fallback(api::not_found)
         .layer(axum::middleware::map_response(security_headers))
         .with_state(state)
@@ -189,15 +211,121 @@ async fn security_headers(mut resp: Response) -> Response {
     resp
 }
 
-/// Serve `router` on `listener` until `shutdown` resolves.
+/// How long a client may take to send a request's headers, or to finish
+/// the TLS handshake.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long open connections get to finish when the server stops.
+const DRAIN: Duration = Duration::from_secs(5);
+
+/// TLS for the UI from PEM files: the certificate chain (server
+/// certificate first) and its private key.
+pub fn tls_acceptor(cert_file: &Path, key_file: &Path) -> Result<TlsAcceptor, String> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+    let certs = CertificateDer::pem_file_iter(cert_file)
+        .and_then(Iterator::collect::<Result<Vec<_>, _>>)
+        .map_err(|e| format!("tls_cert {}: {e}", cert_file.display()))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "tls_cert {}: no certificates found",
+            cert_file.display()
+        ));
+    }
+    let key = PrivateKeyDer::from_pem_file(key_file)
+        .map_err(|e| format!("tls_key {}: {e}", key_file.display()))?;
+    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| format!("TLS setup: {e}"))?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|e| {
+        format!(
+            "tls_cert {} and tls_key {}: {e}",
+            cert_file.display(),
+            key_file.display()
+        )
+    })?;
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(cfg)))
+}
+
+/// Serve `router` on `listener`, over TLS when `tls` is set, until
+/// `shutdown` resolves; open connections then get a few seconds to
+/// finish. Handlers see the client's address as `ConnectInfo`.
 pub async fn serve(
     listener: TcpListener,
     router: Router,
+    tls: Option<TlsAcceptor>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut conns = tokio::task::JoinSet::new();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            r = listener.accept() => {
+                let (stream, peer) = match r {
+                    Ok(x) => x,
+                    Err(_) => {
+                        // Out of file descriptors and the like: wait, so
+                        // the loop does not spin.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let _ = stream.set_nodelay(true);
+                let (router, tls, stop) = (router.clone(), tls.clone(), stop_rx.clone());
+                conns.spawn(async move {
+                    match tls {
+                        None => connection(TokioIo::new(stream), peer, router, stop).await,
+                        Some(acc) => {
+                            if let Ok(Ok(s)) =
+                                tokio::time::timeout(HEADER_TIMEOUT, acc.accept(stream)).await
+                            {
+                                connection(TokioIo::new(s), peer, router, stop).await;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(DRAIN, async { while conns.join_next().await.is_some() {} }).await;
+    conns.abort_all();
+    Ok(())
+}
+
+async fn connection<I>(
+    io: I,
+    peer: SocketAddr,
+    router: Router,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+        req.extensions_mut().insert(ConnectInfo(peer));
+        router.clone().oneshot(req)
+    });
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_TIMEOUT);
+    let conn = builder.serve_connection(io, svc);
+    tokio::pin!(conn);
+    let stopping = tokio::select! {
+        _ = conn.as_mut() => false,
+        r = stop.wait_for(|s| *s) => r.is_ok(),
+    };
+    if stopping {
+        conn.as_mut().graceful_shutdown();
+        let _ = conn.await;
+    }
 }
 
 /// A JSON error body with a status code.

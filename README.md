@@ -13,7 +13,23 @@ four kinds of target. The server also answers HTTP on `127.0.0.1:8080`
 (`listen_ui` in `[server]`; `"off"` turns it off): a web UI with an overview
 matrix and smoke graphs per target, a read-only JSON API under `/api/v1`,
 server-rendered SVG and PNG graphs (`/api/v1/render/<id>.svg` or `.png`), Prometheus `/metrics` and `/healthz`.
-There is no login yet, so keep it on loopback or behind a proxy that has one.
+
+With no users, the UI needs no login, as before; keep it on loopback then.
+`routelith ctl user add NAME --role viewer|operator|admin -c routelith.toml`
+adds a user (it asks for the password; `--password-stdin` reads it from a
+pipe), and from then on the UI shows a login form and the API answers 401
+without a caller. Users live in `users.toml` in the data directory
+(`users_file` in `[server]` to move it), with Argon2id password hashes;
+`ctl user passwd`, `role`, `remove` and `list` change it, and the server
+picks changes up within a second, ending a removed user's sessions. A
+login is a session cookie (HttpOnly, SameSite=Strict, Secure over TLS;
+idle 8 h, 24 h at most) with a CSRF token for writes; scripts and
+Prometheus can send HTTP Basic credentials instead. Ten failed logins in
+five minutes from one address, or for one name, lock it out for the rest
+of that window. `anonymous = true` lets callers without a login read, for a
+wall display. `tls_cert` and `tls_key` (PEM files) serve the UI over HTTPS.
+Roles: viewers read, operators will also silence alerts, admins can do
+everything.
 Once a minute the server also records a health snapshot of its own machine
 (CPU, NIC errors and drops, default gateways, DNS servers) in
 `data/health/`; the target view shows it beside the graphs, so a slow minute

@@ -1,8 +1,8 @@
 //! The `routelith` binary: one executable, several modes (architecture doc §3).
 //!
 //! `server`, `service install|uninstall`, `check icmp|tcp|dns|http`,
-//! `ctl calibrate`, `ctl verify`, `ctl render` and `ctl import smokeping`
-//! work.
+//! `ctl calibrate`, `ctl verify`, `ctl render`, `ctl import smokeping` and
+//! `ctl user` work.
 #![forbid(unsafe_code)]
 
 mod alerting;
@@ -13,6 +13,7 @@ mod import;
 mod render;
 mod server;
 mod service;
+mod user;
 mod verify;
 
 use std::process::ExitCode;
@@ -75,6 +76,8 @@ enum CtlAction {
         #[command(subcommand)]
         from: ImportFrom,
     },
+    /// Add, change and remove the web UI's users.
+    User(user::UserArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -115,6 +118,9 @@ fn main() -> ExitCode {
                     from: ImportFrom::Smokeping(args),
                 },
         } => import::run(&args),
+        Command::Ctl {
+            action: CtlAction::User(args),
+        } => user::run(args),
     }
 }
 
