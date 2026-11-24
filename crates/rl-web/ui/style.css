@@ -108,6 +108,38 @@ form.login button[type="submit"] {
 form.login button:disabled { opacity: 0.6; cursor: wait; }
 form.login .error { color: var(--alert); min-height: 1.45em; margin: 4px 0 0; }
 
+/* Silencing an alert, and the silences list. */
+form.silence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 4px;
+  font-size: 13px;
+}
+form.silence input,
+form.silence select {
+  font: inherit;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+form.silence input { flex: 1 1 14em; min-width: 0; }
+form.silence button[type="submit"] {
+  font: inherit;
+  padding: 4px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--accent);
+  color: var(--on-accent);
+  cursor: pointer;
+}
+form.silence button:disabled { opacity: 0.6; cursor: wait; }
+.error { color: var(--alert); }
+ul.silences { font-size: 13px; }
+
 main { padding: 16px; max-width: 1200px; }
 h1 { font-size: 18px; margin: 0 0 4px; }
 h2 { font-size: 15px; margin: 20px 0 8px; }

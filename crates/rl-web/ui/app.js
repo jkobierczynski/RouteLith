@@ -83,6 +83,28 @@
     return body;
   }
 
+  // A write with the session's CSRF token; the parsed answer, or an error
+  // with the server's reason.
+  async function send(method, url, body) {
+    const headers = { "X-CSRF-Token": (session && session.csrf) || "" };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    const r = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    if (r.status === 401) throw new LoginNeeded();
+    let answer = null;
+    try {
+      answer = await r.json();
+    } catch (_) {
+      /* 204, or not JSON */
+    }
+    if (!r.ok) throw new Error((answer && answer.error) || r.status + " " + r.statusText);
+    return answer;
+  }
+
+  // Operators and admins who logged in may add and end silences.
+  function canSilence() {
+    return !!(session && session.user && (session.role === "operator" || session.role === "admin"));
+  }
+
   function fmtMs(us) {
     if (us === undefined || us === null) return "–";
     const ms = us / 1000;
@@ -442,8 +464,10 @@
   }
 
   function showAlerts(panel, data) {
+    // Leave an open silence form alone until it is sent or closed.
+    if (panel.querySelector("form.silence")) return;
     const list = data.active;
-    const silences = activeSilences(data);
+    const silences = silenceList(panel, data);
     panel.hidden = list.length === 0 && silences.length === 0;
     if (panel.hidden) return;
     if (!list.length) {
@@ -457,7 +481,7 @@
         {},
         ...list.map((a) => {
           const summary = (data.rules.find((r) => r.name === a.rule) || {}).summary;
-          return el(
+          const li = el(
             "li",
             {},
             el("a", { href: targetHref(a.target), text: a.target }),
@@ -478,19 +502,147 @@
               ? [" ", el("span", { class: "badge quiet", text: "suppressed: parent " + a.suppressed_by + " had an alert", title: "Logged, not sent" })]
               : [])
           );
+          if (canSilence() && !a.silenced_by) {
+            li.append(
+              " ",
+              el("button", {
+                class: "link",
+                type: "button",
+                text: "Silence…",
+                title: "Stop sending this alert, and its clear, for a while",
+                onclick: () => silenceForm(panel, li, a),
+              })
+            );
+          }
+          return li;
         })
       ),
       ...silences
     );
   }
 
-  // A line naming the silences in force now, if any.
-  function activeSilences(data) {
-    const on = (data.silences || []).filter((x) => x.active);
-    if (!on.length) return [];
+  // A form under an alert to silence its rule on its target.
+  function silenceForm(panel, li, a) {
+    if (panel.querySelector("form.silence")) return;
+    const minutes = el(
+      "select",
+      { "aria-label": "For how long" },
+      ...[
+        [60, "1 hour"],
+        [240, "4 hours"],
+        [1440, "24 hours"],
+        [10080, "7 days"],
+      ].map(([m, label]) => el("option", { value: m, text: label, selected: m === 240 }))
+    );
+    const comment = el("input", { "aria-label": "Why", placeholder: "Why (kept with the silence)", required: true, maxlength: 500 });
+    const msg = el("span", { class: "error", role: "alert" });
+    const ok = el("button", { type: "submit", text: "Silence" });
+    const form = el(
+      "form",
+      { class: "silence", onsubmit: submit },
+      "Silence " + a.rule + " on " + a.target + " for ",
+      minutes,
+      " ",
+      comment,
+      " ",
+      ok,
+      " ",
+      el("button", { class: "link", type: "button", text: "Cancel", onclick: close }),
+      " ",
+      msg
+    );
+    li.append(form);
+    comment.focus();
+
+    function close() {
+      form.remove();
+      reload(panel);
+    }
+
+    async function submit(ev) {
+      ev.preventDefault();
+      ok.disabled = true;
+      msg.textContent = "";
+      try {
+        await send("POST", "/api/v1/silences", {
+          targets: [a.target],
+          alerts: [a.rule],
+          minutes: Number(minutes.value),
+          comment: comment.value,
+        });
+        close();
+      } catch (e) {
+        if (e instanceof LoginNeeded) return route();
+        msg.textContent = e.message;
+        ok.disabled = false;
+      }
+    }
+  }
+
+  async function reload(panel) {
+    try {
+      showAlerts(panel, await getJson("/api/v1/alerts"));
+    } catch (e) {
+      if (e instanceof LoginNeeded) route();
+    }
+  }
+
+  // The silences in force now, and those added here that are still to
+  // come, with a way to end the added ones for an operator.
+  function silenceList(panel, data) {
+    const shown = (data.silences || []).filter(
+      (x) => x.active || (x.source === "ui" && x.start > data.now)
+    );
+    if (!shown.length) return [];
     return [
-      el("p", { class: "muted", text: "Silenced now: " + on.map((x) => x.name + " (" + x.summary + ")").join(", ") }),
+      el("h3", { text: "Silences" }),
+      el(
+        "ul",
+        { class: "silences" },
+        ...shown.map((x) => {
+          const li = el(
+            "li",
+            {},
+            el("strong", { text: x.name }),
+            el("span", {
+              class: "muted",
+              text:
+                " " + (x.source === "ui" ? untilText(x, data.now) : x.summary) +
+                (x.by ? ", by " + x.by : "") +
+                (x.comment ? ": " + x.comment : ""),
+            })
+          );
+          if (x.source === "ui" && canSilence()) {
+            const msg = el("span", { class: "error", role: "alert" });
+            li.append(
+              " ",
+              el("button", {
+                class: "link",
+                type: "button",
+                text: "End",
+                onclick: async () => {
+                  try {
+                    await send("DELETE", "/api/v1/silences/" + encodeURIComponent(x.name));
+                    reload(panel);
+                  } catch (e) {
+                    if (e instanceof LoginNeeded) return route();
+                    msg.textContent = " " + e.message;
+                  }
+                },
+              }),
+              msg
+            );
+          }
+          return li;
+        })
+      ),
     ];
+  }
+
+  function untilText(x, now) {
+    const what = (x.targets.concat(x.groups).join(", ") || "all targets") + (x.alerts.length ? " (" + x.alerts.join(", ") + ")" : "");
+    if (x.start > now) return what + ", from " + fmtTime(x.start, true) + " until " + fmtTime(x.end, true);
+    return what + ", until " + fmtTime(x.end, x.end - now > 20 * 3600e3);
   }
 
   // Events of one target in the shown range, newest first.

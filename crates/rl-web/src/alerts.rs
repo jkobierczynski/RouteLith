@@ -10,11 +10,11 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use rl_alert::ActiveAlert;
-use rl_core::silence::Silence;
 use serde::{Deserialize, Serialize};
 
 use crate::api::now_ms;
 use crate::metrics::MetricsWriter;
+use crate::silences::Silences;
 use crate::{AppState, error};
 
 const DAY_MS: i64 = 86_400_000;
@@ -38,7 +38,7 @@ pub struct RuleInfo {
 #[derive(Debug, Default)]
 pub struct AlertBoard {
     rules: Vec<RuleInfo>,
-    silences: Vec<Silence>,
+    silences: Arc<Silences>,
     active: Mutex<Vec<ActiveAlert>>,
     raised: AtomicU64,
     cleared: AtomicU64,
@@ -52,11 +52,25 @@ impl AlertBoard {
         }
     }
 
-    /// The configured silences, listed with whether each is in force.
+    /// Only configured silences, kept in memory.
     #[must_use]
-    pub fn with_silences(mut self, silences: Vec<Silence>) -> Self {
+    pub fn with_silences(self, silences: Vec<rl_core::silence::Silence>) -> Self {
+        self.with_shared_silences(Arc::new(Silences::configured(silences)))
+    }
+
+    /// The silences the alert engine uses too.
+    #[must_use]
+    pub fn with_shared_silences(mut self, silences: Arc<Silences>) -> Self {
         self.silences = silences;
         self
+    }
+
+    pub fn silences(&self) -> &Arc<Silences> {
+        &self.silences
+    }
+
+    pub fn rules(&self) -> &[RuleInfo] {
+        &self.rules
     }
 
     /// Replace the active alerts.
@@ -96,19 +110,7 @@ struct ActiveJson<'a> {
     suppressed_by: Option<&'a str>,
 }
 
-#[derive(Serialize)]
-struct SilenceJson<'a> {
-    name: &'a str,
-    /// When it applies, in one line.
-    summary: String,
-    targets: &'a [String],
-    groups: &'a [String],
-    alerts: &'a [String],
-    /// In force now.
-    active: bool,
-}
-
-/// Active alerts and the configured rules.
+/// Active alerts, the rules and the silences, configured and added.
 pub(crate) async fn alerts(State(s): State<Arc<AppState>>) -> Response {
     let active = s.alerts.active();
     let list: Vec<ActiveJson<'_>> = active
@@ -129,19 +131,18 @@ pub(crate) async fn alerts(State(s): State<Arc<AppState>>) -> Response {
         })
         .collect();
     let now = now_ms();
-    let silences: Vec<SilenceJson<'_>> = s
-        .alerts
-        .silences
+    let store = &s.alerts.silences;
+    let mut silences: Vec<serde_json::Value> = store
+        .configured_list()
         .iter()
-        .map(|x| SilenceJson {
-            name: &x.name,
-            summary: x.summary(),
-            targets: &x.targets,
-            groups: &x.groups,
-            alerts: &x.alerts,
-            active: x.active_at(now),
-        })
+        .map(|x| crate::silences::silence_json(x, None, now))
         .collect();
+    silences.extend(
+        store
+            .added()
+            .iter()
+            .map(|a| crate::silences::silence_json(&a.silence, Some(a), now)),
+    );
     Json(serde_json::json!({
         "now": now,
         "active": list,

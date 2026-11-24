@@ -12,6 +12,9 @@
 //! and again with each series' first round of a new hour. An alert raised
 //! under a silence, or while the target's parent has an alert (F6), is
 //! marked so in the event log, as is its clear: outputs leave both unsent.
+//! Silences come from the configuration and from the UI; one that comes
+//! into force while an alert is raised marks that alert from then on, so
+//! its clear is not sent.
 //!
 //! Every event is also handed to the outputs (F7: syslog, JSON lines),
 //! which queue it and send it from their own threads.
@@ -25,8 +28,8 @@ use std::time::Duration;
 use rl_alert::{Engine, RoundValues, Transition, active_from_events};
 use rl_core::alert::RuleKind;
 use rl_core::config::Config;
-use rl_core::silence::Silence;
 use rl_store::{EVENT_DAYS, Event, EventKind, EventLog, Reader, SeriesKey, StoredRound, Tier};
+use rl_web::silences::Silences;
 use rl_web::{AlertBoard, RuleInfo};
 
 const DAY_MS: i64 = 86_400_000;
@@ -64,7 +67,8 @@ pub(crate) struct Alerting {
     reader: Option<Reader>,
     /// Start of the hour each series' baselines were last computed for.
     baseline_hour: HashMap<u64, i64>,
-    silences: Vec<Silence>,
+    /// Configured and added at run time, shared with the UI.
+    silences: Arc<Silences>,
     /// Group and parent of each target.
     targets: HashMap<String, (String, Option<String>)>,
     /// Silence and parent of each raised alert, by series and rule.
@@ -76,6 +80,7 @@ pub(crate) struct Alerting {
 pub(crate) fn start(
     cfg: &Config,
     series: &[SeriesAlerts],
+    silences: Arc<Silences>,
     now_ms: i64,
 ) -> Result<Alerting, String> {
     let data_dir = &cfg.server.data_dir;
@@ -112,7 +117,7 @@ pub(crate) fn start(
     let mut a = Alerting {
         engine: Engine::new(Vec::new(), []),
         log,
-        board: Arc::new(AlertBoard::new(rules).with_silences(cfg.silences.clone())),
+        board: Arc::new(AlertBoard::new(rules).with_shared_silences(silences.clone())),
         keys: series.iter().map(|s| (s.id, s.key.clone())).collect(),
         vantage: cfg.server.vantage.clone(),
         last_ip: HashMap::new(),
@@ -121,7 +126,7 @@ pub(crate) fn start(
         data_dir: data_dir.clone(),
         reader: None,
         baseline_hour: HashMap::new(),
-        silences: cfg.silences.clone(),
+        silences,
         targets: cfg
             .targets
             .iter()
@@ -176,6 +181,7 @@ pub(crate) fn start(
     for s in series {
         a.refresh_baselines(s.id, now_ms);
     }
+    a.mark_silenced(now_ms);
     let active = a.active();
     let e = Event::new(
         now_ms,
@@ -294,6 +300,8 @@ impl Alerting {
                 self.record(e);
             }
             self.board.set_active(self.active());
+        } else if self.mark_silenced(r.ts_ms) {
+            self.board.set_active(self.active());
         }
         if let Some(ip) = r.resolved {
             if let Some(old) = self.last_ip.insert(series, ip) {
@@ -329,20 +337,56 @@ impl Alerting {
         let Some(key) = self.keys.get(&t.series) else {
             return (None, None);
         };
-        let Some((group, parent)) = self.targets.get(&key.target) else {
+        let Some((_, parent)) = self.targets.get(&key.target) else {
             return (None, None);
         };
-        let silence = self
-            .silences
-            .iter()
-            .find(|s| s.applies(&key.target, group, &t.rule) && s.active_at(t.ts_ms))
-            .map(|s| s.name.clone());
+        let silence = self.silence_for(t.series, &t.rule, t.ts_ms);
         let parent = parent.as_ref().filter(|p| {
             self.engine.active().iter().any(|a| {
                 a.series != t.series && self.keys.get(&a.series).is_some_and(|k| &k.target == *p)
             })
         });
         (silence, parent.cloned())
+    }
+
+    /// The silence in force at `t_ms` that covers `rule` on `series`.
+    fn silence_for(&self, series: u64, rule: &str, t_ms: i64) -> Option<String> {
+        let key = self.keys.get(&series)?;
+        let (group, _) = self.targets.get(&key.target)?;
+        self.silences
+            .all()
+            .into_iter()
+            .find(|s| s.applies(&key.target, group, rule) && s.active_at(t_ms))
+            .map(|s| s.name)
+    }
+
+    /// Mark raised alerts that a silence now in force covers, so their
+    /// clear is not sent: one added from the UI, or a configured one that
+    /// began after the raise. Whether any changed.
+    fn mark_silenced(&mut self, now_ms: i64) -> bool {
+        let unmarked: Vec<(u64, String)> = self
+            .quiet
+            .iter()
+            .filter(|(_, q)| q.0.is_none())
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut changed = false;
+        for (series, rule) in unmarked {
+            if let Some(name) = self.silence_for(series, &rule, now_ms) {
+                eprintln!(
+                    "routelith server: {}{rule} is silenced by {name} from now on",
+                    self.keys
+                        .get(&series)
+                        .map(|k| subject(Some(&k.target), Some(&k.family)))
+                        .unwrap_or_default()
+                );
+                if let Some(q) = self.quiet.get_mut(&(series, rule)) {
+                    q.0 = Some(name);
+                }
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Recompute the baselines of `series` once per hour, from its hourly
@@ -456,6 +500,16 @@ impl Alerting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With the configured silences only.
+    fn start(cfg: &Config, series: &[SeriesAlerts], now_ms: i64) -> Result<Alerting, String> {
+        super::start(
+            cfg,
+            series,
+            Arc::new(Silences::configured(cfg.silences.clone())),
+            now_ms,
+        )
+    }
 
     const T0: i64 = 1_800_000_000_000;
     const STEP: i64 = 60_000;
@@ -610,6 +664,53 @@ mod tests {
             rules: vec!["slow".into()],
         };
         (cfg, vec![s(1, "a"), s(2, "b")])
+    }
+
+    #[test]
+    fn a_silence_added_while_raised_keeps_the_clear_unsent() {
+        use rl_core::silence::{Silence, When};
+        use rl_web::silences::Added;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(tmp.path(), SLOW);
+        let silences = Arc::new(Silences::load(Vec::new(), tmp.path(), T0).unwrap());
+        let mut a = super::start(&cfg, &series(&["slow"]), silences.clone(), T0).unwrap();
+        a.round(1, &round(1, 30, "192.0.2.1"));
+        assert_eq!(a.board.active()[0].silenced_by, None);
+
+        let window = When::Once {
+            start_ms: T0 + 2 * STEP,
+            end_ms: T0 + 60 * STEP,
+        };
+        let added = Added {
+            silence: Silence {
+                name: "ui-1".into(),
+                targets: vec!["a".into()],
+                groups: Vec::new(),
+                alerts: vec!["slow".into()],
+                when: window,
+                line: 0,
+            },
+            by: Some("ann".into()),
+            comment: "ISP works".into(),
+            created_ms: T0 + STEP,
+            ended_by: None,
+        };
+        silences.add(added, T0 + STEP).unwrap();
+        // Still slow, inside the window: the raised alert is marked.
+        a.round(1, &round(2, 30, "192.0.2.1"));
+        assert_eq!(a.board.active()[0].silenced_by.as_deref(), Some("ui-1"));
+        // A restart while the silence is in force keeps the mark.
+        drop(a);
+        let mut a =
+            super::start(&cfg, &series(&["slow"]), silences.clone(), T0 + 3 * STEP).unwrap();
+        assert_eq!(a.board.active()[0].silenced_by.as_deref(), Some("ui-1"));
+        a.round(1, &round(4, 10, "192.0.2.1"));
+        let events = rl_store::read_events(tmp.path(), 0, i64::MAX).unwrap();
+        let cleared = events
+            .iter()
+            .find(|e| e.kind == EventKind::AlertCleared)
+            .unwrap();
+        assert_eq!(cleared.silenced_by.as_deref(), Some("ui-1"));
     }
 
     #[test]

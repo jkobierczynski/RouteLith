@@ -1,7 +1,8 @@
 // Browser test of the login (doc §21.5 F11): a server with one user shows
 // the login form, refuses a wrong password, lets the user in, names them
 // in the header, and logs them out again; with no script errors or CSP
-// violations beyond the refused login itself.
+// violations beyond the refused login itself. On the way, the operator
+// silences a raised alert and ends the silence again (§21.6).
 //
 //   node tests/ui/login.mjs target/debug/routelith [screenshot-dir]
 //
@@ -29,6 +30,12 @@ writeFileSync(
 data_dir = ${JSON.stringify(join(dir, "data"))}
 listen_ui = "127.0.0.1:${port}"
 
+[[alert]]
+name = "down"
+metric = "loss"
+condition = ">= 100%"
+for = "1 round"
+
 [[group]]
 name = "local"
 
@@ -41,6 +48,17 @@ step = "2s"
 pings = 2
 spread = "500ms"
 timeout = "500ms"
+
+[[group.target]]
+name = "closed"
+host = "127.0.0.1"
+probe = "tcp"
+port = ${port + 1}
+step = "2s"
+pings = 2
+spread = "500ms"
+timeout = "500ms"
+alerts = ["down"]
 `
 );
 
@@ -114,6 +132,24 @@ try {
   const cookies = await page.context().cookies();
   const c = cookies.find((k) => k.name === "rl_session");
   check(c && c.httpOnly && c.sameSite === "Strict", "the session cookie is HttpOnly and SameSite=Strict");
+
+  // The closed port raises "down"; the operator silences it.
+  await page.waitForSelector("section.alerts li button.link", { timeout: 20000 });
+  await page.click("section.alerts li button.link");
+  await page.waitForSelector("form.silence");
+  check(true, "an operator gets a silence form on a raised alert");
+  await page.fill("form.silence input", "testing the silence form");
+  if (shots) await page.screenshot({ path: join(shots, "silence-form.png") });
+  await page.click("form.silence button[type=submit]");
+  await page.waitForSelector("ul.silences li");
+  const listed = await page.textContent("ul.silences");
+  check(/closed \(down\).*by ann: testing the silence form/.test(listed), "the silence is listed (" + JSON.stringify(listed) + ")");
+  await waitFor(async () => /silenced: ui-/.test(await page.textContent("section.alerts")), "the alert to be marked silenced", 20000);
+  check(true, "the raised alert is marked silenced");
+  if (shots) await page.screenshot({ path: join(shots, "silenced.png") });
+  await page.click("ul.silences button.link");
+  await page.waitForFunction(() => !document.querySelector("ul.silences"), null, { polling: 100 });
+  check(true, "ending the silence removes it from the list");
 
   // A reload keeps the session.
   await page.reload();

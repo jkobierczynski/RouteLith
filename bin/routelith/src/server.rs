@@ -244,7 +244,19 @@ pub(crate) async fn serve(
             rules: p.alerts.clone(),
         })
         .collect();
-    let alerting = match crate::alerting::start(&cfg, &alert_series, now_ms()) {
+    // Silences: the configured ones and those added from the UI before.
+    let silences = match rl_web::silences::Silences::load(
+        cfg.silences.clone(),
+        &cfg.server.data_dir,
+        now_ms(),
+    ) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("routelith server: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let alerting = match crate::alerting::start(&cfg, &alert_series, silences, now_ms()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("routelith server: {e}");
@@ -1132,7 +1144,13 @@ mod tests {
             dir.path().display().to_string()
         );
         let cfg = config::parse(&src).config.unwrap();
-        let mut alerting = crate::alerting::start(&cfg, &[], 0).unwrap();
+        let mut alerting = crate::alerting::start(
+            &cfg,
+            &[],
+            Arc::new(rl_web::silences::Silences::configured(Vec::new())),
+            0,
+        )
+        .unwrap();
         assert_eq!(
             store_loop(w, &rx, &latest, &counters, &mut alerting).unwrap(),
             1
