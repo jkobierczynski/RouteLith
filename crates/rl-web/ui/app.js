@@ -642,7 +642,9 @@
   function untilText(x, now) {
     const what = (x.targets.concat(x.groups).join(", ") || "all targets") + (x.alerts.length ? " (" + x.alerts.join(", ") + ")" : "");
     if (x.start > now) return what + ", from " + fmtTime(x.start, true) + " until " + fmtTime(x.end, true);
-    return what + ", until " + fmtTime(x.end, x.end - now > 20 * 3600e3);
+    // With the date when it ends on another day than today.
+    const otherDay = new Date(x.end).toDateString() !== new Date(now).toDateString();
+    return what + ", until " + fmtTime(x.end, otherDay);
   }
 
   // Events of one target in the shown range, newest first.
