@@ -1,7 +1,9 @@
 // Routelith web UI (architecture doc §20): an overview matrix with the
 // alerts raised now, and a target view of canvas smoke graphs with the
 // target's events, read from /api/v1. Plain JavaScript with no
-// build step; the server embeds this file. Read-only: nothing here writes.
+// build step; the server embeds this file. Once the server has users, a
+// login form comes first (doc §21.5 F11); the session is a cookie the
+// page cannot read, and writes carry its CSRF token.
 //
 // Every value from the API goes into the page through textContent or an
 // attribute, never through innerHTML.
@@ -27,7 +29,9 @@
   const app = document.getElementById("app");
   const crumbs = document.getElementById("crumbs");
   const status = document.getElementById("status");
+  const who = document.getElementById("who");
   let series = null; // from /api/v1/series, loaded once
+  let session = null; // from /api/v1/session: user, role, csrf, ...
   let timer = null;
   let generation = 0; // bumped on navigation; stale fetches are ignored
   const observers = [];
@@ -59,8 +63,16 @@
     return LOSS[LOSS.length - 1][1];
   }
 
+  // The server wants a login first.
+  class LoginNeeded extends Error {
+    constructor() {
+      super("login required");
+    }
+  }
+
   async function getJson(url) {
     const r = await fetch(url, { headers: { Accept: "application/json" } });
+    if (r.status === 401) throw new LoginNeeded();
     let body = null;
     try {
       body = await r.json();
@@ -135,7 +147,14 @@
       refresh()
         .then(
           () => gen === generation && setStatus("updated " + fmtTime(Date.now())),
-          (e) => gen === generation && setStatus("update failed: " + e.message)
+          (e) => {
+            if (gen !== generation) return;
+            // The session ended (logged out elsewhere, or expired).
+            if (e instanceof LoginNeeded) {
+              session = null;
+              route();
+            } else setStatus("update failed: " + e.message);
+          }
         )
         .finally(() => {
           if (gen === generation) timer = setTimeout(tick, every);
@@ -154,12 +173,104 @@
     return series;
   }
 
+  // ---------- login ----------
+
+  async function loadSession() {
+    session = await getJson("/api/v1/session");
+    showWho();
+  }
+
+  // Who is logged in, with a way out; or a way in for a reader without a
+  // login. Nothing when the server has no users.
+  function showWho() {
+    if (!session || !session.users) {
+      who.replaceChildren();
+      return;
+    }
+    if (session.user) {
+      who.replaceChildren(
+        el("span", { class: "muted", text: session.user + " · " + session.role + " " }),
+        el("button", { class: "link", type: "button", onclick: logout, text: "Log out" })
+      );
+    } else if (!session.login_required) {
+      who.replaceChildren(el("a", { href: "#/login", text: "Log in" }));
+    } else who.replaceChildren();
+  }
+
+  async function logout() {
+    try {
+      await fetch("/api/v1/logout", {
+        method: "POST",
+        headers: { "X-CSRF-Token": (session && session.csrf) || "" },
+      });
+    } catch (_) {
+      /* the cookie is cleared on the next 401 anyway */
+    }
+    session = null;
+    series = null;
+    route();
+  }
+
+  function showLogin() {
+    crumbs.replaceChildren();
+    setStatus("");
+    const name = el("input", { id: "login-name", name: "username", autocomplete: "username", required: true });
+    const password = el("input", {
+      id: "login-password",
+      name: "password",
+      type: "password",
+      autocomplete: "current-password",
+      required: true,
+    });
+    const msg = el("p", { class: "error", role: "alert" });
+    const button = el("button", { type: "submit", text: "Log in" });
+    const form = el(
+      "form",
+      { class: "login", onsubmit: submit },
+      el("h1", { text: "Log in" }),
+      el("label", { for: "login-name", text: "User name" }),
+      name,
+      el("label", { for: "login-password", text: "Password" }),
+      password,
+      button,
+      msg
+    );
+    async function submit(ev) {
+      ev.preventDefault();
+      msg.textContent = "";
+      button.disabled = true;
+      try {
+        const r = await fetch("/api/v1/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ name: name.value, password: password.value }),
+        });
+        const body = await r.json().catch(() => null);
+        if (!r.ok) throw new Error((body && body.error) || r.status + " " + r.statusText);
+        session = body;
+        series = null;
+        showWho();
+        if (parseHash().view === "login") location.hash = "#/";
+        else route();
+      } catch (e) {
+        msg.textContent = e.message;
+        password.value = "";
+        password.focus();
+      } finally {
+        button.disabled = false;
+      }
+    }
+    app.replaceChildren(form);
+    name.focus();
+  }
+
   // ---------- routing ----------
 
   function parseHash() {
     const h = location.hash.replace(/^#/, "") || "/";
     const [path, query] = h.split("?");
     const params = new URLSearchParams(query || "");
+    if (path === "/login") return { view: "login" };
     const m = path.match(/^\/target\/(.+)$/);
     if (m) {
       let name;
@@ -183,12 +294,20 @@
     const r = parseHash();
     const gen = generation;
     try {
+      if (!session) await loadSession();
+      if (gen !== generation) return;
+      if (r.view === "login" || (session.login_required && !session.user)) return showLogin();
       await loadSeries();
       if (gen !== generation) return;
       if (r.view === "target") await showTarget(r.name, r.range, gen);
       else await showOverview(gen);
     } catch (e) {
       if (gen !== generation) return;
+      if (e instanceof LoginNeeded) {
+        session = null;
+        showWho();
+        return showLogin();
+      }
       app.replaceChildren(el("p", { class: "note", text: "Could not load: " + e.message }));
     }
   }

@@ -201,6 +201,27 @@ pub(crate) async fn serve(
                     return ExitCode::from(2);
                 }
             };
+            let tls = match &cfg.server.tls {
+                None => None,
+                Some(t) => match rl_web::tls_acceptor(&t.cert, &t.key) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        eprintln!("routelith server: {e}");
+                        return ExitCode::from(2);
+                    }
+                },
+            };
+            let auth = match rl_web::Auth::new(rl_web::AuthConfig {
+                users_file: cfg.server.users_file.clone(),
+                anonymous: cfg.server.anonymous,
+                secure: tls.is_some(),
+            }) {
+                Ok(a) => Arc::new(a),
+                Err(e) => {
+                    eprintln!("routelith server: {e}");
+                    return ExitCode::from(2);
+                }
+            };
             let listener = match tokio::net::TcpListener::bind(addr).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -208,7 +229,7 @@ pub(crate) async fn serve(
                     return ExitCode::from(2);
                 }
             };
-            Some((addr, listener, reader))
+            Some((addr, listener, reader, tls, auth))
         }
     };
 
@@ -239,7 +260,7 @@ pub(crate) async fn serve(
     let stats = Arc::new(Stats::default());
     let web = match ui {
         None => None,
-        Some((addr, listener, reader)) => {
+        Some((addr, listener, reader, tls, auth)) => {
             let state = AppState {
                 reader,
                 data_dir: cfg.server.data_dir.clone(),
@@ -254,8 +275,9 @@ pub(crate) async fn serve(
                     output_stats.clone(),
                 )),
                 alerts: board.clone(),
+                auth: auth.clone(),
             };
-            Some((addr, listener, rl_web::router(Arc::new(state))))
+            Some((addr, listener, rl_web::router(Arc::new(state)), tls, auth))
         }
     };
 
@@ -308,10 +330,21 @@ pub(crate) async fn serve(
         ));
     }
     drop(sink);
-    let web = web.map(|(addr, listener, router)| {
-        eprintln!("routelith server: web UI and API on http://{addr}/");
+    let web = web.map(|(addr, listener, router, tls, auth)| {
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        eprintln!(
+            "routelith server: web UI and API on {scheme}://{addr}/, {}",
+            login_note(&auth)
+        );
+        if !addr.ip().is_loopback() && auth.users().is_empty() {
+            eprintln!(
+                "routelith server: warning: listen_ui {addr} is reachable from other hosts \
+                 and there are no users, so anyone who can connect sees every target; \
+                 add one with `routelith ctl user add`"
+            );
+        }
         let mut stop = stop_rx.clone();
-        tokio::spawn(rl_web::serve(listener, router, async move {
+        tokio::spawn(rl_web::serve(listener, router, tls, async move {
             let _ = stop.wait_for(|s| *s).await;
         }))
     });
@@ -516,6 +549,23 @@ fn to_ms(t: SystemTime) -> i64 {
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
         Err(e) => -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX),
+    }
+}
+
+/// How callers get in, for the start-up line.
+fn login_note(auth: &rl_web::Auth) -> String {
+    let n = auth.users().users.len();
+    let file = auth.config().users_file.display();
+    match (n, auth.config().anonymous) {
+        (0, _) => format!("no login (no users in {file})"),
+        (n, false) => format!(
+            "login required ({n} user{} in {file})",
+            if n == 1 { "" } else { "s" }
+        ),
+        (n, true) => format!(
+            "anonymous read-only, login to change things ({n} user{} in {file})",
+            if n == 1 { "" } else { "s" }
+        ),
     }
 }
 
