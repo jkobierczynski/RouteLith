@@ -1,4 +1,4 @@
-//! The TLS client for syslog over TLS (RFC 5425).
+//! The TLS client for syslog over TLS (RFC 5425) and HTTPS webhooks.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -52,7 +52,7 @@ pub(crate) fn client_config(
     Ok(Arc::new(config))
 }
 
-fn certs(path: &Path, key: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+pub(crate) fn certs(path: &Path, key: &str) -> Result<Vec<CertificateDer<'static>>, String> {
     let certs = CertificateDer::pem_file_iter(path)
         .and_then(Iterator::collect::<Result<Vec<_>, _>>)
         .map_err(|e| format!("{key} {}: {e}", path.display()))?;

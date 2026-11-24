@@ -71,8 +71,18 @@ counted, as retrying would not help. `url`, `secret` and `token` can name
 where the secret is instead of holding it: `${env:NAME}` reads an
 environment variable and `${file:/path}` a file, so the configuration file
 can be shared. Messages
-name only the URL's host, as some URLs are secrets themselves. E-mail
-comes next.
+name only the URL's host, as some URLs are secrets themselves.
+
+`type = "email"` sends one plain-text mail per event over SMTP to the
+`to` list, with a PNG of the series' smoke graph attached (the `graph`
+span before sending, default `3h`; `"off"` for none). `address` is the
+SMTP server; `security` is `starttls` (the default, port 587; the
+upgrade must succeed), `tls` (port 465) or `none` (port 25). With
+`username`, the `password` must come from `${env:NAME}` or
+`${file:/path}`, never the configuration file, and needs `starttls` or
+`tls` unless the server is on this machine. A permanent SMTP refusal
+(5xx: unknown recipient, failed login) drops the event and counts it; a
+temporary one (4xx) and network errors are retried.
 
 A condition can follow the target's own history instead of a fixed value:
 `condition = "> baseline_p50_7d * 2 + 5ms"` compares with the median of the

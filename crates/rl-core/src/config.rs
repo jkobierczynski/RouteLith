@@ -34,14 +34,23 @@ use toml::Spanned;
 use crate::alert::{self, AlertRule, Metric, PatternType, RuleKind, Threshold};
 use crate::duration;
 use crate::output::{
-    self, EventFilter, Framing, JsonlOutput, Output, OutputKind, SyslogFormat, SyslogOutput,
-    Transport, WebhookFormat, WebhookOutput,
+    self, EmailOutput, EventFilter, Framing, JsonlOutput, Output, OutputKind, SmtpSecurity,
+    SyslogFormat, SyslogOutput, Transport, WebhookFormat, WebhookOutput,
 };
 use crate::secret::Secret;
 use crate::silence::{Silence, When};
 
 /// Seconds in a day; steps must divide it so rounds stay aligned to UTC days.
 const DAY_SECS: u64 = 86_400;
+/// A type-specific output key: its name, where it is set (if it is) and
+/// the types it applies to.
+type KeyUse<'a> = (&'a str, Option<Range<usize>>, &'a [&'a str]);
+
+/// The output types this version has.
+const TYPES: [&str; 5] = ["syslog", "jsonl", "eventlog", "webhook", "email"];
+/// The span of an e-mail's graph.
+const MIN_EMAIL_GRAPH: Duration = Duration::from_secs(600);
+const MAX_EMAIL_GRAPH: Duration = Duration::from_secs(30 * 86_400);
 const DEFAULT_STEP: Duration = Duration::from_secs(300);
 const DEFAULT_PINGS: u16 = 20;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -536,6 +545,13 @@ struct RawOutput {
     url: Option<Spanned<String>>,
     secret: Option<Spanned<String>>,
     token: Option<Spanned<String>>,
+    // email (also address and ca_file)
+    security: Option<Spanned<String>>,
+    username: Option<Spanned<String>>,
+    password: Option<Spanned<String>>,
+    from: Option<Spanned<String>>,
+    to: Option<Spanned<Vec<String>>>,
+    graph: Option<Spanned<String>>,
     /// Free text for people; not used.
     #[allow(dead_code)]
     comment: Option<Spanned<String>>,
@@ -1112,49 +1128,106 @@ impl Validator<'_> {
                 },
             };
 
-            // Keys of syslog only; format and ca_file also apply to webhooks.
-            let syslog_only_keys = [
-                ("address", o.address.as_ref().map(Spanned::span)),
-                ("transport", o.transport.as_ref().map(Spanned::span)),
-                ("facility", o.facility.as_ref().map(Spanned::span)),
-                ("hostname", o.hostname.as_ref().map(Spanned::span)),
-                ("app_name", o.app_name.as_ref().map(Spanned::span)),
-                ("sd_id", o.sd_id.as_ref().map(Spanned::span)),
-                ("framing", o.framing.as_ref().map(Spanned::span)),
-                ("cert_file", o.cert_file.as_ref().map(Spanned::span)),
-                ("key_file", o.key_file.as_ref().map(Spanned::span)),
-                ("server_name", o.server_name.as_ref().map(Spanned::span)),
+            // Each type-specific key and the types it applies to.
+            let keys: [KeyUse; 22] = [
+                (
+                    "address",
+                    o.address.as_ref().map(Spanned::span),
+                    &["syslog", "email"],
+                ),
+                (
+                    "transport",
+                    o.transport.as_ref().map(Spanned::span),
+                    &["syslog"],
+                ),
+                (
+                    "format",
+                    o.format.as_ref().map(Spanned::span),
+                    &["syslog", "webhook"],
+                ),
+                (
+                    "facility",
+                    o.facility.as_ref().map(Spanned::span),
+                    &["syslog"],
+                ),
+                (
+                    "hostname",
+                    o.hostname.as_ref().map(Spanned::span),
+                    &["syslog"],
+                ),
+                (
+                    "app_name",
+                    o.app_name.as_ref().map(Spanned::span),
+                    &["syslog"],
+                ),
+                ("sd_id", o.sd_id.as_ref().map(Spanned::span), &["syslog"]),
+                (
+                    "framing",
+                    o.framing.as_ref().map(Spanned::span),
+                    &["syslog"],
+                ),
+                (
+                    "cert_file",
+                    o.cert_file.as_ref().map(Spanned::span),
+                    &["syslog"],
+                ),
+                (
+                    "key_file",
+                    o.key_file.as_ref().map(Spanned::span),
+                    &["syslog"],
+                ),
+                (
+                    "server_name",
+                    o.server_name.as_ref().map(Spanned::span),
+                    &["syslog"],
+                ),
+                (
+                    "ca_file",
+                    o.ca_file.as_ref().map(Spanned::span),
+                    &["syslog", "webhook", "email"],
+                ),
+                ("path", o.path.as_ref().map(Spanned::span), &["jsonl"]),
+                ("url", o.url.as_ref().map(Spanned::span), &["webhook"]),
+                ("secret", o.secret.as_ref().map(Spanned::span), &["webhook"]),
+                ("token", o.token.as_ref().map(Spanned::span), &["webhook"]),
+                (
+                    "security",
+                    o.security.as_ref().map(Spanned::span),
+                    &["email"],
+                ),
+                (
+                    "username",
+                    o.username.as_ref().map(Spanned::span),
+                    &["email"],
+                ),
+                (
+                    "password",
+                    o.password.as_ref().map(Spanned::span),
+                    &["email"],
+                ),
+                ("from", o.from.as_ref().map(Spanned::span), &["email"]),
+                ("to", o.to.as_ref().map(Spanned::span), &["email"]),
+                ("graph", o.graph.as_ref().map(Spanned::span), &["email"]),
             ];
-            let shared_keys = [
-                ("format", o.format.as_ref().map(Spanned::span)),
-                ("ca_file", o.ca_file.as_ref().map(Spanned::span)),
-            ];
-            let jsonl_keys = [("path", o.path.as_ref().map(Spanned::span))];
-            let webhook_keys = [
-                ("url", o.url.as_ref().map(Spanned::span)),
-                ("secret", o.secret.as_ref().map(Spanned::span)),
-                ("token", o.token.as_ref().map(Spanned::span)),
-            ];
-            let not_for = |me: &mut Self, keys: &[(&str, Option<Range<usize>>)], ty: &str| {
-                for (key, span) in keys {
-                    if let Some(span) = span {
-                        me.error(
+            let ty = o.type_.get_ref().as_str();
+            if TYPES.contains(&ty) {
+                for (key, span, types) in &keys {
+                    if let (Some(span), false) = (span, types.contains(&ty)) {
+                        let list = types
+                            .iter()
+                            .map(|t| format!("\"{t}\""))
+                            .collect::<Vec<_>>()
+                            .join(" or ");
+                        self.error(
                             span,
-                            format!("output {name:?}: {key} applies to type = \"{ty}\" only"),
+                            format!("output {name:?}: {key} applies to type = {list} only"),
                         );
                     }
                 }
-            };
+            }
             let kind = match o.type_.get_ref().as_str() {
-                "syslog" => {
-                    not_for(self, &jsonl_keys, "jsonl");
-                    not_for(self, &webhook_keys, "webhook");
-                    self.syslog_output(&name, o).map(OutputKind::Syslog)
-                }
+                "syslog" => self.syslog_output(&name, o).map(OutputKind::Syslog),
                 "jsonl" => {
-                    not_for(self, &syslog_only_keys, "syslog");
-                    not_for(self, &shared_keys, "syslog\" or \"webhook");
-                    not_for(self, &webhook_keys, "webhook");
                     match &o.path {
                         Some(p) if !p.get_ref().trim().is_empty() => {
                             let path = PathBuf::from(p.get_ref());
@@ -1186,10 +1259,6 @@ impl Validator<'_> {
                     }
                 }
                 "eventlog" => {
-                    not_for(self, &syslog_only_keys, "syslog");
-                    not_for(self, &shared_keys, "syslog\" or \"webhook");
-                    not_for(self, &jsonl_keys, "jsonl");
-                    not_for(self, &webhook_keys, "webhook");
                     if cfg!(windows) {
                         Some(OutputKind::EventLog)
                     } else {
@@ -1202,25 +1271,14 @@ impl Validator<'_> {
                         None
                     }
                 }
-                "webhook" => {
-                    not_for(self, &syslog_only_keys, "syslog");
-                    not_for(self, &jsonl_keys, "jsonl");
-                    self.webhook_output(&name, o).map(OutputKind::Webhook)
-                }
-                "email" => {
-                    self.error(
-                        &o.type_.span(),
-                        "output type \"email\" is not available yet; this version sends to \
-                         \"syslog\", \"jsonl\", \"eventlog\" and \"webhook\"",
-                    );
-                    None
-                }
+                "webhook" => self.webhook_output(&name, o).map(OutputKind::Webhook),
+                "email" => self.email_output(&name, o).map(OutputKind::Email),
                 t => {
                     self.error(
                         &o.type_.span(),
                         format!(
                             "unknown output type {t:?}; this version sends to \"syslog\", \
-                             \"jsonl\", \"eventlog\" and \"webhook\""
+                             \"jsonl\", \"eventlog\", \"webhook\" and \"email\""
                         ),
                     );
                     None
@@ -1339,11 +1397,7 @@ impl Validator<'_> {
         // A token sent in clear can be read and reused by anyone on the
         // path; only a loopback receiver is exempt.
         if let (Some(t), Some(u)) = (&o.token, &url) {
-            let loopback = u.host.eq_ignore_ascii_case("localhost")
-                || u.host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|a| a.is_loopback());
-            if !u.tls && !loopback {
+            if !u.tls && !loopback_host(&u.host) {
                 self.error(
                     &t.span(),
                     format!(
@@ -1370,6 +1424,173 @@ impl Validator<'_> {
             secret: secret.map(Secret::new),
             token: token.map(Secret::new),
             ca_file: o.ca_file.as_ref().map(|c| PathBuf::from(c.get_ref())),
+        })
+    }
+
+    fn email_output(&mut self, name: &str, o: &RawOutput) -> Option<EmailOutput> {
+        let errors_before = self.error_count();
+        let security = match &o.security {
+            None => SmtpSecurity::StartTls,
+            Some(v) => match SmtpSecurity::NAMES.iter().find(|(n, _)| n == v.get_ref()) {
+                Some(&(_, s)) => s,
+                None => {
+                    self.error(
+                        &v.span(),
+                        format!(
+                            "output {name:?}: security {:?} is not \"starttls\", \"tls\" or \
+                             \"none\"",
+                            v.get_ref()
+                        ),
+                    );
+                    SmtpSecurity::StartTls
+                }
+            },
+        };
+        let address = match &o.address {
+            None => {
+                self.error(
+                    &o.type_.span(),
+                    format!(
+                        "output {name:?} needs the address of the SMTP server, as in \
+                         \"smtp.example.net:587\""
+                    ),
+                );
+                None
+            }
+            Some(a) => match split_address(a.get_ref(), security.default_port()) {
+                Ok(hp) => Some(hp),
+                Err(e) => {
+                    self.error(&a.span(), format!("output {name:?}: address: {e}"));
+                    None
+                }
+            },
+        };
+        if let Some(u) = &o.username {
+            let v = u.get_ref();
+            if v.is_empty() || v.chars().any(char::is_control) {
+                self.error(
+                    &u.span(),
+                    format!(
+                        "output {name:?}: username must be non-empty, without control characters"
+                    ),
+                );
+            }
+        }
+        let password = o.password.as_ref().and_then(|p| {
+            // §14: no passwords in the configuration file itself.
+            if !p.get_ref().contains("${") {
+                self.error(
+                    &p.span(),
+                    format!(
+                        "output {name:?}: password must come from ${{env:NAME}} or \
+                         ${{file:/path}}, not the configuration file"
+                    ),
+                );
+                return None;
+            }
+            let v = self.secret_value(name, "password", p)?;
+            if v.is_empty() {
+                self.error(&p.span(), format!("output {name:?}: password is empty"));
+            }
+            Some(v)
+        });
+        match (&o.username, &o.password) {
+            (Some(u), None) => self.error(
+                &u.span(),
+                format!("output {name:?}: username needs a password"),
+            ),
+            (None, Some(p)) => self.error(
+                &p.span(),
+                format!("output {name:?}: password needs a username"),
+            ),
+            _ => {}
+        }
+        // A password sent in clear can be read and reused by anyone on the
+        // path; only a loopback server is exempt.
+        if let (Some(p), Some((host, _)), SmtpSecurity::None) = (&o.password, &address, security) {
+            if !loopback_host(host) {
+                self.error(
+                    &p.span(),
+                    format!(
+                        "output {name:?}: a password needs security = \"starttls\" or \"tls\" \
+                         (or a loopback server), so it is not sent in clear"
+                    ),
+                );
+            }
+        }
+        if let (Some(c), SmtpSecurity::None) = (&o.ca_file, security) {
+            self.error(
+                &c.span(),
+                format!(
+                    "output {name:?}: ca_file applies to security \"starttls\" or \"tls\" only"
+                ),
+            );
+        }
+        let from = match &o.from {
+            None => {
+                self.error(
+                    &o.type_.span(),
+                    format!("output {name:?} needs a from address"),
+                );
+                None
+            }
+            Some(f) => {
+                if let Err(e) = check_mailbox(f.get_ref()) {
+                    self.error(&f.span(), format!("output {name:?}: from {e}"));
+                }
+                Some(f.get_ref().clone())
+            }
+        };
+        let to = match &o.to {
+            Some(t) if !t.get_ref().is_empty() => {
+                for a in t.get_ref() {
+                    if let Err(e) = check_mailbox(a) {
+                        self.error(&t.span(), format!("output {name:?}: to {e}"));
+                    }
+                }
+                t.get_ref().clone()
+            }
+            Some(t) => {
+                self.error(&t.span(), format!("output {name:?}: to is empty"));
+                Vec::new()
+            }
+            None => {
+                self.error(
+                    &o.type_.span(),
+                    format!("output {name:?} needs to = [\"someone@example.net\", ...]"),
+                );
+                Vec::new()
+            }
+        };
+        let graph = match &o.graph {
+            None => Some(output::DEFAULT_EMAIL_GRAPH),
+            Some(g) if g.get_ref() == "off" => None,
+            Some(g) => match self.duration("graph", g) {
+                Some(d) if (MIN_EMAIL_GRAPH..=MAX_EMAIL_GRAPH).contains(&d) => Some(d),
+                Some(_) => {
+                    self.error(
+                        &g.span(),
+                        format!("output {name:?}: graph must be from 10m to 30d, or \"off\""),
+                    );
+                    None
+                }
+                None => None,
+            },
+        };
+        if self.error_count() != errors_before {
+            return None;
+        }
+        let (host, port) = address?;
+        Some(EmailOutput {
+            host,
+            port,
+            security,
+            username: o.username.as_ref().map(|u| u.get_ref().clone()),
+            password: password.map(Secret::new),
+            from: from?,
+            to,
+            ca_file: o.ca_file.as_ref().map(|c| PathBuf::from(c.get_ref())),
+            graph,
         })
     }
 
@@ -2503,6 +2724,38 @@ fn numeric_tld(host: &str) -> bool {
             .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// `localhost` or a loopback address: traffic to it stays on this machine.
+fn loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|a| a.is_loopback())
+}
+
+/// `local@domain` or `Display Name <local@domain>`. Only the shape is
+/// checked here; the mail library parses it fully at start.
+fn check_mailbox(s: &str) -> Result<(), String> {
+    let addr = match (s.rfind('<'), s.strip_suffix('>')) {
+        (Some(i), Some(_)) => &s[i + 1..s.len() - 1],
+        (None, None) => s.trim(),
+        _ => return Err(format!("{s:?} has an unmatched '<' or '>'")),
+    };
+    let ok = s.chars().all(|c| !c.is_control())
+        && addr.split_once('@').is_some_and(|(l, d)| {
+            !l.is_empty()
+                && !d.is_empty()
+                && !d.contains('@')
+                && !addr.contains(|c: char| c.is_whitespace() || c == '<' || c == '>')
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "{s:?} is not an e-mail address like name@example.net"
+        ))
+    }
+}
+
 /// `host`, `host:port`, `[v6]:port` or a bare IPv6 address.
 fn split_address(s: &str, default_port: u16) -> Result<(String, u16), String> {
     let s = s.trim();
@@ -2801,7 +3054,7 @@ name = "G"
             (
                 "type  = \"jsonl\"",
                 "type  = \"email\"",
-                "is not available yet",
+                "needs the address of the SMTP server",
             ),
             (
                 "type  = \"jsonl\"",
@@ -2858,7 +3111,7 @@ name = "G"
             (
                 "path  = \"/var",
                 "address = \"x\"\npath  = \"/var",
-                "address applies to type = \"syslog\" only",
+                "address applies to type = \"syslog\" or \"email\" only",
             ),
             (
                 "path  = \"/var/log/routelith/events.jsonl\"",
@@ -3037,7 +3290,7 @@ url    = "https://hooks.slack.example/services/T0/B0/XYZ"
             ),
             (
                 ok.replace("format = \"ntfy\"", "format = \"ntfy\"\naddress = \"x\""),
-                "address applies to type = \"syslog\" only",
+                "address applies to type = \"syslog\" or \"email\" only",
                 "",
             ),
             (
@@ -3079,6 +3332,194 @@ url    = "https://hooks.slack.example/services/T0/B0/XYZ"
             assert!(errors(&src).is_empty(), "{host}: {:?}", errors(&src));
         }
     }
+    const EMAILS: &str = r#"
+[server]
+data_dir = "/tmp/rl"
+
+[[output]]
+name     = "noc"
+type     = "email"
+address  = "smtp.example.net"
+username = "routelith"
+password = "${file:/nonexistent/routelith-smtp}"
+from     = "Routelith <routelith@example.net>"
+to       = ["noc@example.net", "On call <oncall@example.net>"]
+graph    = "6h"
+
+[[output]]
+name     = "relay"
+type     = "email"
+address  = "[::1]:2525"
+security = "none"
+from     = "routelith@example.net"
+to       = ["ops@example.net"]
+graph    = "off"
+"#;
+
+    #[test]
+    fn emails_parse() {
+        use crate::output::{OutputKind, SmtpSecurity};
+        // No password file here, so the first output logs in without one
+        // for this test.
+        let src = EMAILS
+            .replace("username = \"routelith\"\n", "")
+            .replace("password = \"${file:/nonexistent/routelith-smtp}\"\n", "");
+        let p = parse(&src);
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let c = p.config.unwrap();
+        let OutputKind::Email(e) = &c.outputs[0].kind else {
+            panic!("{:?}", c.outputs[0]);
+        };
+        assert_eq!((e.host.as_str(), e.port), ("smtp.example.net", 587));
+        assert_eq!(e.security, SmtpSecurity::StartTls);
+        assert_eq!(e.to.len(), 2);
+        assert_eq!(e.graph, Some(Duration::from_secs(6 * 3600)));
+        assert_eq!(c.outputs[0].kind.type_name(), "email");
+        let OutputKind::Email(e) = &c.outputs[1].kind else {
+            panic!("{:?}", c.outputs[1]);
+        };
+        assert_eq!((e.host.as_str(), e.port), ("::1", 2525));
+        assert_eq!(e.security, SmtpSecurity::None);
+        assert_eq!(e.graph, None);
+        // security = "tls" defaults to port 465.
+        let p = parse(&src.replace(
+            "address  = \"smtp.example.net\"",
+            "address = \"smtp.example.net\"\nsecurity = \"tls\"",
+        ));
+        let OutputKind::Email(e) = &p.config.unwrap().outputs[0].kind else {
+            panic!();
+        };
+        assert_eq!(e.port, 465);
+    }
+
+    #[test]
+    fn a_password_comes_from_a_reference() {
+        use crate::output::OutputKind;
+        let dir = std::env::temp_dir().join(format!("rl-core-pw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("smtp");
+        std::fs::write(&file, "hunter2\n").unwrap();
+        // Forward slashes: a Windows path's backslashes would be escapes in
+        // a TOML string, and Windows takes either.
+        let path = file.to_str().unwrap().replace('\\', "/");
+        let src = EMAILS.replace("/nonexistent/routelith-smtp", &path);
+        let p = parse(&src);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let c = p.config.unwrap();
+        let OutputKind::Email(e) = &c.outputs[0].kind else {
+            panic!();
+        };
+        assert_eq!(e.password.as_ref().unwrap().expose(), "hunter2");
+        assert_eq!(e.username.as_deref(), Some("routelith"));
+        assert!(!format!("{:?}", c.outputs[0]).contains("hunter2"));
+    }
+
+    #[test]
+    fn email_mistakes_are_reported() {
+        for (from, to, message) in [
+            (
+                "password = \"${file:/nonexistent/routelith-smtp}\"",
+                "password = \"hunter2\"",
+                "password must come from ${env:NAME} or ${file:/path}",
+            ),
+            (
+                "password = \"${file:/nonexistent/routelith-smtp}\"\n",
+                "",
+                "username needs a password",
+            ),
+            (
+                "username = \"routelith\"\n",
+                "",
+                "password needs a username",
+            ),
+            (
+                "${file:/nonexistent/routelith-smtp}",
+                "${file:/nonexistent/routelith-smtp}",
+                "cannot read /nonexistent/routelith-smtp",
+            ),
+            (
+                "address  = \"smtp.example.net\"",
+                "address = \"smtp.example.net\"\nsecurity = \"none\"",
+                "a password needs security = \"starttls\" or \"tls\"",
+            ),
+            (
+                "security = \"none\"",
+                "security = \"ssl\"",
+                "security \"ssl\" is not",
+            ),
+            (
+                "security = \"none\"",
+                "security = \"none\"\nca_file = \"/ca.pem\"",
+                "ca_file applies to security",
+            ),
+            (
+                "address  = \"[::1]:2525\"\n",
+                "",
+                "needs the address of the SMTP server",
+            ),
+            (
+                "from     = \"routelith@example.net\"\n",
+                "",
+                "needs a from address",
+            ),
+            (
+                "from     = \"routelith@example.net\"",
+                "from = \"routelith\"",
+                "from \"routelith\" is not an e-mail address",
+            ),
+            (
+                "[\"ops@example.net\"]",
+                "[\"ops@example.net\", \"Ops <ops@example.net\"]",
+                "unmatched",
+            ),
+            ("[\"ops@example.net\"]", "[]", "to is empty"),
+            (
+                "graph    = \"6h\"",
+                "graph = \"1m\"",
+                "graph must be from 10m to 30d",
+            ),
+            (
+                "graph    = \"off\"",
+                "graph = \"off\"\nurl = \"https://x/\"",
+                "url applies to type = \"webhook\" only",
+            ),
+            (
+                "graph    = \"off\"",
+                "graph = \"off\"\npath = \"/x\"",
+                "path applies to type = \"jsonl\" only",
+            ),
+        ] {
+            assert!(EMAILS.contains(from), "{from}");
+            let src = EMAILS.replacen(from, to, 1);
+            let errs = errors(&src);
+            assert!(
+                errs.iter().any(|e| e.contains(message)),
+                "{message}: {errs:?}"
+            );
+        }
+        // Keys of other types are named with the types they belong to.
+        let errs = errors(&EMAILS.replace(
+            "graph    = \"off\"",
+            "graph = \"off\"\nfacility = \"local0\"",
+        ));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("facility applies to type = \"syslog\" only")),
+            "{errs:?}"
+        );
+        // A loopback server may take a password in clear.
+        let local = EMAILS.replace(
+            "address  = \"smtp.example.net\"",
+            "address = \"127.0.0.1:2525\"\nsecurity = \"none\"",
+        );
+        assert!(
+            errors(&local).iter().all(|e| !e.contains("in clear")),
+            "{:?}",
+            errors(&local)
+        );
+    }
+
     #[test]
     fn parents_and_silences_parse() {
         use crate::silence::When;

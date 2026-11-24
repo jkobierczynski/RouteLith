@@ -100,6 +100,18 @@ duration = "2h"
 # url    = "https://ntfy.sh/${file:/etc/routelith/ntfy-topic}"
 # token  = "${env:NTFY_TOKEN}"      # ntfy or gotify; optional for ntfy
 #
+# [[output]]
+# name     = "noc-mail"
+# type     = "email"
+# address  = "smtp.example.net"     # port 587 with starttls (the default)
+# security = "starttls"             # or tls (port 465), none (port 25)
+# username = "routelith"
+# password = "${env:RL_SMTP_PASSWORD}"  # ${env:} or ${file:} only
+# from     = "Routelith <routelith@example.net>"
+# to       = ["noc@example.net"]
+# graph    = "3h"                   # PNG attached; "off" for none
+# events   = ["alert_raised", "alert_cleared"]
+#
 # [[output]]                        # Windows only: the Application log,
 # name = "eventlog"                 # source Routelith
 # type = "eventlog"

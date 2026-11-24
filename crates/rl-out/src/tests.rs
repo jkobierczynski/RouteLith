@@ -6,8 +6,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use rl_core::output::{
-    EventFilter, Framing, JsonlOutput, Output, OutputKind, SyslogFormat, SyslogOutput, Transport,
-    WebhookFormat, WebhookOutput,
+    EmailOutput, EventFilter, Framing, JsonlOutput, Output, OutputKind, SmtpSecurity, SyslogFormat,
+    SyslogOutput, Transport, WebhookFormat, WebhookOutput,
 };
 use rl_store::{Event, EventKind};
 
@@ -215,6 +215,7 @@ fn syslog_over_udp() {
     let outs = Outputs::start(
         &[output(OutputKind::Syslog(syslog(port, Transport::Udp)), 10)],
         HashMap::new(),
+        None,
     )
     .unwrap();
     outs.send(&raised());
@@ -234,6 +235,7 @@ fn syslog_over_tcp_reconnects() {
     let outs = Outputs::start(
         &[output(OutputKind::Syslog(cfg.clone()), 10)],
         HashMap::new(),
+        None,
     )
     .unwrap();
     outs.send(&raised());
@@ -255,7 +257,8 @@ fn syslog_over_tcp_reconnects() {
 
     // LF framing.
     cfg.framing = Framing::Lf;
-    let outs = Outputs::start(&[output(OutputKind::Syslog(cfg), 10)], HashMap::new()).unwrap();
+    let outs =
+        Outputs::start(&[output(OutputKind::Syslog(cfg), 10)], HashMap::new(), None).unwrap();
     outs.send(&raised());
     let (s, _) = l.accept().unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -296,7 +299,8 @@ fn syslog_over_tls() {
     let mut cfg = syslog(port, Transport::Tls);
     cfg.ca_file = Some(ca);
     cfg.server_name = Some("localhost".into());
-    let outs = Outputs::start(&[output(OutputKind::Syslog(cfg), 10)], HashMap::new()).unwrap();
+    let outs =
+        Outputs::start(&[output(OutputKind::Syslog(cfg), 10)], HashMap::new(), None).unwrap();
     outs.send(&raised());
     check_parsed(&parse(&receiver.join().unwrap()));
     outs.close(Duration::from_secs(1));
@@ -312,6 +316,7 @@ fn a_down_receiver_never_blocks_the_sender() {
     let outs = Outputs::start(
         &[output(OutputKind::Syslog(syslog(port, Transport::Tcp)), 5)],
         HashMap::new(),
+        None,
     )
     .unwrap();
     let started = Instant::now();
@@ -342,6 +347,7 @@ fn jsonl_appends_events() {
             10,
         )],
         HashMap::new(),
+        None,
     )
     .unwrap();
     outs.send(&raised());
@@ -370,7 +376,7 @@ fn jsonl_appends_events() {
         }),
         10,
     );
-    let err = Outputs::start(&[bad], HashMap::new()).unwrap_err();
+    let err = Outputs::start(&[bad], HashMap::new(), None).unwrap_err();
     assert!(err.contains("cannot open"), "{err}");
     // Two spellings of one file: their lines would interleave.
     std::fs::create_dir(dir.path().join("sub")).unwrap();
@@ -379,7 +385,7 @@ fn jsonl_appends_events() {
         output(OutputKind::Jsonl(JsonlOutput { path: path.clone() }), 10),
         output(OutputKind::Jsonl(JsonlOutput { path: alias }), 10),
     ];
-    let err = Outputs::start(&outs, HashMap::new()).unwrap_err();
+    let err = Outputs::start(&outs, HashMap::new(), None).unwrap_err();
     assert!(err.contains("already writes"), "{err}");
 }
 
@@ -393,6 +399,7 @@ fn queued_events_are_delivered_at_close() {
             100,
         )],
         HashMap::new(),
+        None,
     )
     .unwrap();
     for _ in 0..50 {
@@ -569,7 +576,7 @@ fn webhook_retries_a_busy_receiver_and_signs() {
         WebhookFormat::Json,
     );
     w.secret = Some(rl_core::secret::Secret::new("s3cr3t"));
-    let outs = Outputs::start(&[output(OutputKind::Webhook(w), 10)], HashMap::new()).unwrap();
+    let outs = Outputs::start(&[output(OutputKind::Webhook(w), 10)], HashMap::new(), None).unwrap();
     let stats = outs.stats();
     outs.send(&raised());
     let seen = server.join().unwrap();
@@ -609,7 +616,7 @@ fn webhook_retries_a_busy_receiver_and_signs() {
 fn webhook_drops_what_the_receiver_refuses() {
     let (port, server) = http_server(vec![400, 200]);
     let w = webhook(&format!("http://127.0.0.1:{port}/"), WebhookFormat::Slack);
-    let outs = Outputs::start(&[output(OutputKind::Webhook(w), 10)], HashMap::new()).unwrap();
+    let outs = Outputs::start(&[output(OutputKind::Webhook(w), 10)], HashMap::new(), None).unwrap();
     let stats = outs.stats();
     let mut second = raised();
     second.message = "second <b>&".into();
@@ -666,7 +673,7 @@ fn webhook_over_https() {
     );
     w.ca_file = Some(ca);
     w.token = Some(rl_core::secret::Secret::new("AbC.123"));
-    let outs = Outputs::start(&[output(OutputKind::Webhook(w), 10)], HashMap::new()).unwrap();
+    let outs = Outputs::start(&[output(OutputKind::Webhook(w), 10)], HashMap::new(), None).unwrap();
     let stats = outs.stats();
     outs.send(&raised());
     let seen = receiver.join().unwrap();
@@ -721,4 +728,223 @@ fn webhook_formats() {
     // Unsigned JSON has no signature headers.
     let r = webhook::request(&webhook("http://x/", WebhookFormat::Json), &e, 0);
     assert!(r.headers.iter().all(|h| !h.0.contains("Signature")));
+}
+
+/// What a test SMTP server saw in one session.
+#[derive(Debug, Default)]
+struct Mail {
+    auth: Option<String>,
+    rcpt: Vec<String>,
+    data: String,
+}
+
+enum Next {
+    Done,
+    StartTls,
+}
+
+/// One SMTP dialogue: RCPT gets `rcpt_code`; STARTTLS is offered when
+/// `offer_tls`, else AUTH PLAIN.
+fn smtp_dialog<S: std::io::Read + std::io::Write>(
+    r: &mut BufReader<S>,
+    rcpt_code: u16,
+    offer_tls: bool,
+    m: &mut Mail,
+) -> Next {
+    loop {
+        let mut line = String::new();
+        if r.read_line(&mut line).unwrap_or(0) == 0 {
+            return Next::Done;
+        }
+        let up = line.to_ascii_uppercase();
+        let reply = if up.starts_with("EHLO") {
+            if offer_tls {
+                "250-test\r\n250 STARTTLS\r\n".to_string()
+            } else {
+                "250-test\r\n250 AUTH PLAIN\r\n".to_string()
+            }
+        } else if up.starts_with("STARTTLS") {
+            r.get_mut().write_all(b"220 go ahead\r\n").unwrap();
+            return Next::StartTls;
+        } else if up.starts_with("AUTH PLAIN") {
+            m.auth = Some(line[10..].trim().to_string());
+            "235 ok\r\n".to_string()
+        } else if up.starts_with("RCPT") {
+            m.rcpt.push(line.trim().to_string());
+            format!("{rcpt_code} rcpt\r\n")
+        } else if up.starts_with("DATA") {
+            r.get_mut().write_all(b"354 go\r\n").unwrap();
+            loop {
+                let mut l = String::new();
+                if r.read_line(&mut l).unwrap_or(0) == 0 || l == ".\r\n" {
+                    break;
+                }
+                m.data += &l;
+            }
+            "250 queued\r\n".to_string()
+        } else if up.starts_with("QUIT") {
+            let _ = r.get_mut().write_all(b"221 bye\r\n");
+            return Next::Done;
+        } else {
+            "250 ok\r\n".to_string()
+        };
+        r.get_mut().write_all(reply.as_bytes()).unwrap();
+        r.get_mut().flush().unwrap();
+    }
+}
+
+/// A plain SMTP server answering RCPT on each connection with the next code.
+fn smtp_server(codes: Vec<u16>) -> (u16, std::thread::JoinHandle<Vec<Mail>>) {
+    use std::io::Write;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let t = std::thread::spawn(move || {
+        codes
+            .into_iter()
+            .map(|code| {
+                let (mut s, _) = l.accept().unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                s.write_all(b"220 test ESMTP\r\n").unwrap();
+                let mut m = Mail::default();
+                smtp_dialog(&mut BufReader::new(s), code, false, &mut m);
+                m
+            })
+            .collect()
+    });
+    (port, t)
+}
+
+fn email(port: u16, security: SmtpSecurity) -> EmailOutput {
+    EmailOutput {
+        host: "127.0.0.1".into(),
+        port,
+        security,
+        username: None,
+        password: None,
+        from: "Routelith <routelith@example.net>".into(),
+        to: vec!["noc@example.net".into()],
+        ca_file: None,
+        graph: Some(Duration::from_secs(3600)),
+    }
+}
+
+fn fake_graph() -> GraphFn {
+    Arc::new(|e: &Event, span: Duration| {
+        assert_eq!(span, Duration::from_secs(3600));
+        Ok(e.series.map(|_| b"\x89PNG not really".to_vec()))
+    })
+}
+
+#[test]
+fn email_retries_a_busy_server_and_attaches_the_graph() {
+    let (port, server) = smtp_server(vec![451, 250]);
+    let o = output(OutputKind::Email(email(port, SmtpSecurity::None)), 10);
+    let outs = Outputs::start(&[o], HashMap::new(), Some(fake_graph())).unwrap();
+    let stats = outs.stats();
+    outs.send(&raised());
+    let mails = server.join().unwrap();
+    wait_for("sent", || stats[0].sent.load(Ordering::Relaxed) == 1);
+    outs.close(Duration::from_secs(1));
+    assert_eq!(stats[0].errors.load(Ordering::Relaxed), 1);
+    assert_eq!(stats[0].dropped.load(Ordering::Relaxed), 0);
+    assert!(mails[0].data.is_empty(), "{:?}", mails[0]);
+    let data = &mails[1].data;
+    assert!(
+        mails[1].rcpt[0].contains("<noc@example.net>"),
+        "{:?}",
+        mails[1]
+    );
+    assert!(
+        data.contains("Subject: Routelith: gw alert raised (loss)"),
+        "{data}"
+    );
+    assert!(
+        data.contains("From: Routelith <routelith@example.net>"),
+        "{data}"
+    );
+    assert!(data.contains("Rule: loss"), "{data}");
+    assert!(
+        data.contains("image/png") && data.contains("graph.png"),
+        "{data}"
+    );
+}
+
+#[test]
+fn email_drops_what_the_server_refuses() {
+    let (port, server) = smtp_server(vec![550, 250]);
+    let o = output(OutputKind::Email(email(port, SmtpSecurity::None)), 10);
+    let outs = Outputs::start(&[o], HashMap::new(), Some(fake_graph())).unwrap();
+    let stats = outs.stats();
+    // No series: no graph.
+    let started = Event::new(T, EventKind::ServerStarted, "local", "started");
+    outs.send(&raised());
+    outs.send(&started);
+    let mails = server.join().unwrap();
+    wait_for("sent", || stats[0].sent.load(Ordering::Relaxed) == 1);
+    outs.close(Duration::from_secs(1));
+    assert_eq!(stats[0].dropped.load(Ordering::Relaxed), 1);
+    assert!(
+        mails[1].data.contains("Subject: Routelith: server started"),
+        "{:?}",
+        mails[1]
+    );
+    assert!(!mails[1].data.contains("graph.png"), "{:?}", mails[1]);
+}
+
+#[test]
+fn email_with_starttls_and_login() {
+    use std::io::Write;
+
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, ck.cert.pem()).unwrap();
+    let server = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(ck.cert.der().to_vec())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der())),
+        )
+        .unwrap(),
+    );
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let receiver = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.write_all(b"220 test ESMTP\r\n").unwrap();
+        let mut m = Mail::default();
+        let mut plain = BufReader::new(s);
+        let Next::StartTls = smtp_dialog(&mut plain, 250, true, &mut m) else {
+            panic!("no STARTTLS: {m:?}");
+        };
+        let c = rustls::ServerConnection::new(server).unwrap();
+        let tls = rustls::StreamOwned::new(c, plain.into_inner());
+        smtp_dialog(&mut BufReader::new(tls), 250, false, &mut m);
+        m
+    });
+    let mut cfg = email(port, SmtpSecurity::StartTls);
+    cfg.ca_file = Some(ca);
+    cfg.username = Some("routelith".into());
+    cfg.password = Some(rl_core::secret::Secret::new("hunter2"));
+    let o = output(OutputKind::Email(cfg), 10);
+    let outs = Outputs::start(&[o], HashMap::new(), None).unwrap();
+    let stats = outs.stats();
+    outs.send(&raised());
+    let m = receiver.join().unwrap();
+    wait_for("sent", || stats[0].sent.load(Ordering::Relaxed) == 1);
+    outs.close(Duration::from_secs(1));
+    // AUTH PLAIN: base64 of "\0routelith\0hunter2".
+    assert_eq!(m.auth.as_deref(), Some("AHJvdXRlbGl0aABodW50ZXIy"), "{m:?}");
+    assert!(
+        m.data.contains("Subject: Routelith: gw alert raised"),
+        "{m:?}"
+    );
 }
