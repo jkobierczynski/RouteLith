@@ -242,25 +242,16 @@ impl Auth {
         lock(&self.failures).remove(&FailureKey::Name(name.to_string()));
     }
 
-    /// Check a name and password, counting a failure. `Err` carries the
-    /// response for a refused or throttled try.
+    /// Check a name and password, counting a failure.
     async fn check_password(
         self: &Arc<Self>,
         addr: IpAddr,
         name: &str,
         password: &str,
-    ) -> Result<Role, Response> {
+    ) -> Result<Role, Refused> {
         let keys = [FailureKey::Addr(addr), FailureKey::Name(name.to_string())];
         if keys.iter().any(|k| self.failed_recently(k)) {
-            let mut r = error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many failed logins; try again in a few minutes",
-            );
-            r.headers_mut().insert(
-                header::RETRY_AFTER,
-                HeaderValue::from(FAILURE_WINDOW.as_secs()),
-            );
-            return Err(r);
+            return Err(Refused::Throttled);
         }
         let user = self.users().get(name).cloned();
         let (hash, role) = match &user {
@@ -279,10 +270,7 @@ impl Auth {
             }
             _ => {
                 self.count_failure(&keys);
-                Err(error(
-                    StatusCode::UNAUTHORIZED,
-                    "wrong user name or password",
-                ))
+                Err(Refused::Wrong)
             }
         }
     }
@@ -341,7 +329,7 @@ impl Auth {
         addr: IpAddr,
         name: &str,
         password: &str,
-    ) -> Result<Role, Response> {
+    ) -> Result<Role, Refused> {
         let key: [u8; 32] = digest(&SHA256, format!("{name}:{password}").as_bytes())
             .as_ref()
             .try_into()
@@ -370,6 +358,33 @@ impl Auth {
             "{COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}"
         ))
         .unwrap_or_else(|_| HeaderValue::from_static(""))
+    }
+}
+
+/// Why a name and password were not taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    Wrong,
+    /// Too many failures lately; not checked.
+    Throttled,
+}
+
+impl IntoResponse for Refused {
+    fn into_response(self) -> Response {
+        match self {
+            Refused::Wrong => error(StatusCode::UNAUTHORIZED, "wrong user name or password"),
+            Refused::Throttled => {
+                let mut r = error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many failed logins; try again in a few minutes",
+                );
+                r.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    HeaderValue::from(FAILURE_WINDOW.as_secs()),
+                );
+                r
+            }
+        }
     }
 }
 
@@ -506,7 +521,7 @@ pub(crate) async fn guard(
                 name: Some(name),
                 role,
             }),
-            Err(resp) => return resp,
+            Err(r) => return r.into_response(),
         }
     } else {
         None
@@ -597,7 +612,7 @@ pub(crate) async fn login(State(s): State<Arc<AppState>>, req: Request) -> Respo
     }
     let role = match auth.check_password(addr, &b.name, &b.password).await {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(r) => return r.into_response(),
     };
     let (token, csrf) = auth.new_session(&b.name);
     let mut resp = session_json(
