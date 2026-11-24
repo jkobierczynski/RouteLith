@@ -148,7 +148,7 @@ try {
   check(true, "the raised alert is marked silenced");
   if (shots) await page.screenshot({ path: join(shots, "silenced.png") });
   await page.click("ul.silences button.link");
-  await page.waitForFunction(() => !document.querySelector("ul.silences"), null, { polling: 100 });
+  await page.waitForSelector("ul.silences", { state: "detached" });
   check(true, "ending the silence removes it from the list");
 
   // A reload keeps the session.
