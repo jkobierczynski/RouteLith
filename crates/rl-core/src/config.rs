@@ -73,6 +73,10 @@ pub struct Config {
     pub server: ServerConfig,
     /// Targets measured from this vantage, in file order.
     pub targets: Vec<TargetConfig>,
+    /// Targets measured by agents (§21.7 G5): those of groups whose
+    /// `vantages` names another vantage or `"*"`, in file order. A target
+    /// the server measures too is in both lists.
+    pub agent_targets: Vec<TargetConfig>,
     /// Alert rules, in file order (§21.5 F1).
     pub alerts: Vec<crate::alert::AlertRule>,
     /// Silences, in file order (§21.5 F6).
@@ -165,12 +169,15 @@ pub struct TargetConfig {
     /// The target this one depends on (§21.5 F6): while it has an alert
     /// raised, this target's alerts are recorded as suppressed.
     pub parent: Option<String>,
+    /// The group's `vantages` as written; empty when it has none (the
+    /// server only). `"*"` stands for every enrolled agent and the server.
+    pub vantages: Vec<String>,
     /// 1-based line of the target's table, for messages.
     pub line: usize,
 }
 
 /// The probe of a target and its settings (architecture doc §4).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ProbeConfig {
     /// ICMP echo with this many payload bytes.
     Icmp { payload_size: u16 },
@@ -183,7 +190,7 @@ pub enum ProbeConfig {
 }
 
 /// An HTTP target's request and what counts as success (§4.6).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct HttpConfig {
     /// The URL as configured.
     pub url: String,
@@ -214,7 +221,9 @@ pub struct HttpConfig {
 /// `total` time); the rest is not downloaded.
 pub const BODY_LIMIT: usize = 1 << 20;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum HttpMethod {
     #[default]
     Get,
@@ -231,7 +240,9 @@ impl HttpMethod {
 }
 
 /// Which HTTP time a sample stores (the others go to the phase timings).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum HttpMetric {
     /// Start of connect to the first response byte.
     #[default]
@@ -360,7 +371,7 @@ pub fn parse_status_ranges(s: &str) -> Result<Vec<(u16, u16)>, String> {
 }
 
 /// A DNS target's query and its expected answer (§4.5).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DnsConfig {
     pub port: u16,
     /// Name to query; each `{rand}` becomes a fresh random label per sample,
@@ -379,7 +390,9 @@ pub struct DnsConfig {
 }
 
 /// How DNS queries travel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum DnsTransport {
     #[default]
     Udp,
@@ -419,7 +432,9 @@ impl ProbeConfig {
 }
 
 /// What a TCP sample times (§4.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum TcpMode {
     /// From `connect()` until the handshake completes.
     #[default]
@@ -438,7 +453,7 @@ impl TcpMode {
 }
 
 /// When and how often a target is measured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Schedule {
     /// One round every `step`, aligned to wall-clock multiples of it.
     pub step: Duration,
@@ -450,6 +465,22 @@ pub struct Schedule {
     pub timeout: Duration,
 }
 
+/// `vantages` entry for every enrolled agent and the server.
+pub const ALL_VANTAGES: &str = "*";
+
+impl TargetConfig {
+    /// Whether `vantage` measures this target. `server` is the server's own
+    /// vantage name, which measures targets of groups without `vantages`.
+    pub fn measured_by(&self, vantage: &str, server: &str) -> bool {
+        if self.vantages.is_empty() {
+            return vantage == server;
+        }
+        self.vantages
+            .iter()
+            .any(|v| v == vantage || v == ALL_VANTAGES)
+    }
+}
+
 impl Schedule {
     /// Average packets per second this schedule sends for one series.
     pub fn pps(&self) -> f64 {
@@ -458,7 +489,7 @@ impl Schedule {
 }
 
 /// Address family of a target (§5.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Family {
     V4,
     V6,
@@ -831,6 +862,7 @@ impl Validator<'_> {
         self.check_layer(&defaults);
 
         let mut targets = Vec::new();
+        let mut agent_targets = Vec::new();
         let mut group_names: HashMap<String, Range<usize>> = HashMap::new();
         let mut target_names: HashMap<String, usize> = HashMap::new();
         // Each target's parent as written, with where it was written.
@@ -851,19 +883,44 @@ impl Validator<'_> {
                 group_names.insert(gname.clone(), group.name.span());
             }
 
-            let measured_here = match &group.vantages {
-                Some(v) if !v.get_ref().iter().any(|n| n == &vantage) => {
+            let listed: Vec<String> = group
+                .vantages
+                .as_ref()
+                .map(|v| v.get_ref().iter().map(|n| n.trim().to_string()).collect())
+                .unwrap_or_default();
+            if let Some(v) = &group.vantages {
+                if listed.is_empty() {
+                    self.error(
+                        &v.span(),
+                        "vantages must name at least one vantage, or \"*\"",
+                    );
+                }
+                for n in &listed {
+                    if n != ALL_VANTAGES && !valid_name(n) {
+                        self.error(&v.span(), name_rule("each of vantages"));
+                    }
+                }
+            }
+            let measured_here =
+                listed.is_empty() || listed.iter().any(|n| n == &vantage || n == ALL_VANTAGES);
+            let by_agents = listed.iter().any(|n| n != &vantage);
+            let agents_listen = server.as_ref().is_some_and(|s| s.listen_agents.is_some());
+            if by_agents && !agents_listen {
+                if let Some(v) = &group.vantages {
                     self.warning(
                         &v.span(),
                         format!(
-                            "group {gname:?} does not list this vantage ({:?}); its targets are not measured here",
-                            vantage
+                            "group {gname:?} lists other vantages than this one ({vantage:?}), \
+                             but listen_agents is not set, so no agent can measure it{}",
+                            if measured_here {
+                                ""
+                            } else {
+                                "; its targets are not measured"
+                            }
                         ),
                     );
-                    false
                 }
-                _ => true,
-            };
+            }
             if group.targets.is_empty() {
                 self.warning(&group_span, format!("group {gname:?} has no targets"));
             }
@@ -895,9 +952,15 @@ impl Validator<'_> {
                     parents.push((target.name.get_ref().clone(), p.clone(), measured_here));
                 }
                 let t = self.target(&target, &gname, &settings, span);
-                if let (Some(mut t), true) = (t, measured_here) {
+                if let Some(mut t) = t {
                     t.parent = parent.map(|p| p.into_inner());
-                    targets.push(t);
+                    t.vantages = listed.clone();
+                    if by_agents {
+                        agent_targets.push(t.clone());
+                    }
+                    if measured_here {
+                        targets.push(t);
+                    }
                 }
             }
         }
@@ -945,6 +1008,7 @@ impl Validator<'_> {
         Some(Config {
             server,
             targets,
+            agent_targets,
             alerts,
             silences,
             outputs,
@@ -2453,6 +2517,7 @@ impl Validator<'_> {
             },
             alerts,
             parent: None,
+            vantages: Vec::new(),
             line: self.position(span.start).0,
         })
     }
@@ -4691,7 +4756,7 @@ name = "G"
     }
 
     #[test]
-    fn other_vantages_are_skipped_with_a_warning() {
+    fn agent_groups_without_listen_agents_warn() {
         let src = r#"[server]
 data_dir = "/tmp/rl"
 listen_ui = "0.0.0.0:8080"
@@ -4705,7 +4770,78 @@ vantages = ["hasselt"]
         let p = parse(src);
         assert_eq!(p.errors().count(), 0);
         assert_eq!(p.diagnostics.len(), 2, "{:?}", p.diagnostics);
-        assert!(p.config.unwrap().targets.is_empty());
+        assert!(
+            p.diagnostics
+                .iter()
+                .any(|d| d.message.contains("listen_agents is not set")),
+            "{:?}",
+            p.diagnostics
+        );
+        let c = p.config.unwrap();
+        assert!(c.targets.is_empty());
+        assert_eq!(c.agent_targets.len(), 1);
+    }
+
+    #[test]
+    fn vantages_assign_targets_to_agents() {
+        let src = r#"[server]
+data_dir = "/tmp/rl"
+vantage = "home"
+listen_ui = "off"
+listen_agents = "0.0.0.0:4443"
+[[group]]
+name = "Local"
+  [[group.target]]
+  name = "a"
+  host = "h"
+[[group]]
+name = "Both"
+vantages = ["home", "genk"]
+  [[group.target]]
+  name = "b"
+  host = "h"
+[[group]]
+name = "Remote"
+vantages = ["genk", "gent"]
+  [[group.target]]
+  name = "c"
+  host = "h"
+[[group]]
+name = "Everywhere"
+vantages = ["*"]
+  [[group.target]]
+  name = "d"
+  host = "h"
+"#;
+        let p = parse(src);
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let c = p.config.unwrap();
+        let ids = |t: &[TargetConfig]| t.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&c.targets), ["a", "b", "d"]);
+        assert_eq!(ids(&c.agent_targets), ["b", "c", "d"]);
+        let by = |id: &str, v: &str| {
+            c.agent_targets
+                .iter()
+                .chain(&c.targets)
+                .find(|t| t.id == id)
+                .unwrap()
+                .measured_by(v, "home")
+        };
+        assert!(by("a", "home") && !by("a", "genk"));
+        assert!(by("b", "genk") && !by("b", "gent"));
+        assert!(by("c", "gent") && !by("c", "home"));
+        assert!(by("d", "anything") && by("d", "home"));
+    }
+
+    #[test]
+    fn vantage_names_are_checked() {
+        for list in ["[]", "[\"a b\"]", "[\"../x\"]"] {
+            let src = format!(
+                "[server]\ndata_dir = \"d\"\nlisten_agents = \"0.0.0.0:1\"\n[[group]]\n\
+                 name = \"g\"\nvantages = {list}\n[[group.target]]\nname = \"t\"\nhost = \"h\"\n"
+            );
+            assert!(parse(&src).errors().count() > 0, "{list}");
+        }
     }
 
     #[test]

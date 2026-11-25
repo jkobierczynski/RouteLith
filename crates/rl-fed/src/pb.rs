@@ -31,17 +31,21 @@ pub struct EnrollResponse {
     #[prost(bytes = "vec", tag = "3")]
     pub ca_der: ::prost::alloc::vec::Vec<u8>,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AgentMessage {
-    #[prost(oneof = "agent_message::Msg", tags = "1")]
+    #[prost(oneof = "agent_message::Msg", tags = "1, 2, 3")]
     pub msg: ::core::option::Option<agent_message::Msg>,
 }
 /// Nested message and enum types in `AgentMessage`.
 pub mod agent_message {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Msg {
         #[prost(message, tag = "1")]
         Hello(super::Hello),
+        #[prost(message, tag = "2")]
+        Results(super::ResultBatch),
+        #[prost(message, tag = "3")]
+        Applied(super::ConfigApplied),
     }
 }
 /// First message on every stream.
@@ -53,17 +57,21 @@ pub struct Hello {
     #[prost(string, tag = "2")]
     pub os: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ServerMessage {
-    #[prost(oneof = "server_message::Msg", tags = "1")]
+    #[prost(oneof = "server_message::Msg", tags = "1, 2, 3")]
     pub msg: ::core::option::Option<server_message::Msg>,
 }
 /// Nested message and enum types in `ServerMessage`.
 pub mod server_message {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Msg {
         #[prost(message, tag = "1")]
         Welcome(super::Welcome),
+        #[prost(message, tag = "2")]
+        Config(super::ConfigSnapshot),
+        #[prost(message, tag = "3")]
+        Ack(super::Ack),
     }
 }
 /// Answer to Hello.
@@ -74,6 +82,109 @@ pub struct Welcome {
     pub name: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub server_version: ::prost::alloc::string::String,
+}
+/// Everything this agent measures (§21.7 G5): sent after Welcome and
+/// whenever it changes. It replaces the previous snapshot whole.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConfigSnapshot {
+    /// Changes whenever any assignment changes.
+    #[prost(string, tag = "1")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub assignments: ::prost::alloc::vec::Vec<Assignment>,
+}
+/// One series to measure.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Assignment {
+    /// The server's id for the series; rounds carry it back.
+    #[prost(uint64, tag = "1")]
+    pub series_id: u64,
+    #[prost(string, tag = "2")]
+    pub target: ::prost::alloc::string::String,
+    /// "v4", "v6" or "prefer-v6".
+    #[prost(string, tag = "3")]
+    pub family: ::prost::alloc::string::String,
+    /// Host, schedule and probe settings as JSON (rl_fed::assign::Spec), so
+    /// probe settings can grow without protocol changes.
+    #[prost(bytes = "vec", tag = "4")]
+    pub spec_json: ::prost::alloc::vec::Vec<u8>,
+}
+/// The agent took a snapshot.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConfigApplied {
+    #[prost(string, tag = "1")]
+    pub version: ::prost::alloc::string::String,
+    /// Series the agent will not measure, with the reason.
+    #[prost(message, repeated, tag = "2")]
+    pub refused: ::prost::alloc::vec::Vec<Refusal>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Refusal {
+    #[prost(uint64, tag = "1")]
+    pub series_id: u64,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// Finished rounds, in the order they finished (at most 1 s old).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResultBatch {
+    #[prost(message, repeated, tag = "1")]
+    pub rounds: ::prost::alloc::vec::Vec<Round>,
+}
+/// One round, as the store keeps it (§6).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Round {
+    /// Per agent, increasing by one per round.
+    #[prost(uint64, tag = "1")]
+    pub seq: u64,
+    #[prost(uint64, tag = "2")]
+    pub series_id: u64,
+    /// Round start, Unix milliseconds, by the agent's clock.
+    #[prost(int64, tag = "3")]
+    pub ts_ms: i64,
+    #[prost(uint32, tag = "4")]
+    pub sent: u32,
+    /// RTTs of the replies in microseconds, ascending.
+    #[prost(uint32, repeated, tag = "5")]
+    pub rtts_us: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint32, tag = "6")]
+    pub unreachable: u32,
+    #[prost(uint32, tag = "7")]
+    pub time_exceeded: u32,
+    #[prost(uint32, tag = "8")]
+    pub send_failed: u32,
+    #[prost(uint32, tag = "9")]
+    pub other_errors: u32,
+    /// Address measured: 4 or 16 bytes, empty if unknown.
+    #[prost(bytes = "vec", tag = "10")]
+    pub resolved: ::prost::alloc::vec::Vec<u8>,
+    /// Timing backend (rl_core::TimingBackend::code, 1 and up); 0 if unknown.
+    #[prost(uint32, tag = "11")]
+    pub timing: u32,
+    #[prost(uint32, tag = "12")]
+    pub flags: u32,
+    /// HTTP targets: median phase times and the certificate's expiry.
+    #[prost(message, optional, tag = "13")]
+    pub http: ::core::option::Option<HttpSummary>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HttpSummary {
+    #[prost(uint32, optional, tag = "1")]
+    pub connect_us: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub tls_us: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub ttfb_us: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub total_us: ::core::option::Option<u32>,
+    #[prost(int64, optional, tag = "5")]
+    pub cert_not_after_s: ::core::option::Option<i64>,
+}
+/// Rounds up to this seq are stored; the agent may forget them.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Ack {
+    #[prost(uint64, tag = "1")]
+    pub up_to_seq: u64,
 }
 /// Generated client implementations.
 pub mod agent_client {

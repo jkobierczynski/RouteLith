@@ -14,6 +14,8 @@ workspace = true
 [dependencies]
 base64.workspace = true
 prost.workspace = true
+rl-core.workspace = true
+rl-store.workspace = true
 rcgen.workspace = true
 ring.workspace = true
 rustls.workspace = true

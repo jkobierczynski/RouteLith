@@ -1,18 +1,24 @@
 //! Agents (§21.7): `routelith agent enroll|run` on the agent, and
 //! `routelith ctl agent add|list|revoke` on the server.
 
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
-use rl_core::config;
+use rl_core::config::{self, Family, ProbeConfig};
 use rl_fed::agent_config::AgentConfig;
 use rl_fed::ca::Ca;
 use rl_fed::client::{self, Identity};
+use rl_fed::pb;
 use rl_fed::registry::{Registry, TOKEN_TTL_MS};
 use rl_fed::token::Token;
+use rl_probe::{Probe, RateLimiter};
+use rl_sched::{Completed, Job, Sink, Stats};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -31,8 +37,8 @@ pub(crate) enum AgentAction {
         #[arg(long)]
         token_stdin: bool,
     },
-    /// Connect to the server and stay connected, reconnecting after
-    /// failures. (Measuring for the server arrives with M3 step 2.)
+    /// Measure what the server assigns and send it the rounds,
+    /// reconnecting after failures.
     Run {
         /// The agent's configuration file.
         #[arg(short, long)]
@@ -131,36 +137,28 @@ async fn run(path: &Path) -> ExitCode {
     };
     eprintln!("routelith agent: {} connecting to {}", id.name, cfg.server);
     tokio::pin!(signal);
+    let (round_tx, mut round_rx) = tokio::sync::mpsc::channel::<pb::Round>(QUEUE);
+    let mut m = Measuring::new(&id.name, cfg.max_pps, round_tx);
     let mut backoff = Backoff::default();
     loop {
+        let started = Instant::now();
         let attempt = async {
-            let started = Instant::now();
             match client::connect(&cfg.server, &id, VERSION).await {
-                Ok(mut s) => {
+                Ok(s) => {
                     eprintln!(
                         "routelith agent: connected to {} as {} (server version {})",
                         cfg.server, s.name, s.server_version
                     );
-                    let why = loop {
-                        match s.inbound.message().await {
-                            Ok(Some(_)) => {}
-                            Ok(None) => break "the server closed the stream".to_string(),
-                            Err(st) => break st.message().to_string(),
-                        }
-                    };
+                    let why = session(s, &mut m, &mut round_rx).await;
                     eprintln!("routelith agent: disconnected: {why}");
-                    started.elapsed()
                 }
-                Err(e) => {
-                    eprintln!("routelith agent: {e}");
-                    Duration::ZERO
-                }
+                Err(e) => eprintln!("routelith agent: {e}"),
             }
         };
         tokio::select! {
             () = &mut signal => break,
-            lasted = attempt => {
-                let wait = backoff.next(lasted);
+            () = attempt => {
+                let wait = backoff.next(started.elapsed());
                 eprintln!("routelith agent: trying again in {} s", wait.as_secs());
                 tokio::select! {
                     () = &mut signal => break,
@@ -170,7 +168,233 @@ async fn run(path: &Path) -> ExitCode {
         }
     }
     eprintln!("routelith agent: stopping");
+    m.stop().await;
+    let dropped = m.dropped.load(Ordering::Relaxed);
+    if dropped > 0 {
+        eprintln!("routelith agent: {dropped} round(s) were dropped because the queue was full");
+    }
     ExitCode::SUCCESS
+}
+
+/// Rounds kept in memory while the server is unreachable (the on-disk
+/// spool replaces this in M3 step 3).
+const QUEUE: usize = 16_384;
+/// Rounds per batch at most; a batch also goes out 1 s after its first round.
+const BATCH: usize = 500;
+
+/// One connection: take the configuration, send rounds, until the stream
+/// ends. Returns why it ended.
+async fn session(
+    mut s: client::Session,
+    m: &mut Measuring,
+    rounds: &mut tokio::sync::mpsc::Receiver<pb::Round>,
+) -> String {
+    let mut batch: Vec<pb::Round> = Vec::new();
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let flush_at = deadline;
+        tokio::select! {
+            msg = s.inbound.message() => match msg {
+                Ok(Some(pb::ServerMessage { msg: Some(pb::server_message::Msg::Config(snap)) })) => {
+                    let applied = m.apply(snap).await;
+                    let msg = pb::AgentMessage { msg: Some(pb::agent_message::Msg::Applied(applied)) };
+                    if s.outbound.send(msg).await.is_err() {
+                        return "the stream closed".to_string();
+                    }
+                }
+                // Acks matter once rounds are spooled (step 3).
+                Ok(Some(_)) => {}
+                Ok(None) => return "the server closed the stream".to_string(),
+                Err(st) => return st.message().to_string(),
+            },
+            Some(r) = rounds.recv(), if batch.len() < BATCH => {
+                if batch.is_empty() {
+                    deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+                }
+                batch.push(r);
+            }
+            () = async {
+                match flush_at {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+        }
+        let due = deadline.is_some_and(|t| t <= tokio::time::Instant::now());
+        if !batch.is_empty() && (due || batch.len() >= BATCH) {
+            let msg = pb::AgentMessage {
+                msg: Some(pb::agent_message::Msg::Results(pb::ResultBatch {
+                    rounds: std::mem::take(&mut batch),
+                })),
+            };
+            deadline = None;
+            if s.outbound.send(msg).await.is_err() {
+                return "the stream closed".to_string();
+            }
+        }
+    }
+}
+
+/// The scheduler jobs for the current configuration.
+struct Measuring {
+    name: String,
+    limiter: Arc<RateLimiter>,
+    stats: Arc<Stats>,
+    sink: Sink,
+    dropped: Arc<AtomicU64>,
+    version: Option<String>,
+    stop: Option<tokio::sync::watch::Sender<bool>>,
+    jobs: tokio::task::JoinSet<()>,
+}
+
+impl Measuring {
+    fn new(name: &str, max_pps: u32, tx: tokio::sync::mpsc::Sender<pb::Round>) -> Self {
+        let seq = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let d = dropped.clone();
+        let sink: Sink = Arc::new(move |c: Completed| {
+            let round = match crate::server::stored(&c) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("routelith agent: series {}: invalid round: {e}", c.series);
+                    return true;
+                }
+            };
+            let http = crate::server::http_summary(&c).map(|(p, cert)| pb::HttpSummary {
+                connect_us: p.connect,
+                tls_us: p.tls,
+                ttfb_us: p.ttfb,
+                total_us: p.total,
+                cert_not_after_s: cert,
+            });
+            let n = seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let ok = tx
+                .try_send(rl_fed::assign::to_wire(n, c.series, &round, http))
+                .is_ok();
+            if !ok {
+                d.fetch_add(1, Ordering::Relaxed);
+            }
+            ok
+        });
+        Measuring {
+            name: name.to_string(),
+            limiter: Arc::new(RateLimiter::new(max_pps)),
+            stats: Arc::new(Stats::default()),
+            sink,
+            dropped,
+            version: None,
+            stop: None,
+            jobs: tokio::task::JoinSet::new(),
+        }
+    }
+
+    async fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(true);
+        }
+        while self.jobs.join_next().await.is_some() {}
+        self.version = None;
+    }
+
+    /// Measure what `snap` says. The same version again (after a
+    /// reconnect) keeps the running jobs.
+    async fn apply(&mut self, snap: pb::ConfigSnapshot) -> pb::ConfigApplied {
+        let mut refused = Vec::new();
+        if self.version.as_deref() == Some(snap.version.as_str()) {
+            return pb::ConfigApplied {
+                version: snap.version,
+                refused,
+            };
+        }
+        self.stop().await;
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let mut probes: HashMap<ProbeConfig, Arc<dyn Probe>> = HashMap::new();
+        let mut icmp_ok: [Option<Result<(), String>>; 2] = [None, None];
+        let mut started = 0usize;
+        for a in &snap.assignments {
+            let spec = match rl_fed::assign::spec(a) {
+                Ok(s) => s,
+                Err(e) => {
+                    refused.push(refusal(a.series_id, e.to_string()));
+                    continue;
+                }
+            };
+            let mut v6_usable = true;
+            if matches!(spec.probe, ProbeConfig::Icmp { .. }) {
+                let mut allowed = |v6: bool| {
+                    icmp_ok[usize::from(v6)]
+                        .get_or_insert_with(|| {
+                            rl_probe::check_permission(v6).map_err(|e| e.to_string())
+                        })
+                        .clone()
+                };
+                let check = match spec.family {
+                    Family::V4 => allowed(false),
+                    Family::V6 => allowed(true),
+                    _ => {
+                        v6_usable = allowed(true).is_ok();
+                        if v6_usable { Ok(()) } else { allowed(false) }
+                    }
+                };
+                if let Err(e) = check {
+                    refused.push(refusal(a.series_id, format!("cannot send ICMP: {e}")));
+                    continue;
+                }
+            }
+            let probe = match probes.get(&spec.probe) {
+                Some(p) => p.clone(),
+                None => match crate::server::make_probe(&spec.probe, &self.limiter) {
+                    Ok(p) => probes.entry(spec.probe.clone()).or_insert(p).clone(),
+                    Err(e) => {
+                        refused.push(refusal(a.series_id, e.to_string()));
+                        continue;
+                    }
+                },
+            };
+            let job = Job {
+                series: a.series_id,
+                vantage: self.name.clone(),
+                target: a.target.clone(),
+                host: spec.host,
+                family: spec.family,
+                v6_usable,
+                schedule: spec.schedule,
+            };
+            self.jobs.spawn(rl_sched::run_job(
+                job,
+                probe,
+                self.sink.clone(),
+                self.stats.clone(),
+                stop_rx.clone(),
+            ));
+            started += 1;
+        }
+        eprintln!(
+            "routelith agent: configuration {}: measuring {started} series{}",
+            snap.version,
+            if refused.is_empty() {
+                String::new()
+            } else {
+                format!(", {} refused", refused.len())
+            }
+        );
+        for r in &refused {
+            eprintln!(
+                "routelith agent: series {} refused: {}",
+                r.series_id, r.reason
+            );
+        }
+        self.stop = Some(stop_tx);
+        self.version = Some(snap.version.clone());
+        pb::ConfigApplied {
+            version: snap.version,
+            refused,
+        }
+    }
+}
+
+fn refusal(series_id: u64, reason: String) -> pb::Refusal {
+    pb::Refusal { series_id, reason }
 }
 
 /// Reconnect delays: 1, 2, 4 … 60 s; back to 1 s after a connection that

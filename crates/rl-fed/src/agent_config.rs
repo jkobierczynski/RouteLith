@@ -4,6 +4,7 @@
 //! ```toml
 //! server   = "monitor.example.be:4443"
 //! data_dir = "/var/lib/routelith-agent"
+//! max_pps  = 1000   # optional
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -18,13 +19,19 @@ pub struct AgentConfig {
     pub server: ServerAddr,
     /// Identity (key, certificate, pinned CA) and, from M3 step 3, the spool.
     pub data_dir: PathBuf,
+    /// Packets-per-second ceiling for everything this agent measures.
+    pub max_pps: u32,
 }
+
+/// Default `max_pps`, as for the server.
+pub const DEFAULT_MAX_PPS: u32 = 1_000;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
     server: String,
     data_dir: String,
+    max_pps: Option<i64>,
 }
 
 impl AgentConfig {
@@ -33,9 +40,16 @@ impl AgentConfig {
         if raw.data_dir.trim().is_empty() || raw.data_dir.contains('\0') {
             return Err(FedError::Invalid("data_dir must be a folder path".into()));
         }
+        let max_pps = match raw.max_pps {
+            None => DEFAULT_MAX_PPS,
+            Some(n) => u32::try_from(n).ok().filter(|n| *n >= 1).ok_or_else(|| {
+                FedError::Invalid("max_pps must be a whole number of 1 or more".into())
+            })?,
+        };
         Ok(AgentConfig {
             server: ServerAddr::parse(&raw.server)?,
             data_dir: PathBuf::from(raw.data_dir),
+            max_pps,
         })
     }
 
@@ -64,5 +78,8 @@ mod tests {
         assert!(AgentConfig::parse("server = \"x\"\ndata_dir = \"d\"\ntargets = 1\n").is_err());
         assert!(AgentConfig::parse("server = \"x:0\"\ndata_dir = \"d\"\n").is_err());
         assert!(AgentConfig::parse("server = \"x\"\ndata_dir = \"\"\n").is_err());
+        assert!(AgentConfig::parse("server = \"x\"\ndata_dir = \"d\"\nmax_pps = 0\n").is_err());
+        let c = AgentConfig::parse("server = \"x\"\ndata_dir = \"d\"\nmax_pps = 50\n").unwrap();
+        assert_eq!(c.max_pps, 50);
     }
 }

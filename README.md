@@ -194,13 +194,27 @@ default). On Windows it uses the ICMP helper API and needs no privileges.
 ## Agents
 
 Agents measure from other sites and report to one server (milestone M3,
-in progress: agents enroll and connect; measuring for the server comes
-next). The server accepts them on `listen_agents`:
+in progress: no on-disk spool yet, so rounds measured while the server is
+unreachable are kept in memory only). The server accepts them on
+`listen_agents`, and a group's `vantages` says who measures it:
 
 ```toml
 [server]
+vantage       = "home"
 listen_agents = "0.0.0.0:4443"
+
+[[group]]
+name     = "erp"
+vantages = ["home", "plant-genk"]   # the server and agent plant-genk
+# vantages = ["*"]                  # every enrolled agent and the server
 ```
+
+A group without `vantages` is measured by the server only. Agents get
+their targets from the server when they connect and store nothing but
+their identity; their series appear under the agent's name. Groups with
+`"*"` include agents enrolled before the server started, so restart the
+server after enrolling a new agent for them, as after any configuration
+change. An HTTP target's `ca_file` is read on the agent.
 
 At first use the server creates its own CA in `data_dir/ca/`; keep
 `ca.key` private. Enrolling an agent takes one token, made on the server:

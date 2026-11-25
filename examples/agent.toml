@@ -5,3 +5,4 @@
 
 server   = "monitor.example.be:4443"   # the server's listen_agents (port 4443 if left out)
 data_dir = "/var/lib/routelith-agent"  # identity (key, certificate, server CA)
+# max_pps = 1000                       # packets-per-second ceiling for this agent
