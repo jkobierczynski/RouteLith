@@ -42,6 +42,8 @@ message EnrollResponse {
 message AgentMessage {
   oneof msg {
     Hello hello = 1;
+    ResultBatch results = 2;
+    ConfigApplied applied = 3;
   }
 }
 
@@ -55,6 +57,8 @@ message Hello {
 message ServerMessage {
   oneof msg {
     Welcome welcome = 1;
+    ConfigSnapshot config = 2;
+    Ack ack = 3;
   }
 }
 
@@ -63,4 +67,77 @@ message Welcome {
   // The name the server knows this agent by (from its certificate).
   string name = 1;
   string server_version = 2;
+}
+
+// Everything this agent measures (§21.7 G5): sent after Welcome and
+// whenever it changes. It replaces the previous snapshot whole.
+message ConfigSnapshot {
+  // Changes whenever any assignment changes.
+  string version = 1;
+  repeated Assignment assignments = 2;
+}
+
+// One series to measure.
+message Assignment {
+  // The server's id for the series; rounds carry it back.
+  uint64 series_id = 1;
+  string target = 2;
+  // "v4", "v6" or "prefer-v6".
+  string family = 3;
+  // Host, schedule and probe settings as JSON (rl_fed::assign::Spec), so
+  // probe settings can grow without protocol changes.
+  bytes spec_json = 4;
+}
+
+// The agent took a snapshot.
+message ConfigApplied {
+  string version = 1;
+  // Series the agent will not measure, with the reason.
+  repeated Refusal refused = 2;
+}
+
+message Refusal {
+  uint64 series_id = 1;
+  string reason = 2;
+}
+
+// Finished rounds, in the order they finished (at most 1 s old).
+message ResultBatch {
+  repeated Round rounds = 1;
+}
+
+// One round, as the store keeps it (§6).
+message Round {
+  // Per agent, increasing by one per round.
+  uint64 seq = 1;
+  uint64 series_id = 2;
+  // Round start, Unix milliseconds, by the agent's clock.
+  int64 ts_ms = 3;
+  uint32 sent = 4;
+  // RTTs of the replies in microseconds, ascending.
+  repeated uint32 rtts_us = 5;
+  uint32 unreachable = 6;
+  uint32 time_exceeded = 7;
+  uint32 send_failed = 8;
+  uint32 other_errors = 9;
+  // Address measured: 4 or 16 bytes, empty if unknown.
+  bytes resolved = 10;
+  // Timing backend (rl_core::TimingBackend::code, 1 and up); 0 if unknown.
+  uint32 timing = 11;
+  uint32 flags = 12;
+  // HTTP targets: median phase times and the certificate's expiry.
+  HttpSummary http = 13;
+}
+
+message HttpSummary {
+  optional uint32 connect_us = 1;
+  optional uint32 tls_us = 2;
+  optional uint32 ttfb_us = 3;
+  optional uint32 total_us = 4;
+  optional int64 cert_not_after_s = 5;
+}
+
+// Rounds up to this seq are stored; the agent may forget them.
+message Ack {
+  uint64 up_to_seq = 1;
 }

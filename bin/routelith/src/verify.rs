@@ -96,11 +96,37 @@ fn summary(cfg: &Config, warnings: usize) -> String {
         },
         cfg.server.max_pps,
         cfg.server.vantage,
-        match warnings {
-            0 => String::new(),
-            1 => ", 1 warning".to_string(),
-            n => format!(", {n} warnings"),
-        }
+        agents_note(cfg)
+            + &match warnings {
+                0 => String::new(),
+                1 => ", 1 warning".to_string(),
+                n => format!(", {n} warnings"),
+            }
+    )
+}
+
+/// Targets measured by agents, by vantage name (`*`: every agent).
+fn agents_note(cfg: &Config) -> String {
+    if cfg.agent_targets.is_empty() {
+        return String::new();
+    }
+    let mut names: Vec<&str> = cfg
+        .agent_targets
+        .iter()
+        .flat_map(|t| t.vantages.iter().map(String::as_str))
+        .filter(|v| *v != cfg.server.vantage)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    format!(
+        "; {} target{} for agents ({})",
+        cfg.agent_targets.len(),
+        if cfg.agent_targets.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+        names.join(", ")
     )
 }
 

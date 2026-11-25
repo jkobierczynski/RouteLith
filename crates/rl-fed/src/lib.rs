@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_config;
+pub mod assign;
 pub mod ca;
 pub mod client;
 mod files;

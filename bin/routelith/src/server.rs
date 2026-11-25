@@ -1,5 +1,6 @@
 //! `routelith server`: the scheduler, the store and the HTTP side (web UI,
-//! REST API, `/metrics`) in the foreground. No agent API yet (M3).
+//! REST API, `/metrics`) in the foreground, and with `listen_agents` the
+//! agent link (M3): agents' rounds go to the same store thread.
 //!
 //! Probes run as tokio tasks, one per series. Finished rounds go through a
 //! bounded queue to one store thread, which owns the [`Writer`], fsyncs the
@@ -66,22 +67,37 @@ pub(crate) async fn serve(
         Ok(cfg) => cfg,
         Err(code) => return code,
     };
-    let plans = series_plans(&cfg);
+    // Agents named in `vantages`, plus every enrolled agent when a group
+    // says "*" (agents enrolled later get those after a restart).
+    let agent_names = match agent_vantages(&cfg) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("routelith server: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let plans = series_plans(&cfg, &agent_names);
     if plans.is_empty() {
         eprintln!("routelith server: no targets to measure");
         return ExitCode::from(1);
     }
+    let local_n = plans
+        .iter()
+        .take_while(|p| p.vantage == cfg.server.vantage)
+        .count();
+    let local = &plans[..local_n];
+    let agent_series = plans.len() - local_n;
     // An ICMP series needs an ICMP socket of its family; prefer-v6 can use
     // either. Other probes use ordinary sockets.
     let icmp = |p: &&SeriesPlan| matches!(p.probe, ProbeConfig::Icmp { .. });
-    let prefer = plans
+    let prefer = local
         .iter()
         .filter(icmp)
         .any(|p| p.family == Family::PreferV6);
     let mut usable = [true; 2];
     for v6 in [false, true] {
         let own = if v6 { Family::V6 } else { Family::V4 };
-        let required = plans.iter().filter(icmp).any(|p| p.family == own);
+        let required = local.iter().filter(icmp).any(|p| p.family == own);
         if !required && !prefer {
             continue;
         }
@@ -149,7 +165,7 @@ pub(crate) async fn serve(
     }
     let keys: Vec<SeriesKey> = plans
         .iter()
-        .map(|p| SeriesKey::new(&cfg.server.vantage, &p.target, p.family.as_str()))
+        .map(|p| SeriesKey::new(&p.vantage, &p.target, p.family.as_str()))
         .collect();
     let ids = match writer.register(&keys) {
         Ok(ids) => ids,
@@ -176,8 +192,8 @@ pub(crate) async fn serve(
     // would cut their delivery short and leave no "server stopped".
     let limiter = Arc::new(RateLimiter::new(cfg.server.max_pps));
     let mut probes: HashMap<ProbeConfig, Arc<dyn Probe>> = HashMap::new();
-    let mut plan_probes = Vec::with_capacity(plans.len());
-    for plan in &plans {
+    let mut plan_probes = Vec::with_capacity(local_n);
+    for plan in &plans[..local_n] {
         let probe = match probes.get(&plan.probe) {
             Some(p) => p.clone(),
             None => match make_probe(&plan.probe, &limiter) {
@@ -234,15 +250,18 @@ pub(crate) async fn serve(
     };
 
     // The agent side (§21.7 G2): bind now too.
+    let (agent_rounds_tx, agent_rounds_rx) = tokio::sync::mpsc::channel(64);
     let agents = match cfg.server.listen_agents {
         None => None,
         Some(addr) => {
-            let opts = rl_fed::server::ServerOptions::new(
+            let mut opts = rl_fed::server::ServerOptions::new(
                 addr,
                 cfg.server.data_dir.clone(),
                 env!("CARGO_PKG_VERSION"),
                 &cfg.server.vantage,
             );
+            opts.assignments = Arc::new(assignments(&plans[local_n..], &ids[local_n..]));
+            opts.rounds = Some(agent_rounds_tx);
             match rl_fed::server::bind(opts).await {
                 Ok(l) => Some(l),
                 Err(e) => {
@@ -297,7 +316,7 @@ pub(crate) async fn serve(
                 reader,
                 data_dir: cfg.server.data_dir.clone(),
                 host: host.clone(),
-                series: series_infos(&plans, &ids, &cfg.server.vantage),
+                series: series_infos(&plans, &ids),
                 latest: latest.clone(),
                 vantage: cfg.server.vantage.clone(),
                 started: Instant::now(),
@@ -315,7 +334,7 @@ pub(crate) async fn serve(
         }
     };
 
-    let (tx, rx) = mpsc::sync_channel::<Completed>(QUEUE);
+    let (tx, rx) = mpsc::sync_channel::<Input>(QUEUE);
     // Tells the main loop when the store thread ends early (after an error).
     let (store_done_tx, mut store_done) = tokio::sync::oneshot::channel::<()>();
     let store_latest = latest.clone();
@@ -326,7 +345,11 @@ pub(crate) async fn serve(
         let _ = store_done_tx.send(());
         r
     });
-    let sink: Sink = Arc::new(move |c| tx.try_send(c).is_ok());
+    // Agents' rounds wait for room in the queue instead of being dropped:
+    // the agent keeps them until they are acknowledged.
+    let remote_tx = tx.clone();
+    let agent_feed = tokio::spawn(feed_agent_rounds(agent_rounds_rx, remote_tx));
+    let sink: Sink = Arc::new(move |c| tx.try_send(Input::Local(c)).is_ok());
     let (health_stop, health_rx) = mpsc::channel::<()>();
     let health = match crate::health::spawn(
         cfg.server.data_dir.clone(),
@@ -344,7 +367,13 @@ pub(crate) async fn serve(
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut jobs = tokio::task::JoinSet::new();
-    for ((plan, series), probe) in plans.into_iter().zip(ids).zip(plan_probes) {
+    let local_ids: Vec<u64> = ids[..local_n].to_vec();
+    for ((plan, series), probe) in plans
+        .into_iter()
+        .take(local_n)
+        .zip(local_ids)
+        .zip(plan_probes)
+    {
         let job = Job {
             // Only ICMP depends on this process's socket permissions.
             v6_usable: usable[1] || !matches!(plan.probe, ProbeConfig::Icmp { .. }),
@@ -404,6 +433,13 @@ pub(crate) async fn serve(
         cfg.server.vantage,
         cfg.server.data_dir.display()
     );
+    if agents.is_some() && !agent_names.is_empty() {
+        eprintln!(
+            "routelith server: agents measure {} series: {}",
+            agent_series,
+            agent_names.join(", ")
+        );
+    }
 
     let interval = Duration::from_secs(args.stats_interval);
     let mut ticker = tokio::time::interval(if interval.is_zero() {
@@ -456,6 +492,7 @@ pub(crate) async fn serve(
     if let Some(a) = agents {
         a.shutdown();
     }
+    agent_feed.abort();
     while let Some(r) = jobs.join_next().await {
         if r.is_err() {
             panicked += 1;
@@ -539,6 +576,8 @@ fn load(path: &Path) -> Result<Config, ExitCode> {
 /// One series to measure, before it has an id.
 #[derive(Debug, Clone, PartialEq)]
 struct SeriesPlan {
+    /// Who measures it: the server's own vantage or an agent.
+    vantage: String,
     target: String,
     host: String,
     family: Family,
@@ -551,7 +590,10 @@ struct SeriesPlan {
 
 /// One probe instance per distinct probe configuration, all sharing the
 /// packets-per-second ceiling.
-fn make_probe(cfg: &ProbeConfig, limiter: &Arc<RateLimiter>) -> Result<Arc<dyn Probe>, ProbeError> {
+pub(crate) fn make_probe(
+    cfg: &ProbeConfig,
+    limiter: &Arc<RateLimiter>,
+) -> Result<Arc<dyn Probe>, ProbeError> {
     Ok(match cfg {
         &ProbeConfig::Tcp { port, mode } => {
             Arc::new(TcpProbe::new(TcpConfig { port, mode }).with_rate_limiter(limiter.clone()))
@@ -568,10 +610,12 @@ fn make_probe(cfg: &ProbeConfig, limiter: &Arc<RateLimiter>) -> Result<Arc<dyn P
     })
 }
 
-/// Targets as series: a `both` target measures v4 and v6 separately.
-fn series_plans(cfg: &Config) -> Vec<SeriesPlan> {
+/// Targets as series: a `both` target measures v4 and v6 separately. The
+/// server's own series come first, then each agent's.
+fn series_plans(cfg: &Config, agents: &[String]) -> Vec<SeriesPlan> {
     let mut out = Vec::new();
-    for t in &cfg.targets {
+    let own = &cfg.server.vantage;
+    let mut add = |vantage: &str, t: &rl_core::config::TargetConfig| {
         let families: &[Family] = match t.family {
             Family::Both => &[Family::V4, Family::V6],
             Family::V4 => &[Family::V4],
@@ -580,6 +624,7 @@ fn series_plans(cfg: &Config) -> Vec<SeriesPlan> {
         };
         for &family in families {
             out.push(SeriesPlan {
+                vantage: vantage.to_string(),
                 target: t.id.clone(),
                 host: t.host.clone(),
                 group: t.group.clone(),
@@ -589,8 +634,127 @@ fn series_plans(cfg: &Config) -> Vec<SeriesPlan> {
                 alerts: t.alerts.clone(),
             });
         }
+    };
+    for t in &cfg.targets {
+        add(own, t);
+    }
+    for agent in agents {
+        for t in cfg
+            .agent_targets
+            .iter()
+            .filter(|t| t.measured_by(agent, own))
+        {
+            add(agent, t);
+        }
     }
     out
+}
+
+/// The agents that measure something: those named in `vantages`, and with
+/// `"*"` every enrolled, unrevoked agent. Sorted, without the server.
+fn agent_vantages(cfg: &Config) -> Result<Vec<String>, String> {
+    if cfg.server.listen_agents.is_none() {
+        return Ok(Vec::new());
+    }
+    let own = &cfg.server.vantage;
+    let mut names: std::collections::BTreeSet<String> = cfg
+        .agent_targets
+        .iter()
+        .flat_map(|t| t.vantages.iter())
+        .filter(|v| *v != own && *v != config::ALL_VANTAGES)
+        .cloned()
+        .collect();
+    let everyone = cfg
+        .agent_targets
+        .iter()
+        .any(|t| t.vantages.iter().any(|v| v == config::ALL_VANTAGES));
+    if everyone {
+        let enrolled = rl_fed::registry::Registry::new(&cfg.server.data_dir)
+            .list()
+            .map_err(|e| e.to_string())?;
+        names.extend(
+            enrolled
+                .into_iter()
+                .filter(|a| a.revoked_ms.is_none() && &a.name != own)
+                .map(|a| a.name),
+        );
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// What each agent measures, from its plans and their series ids.
+fn assignments(plans: &[SeriesPlan], ids: &[u64]) -> rl_fed::assign::Assignments {
+    let mut by_agent: HashMap<&str, Vec<rl_fed::pb::Assignment>> = HashMap::new();
+    for (p, &id) in plans.iter().zip(ids) {
+        let spec = rl_fed::assign::Spec {
+            host: p.host.clone(),
+            family: p.family,
+            schedule: p.schedule,
+            probe: p.probe.clone(),
+        };
+        by_agent
+            .entry(&p.vantage)
+            .or_default()
+            .push(rl_fed::assign::assignment(id, &p.target, &spec));
+    }
+    let mut out = rl_fed::assign::Assignments::default();
+    for (agent, list) in by_agent {
+        out.insert(agent, list);
+    }
+    out
+}
+
+/// What the store thread takes: a round measured here, or one an agent
+/// measured (already in stored form).
+enum Input {
+    Local(Completed),
+    Remote {
+        series: u64,
+        round: StoredRound,
+        latest: LatestRound,
+    },
+}
+
+/// Move agents' batches into the store queue, waiting for room (on a
+/// blocking thread, as the queue is a std channel).
+async fn feed_agent_rounds(
+    mut rx: tokio::sync::mpsc::Receiver<rl_fed::server::AgentRounds>,
+    tx: mpsc::SyncSender<Input>,
+) {
+    while let Some(batch) = rx.recv().await {
+        let tx = tx.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            for r in &batch.rounds {
+                let round = match rl_fed::assign::from_wire(r) {
+                    Ok(round) => round,
+                    Err(e) => {
+                        eprintln!(
+                            "routelith server: agent {}: series {}: invalid round: {e}",
+                            batch.agent, r.series_id
+                        );
+                        continue;
+                    }
+                };
+                let latest = remote_latest(&round, r.http.as_ref());
+                if tx
+                    .send(Input::Remote {
+                        series: r.series_id,
+                        round,
+                        latest,
+                    })
+                    .is_err()
+                {
+                    let _ = batch.done.send(Err("the store has stopped".to_string()));
+                    return;
+                }
+            }
+            let _ = batch.done.send(Ok(()));
+        })
+        .await;
+        if result.is_err() {
+            return;
+        }
+    }
 }
 
 fn now_ms() -> i64 {
@@ -623,7 +787,7 @@ fn login_note(auth: &rl_web::Auth) -> String {
 
 /// The stored form of a finished round. A round that could not run counts
 /// every sample as an error of its cause.
-fn stored(c: &Completed) -> Result<StoredRound, rl_store::StoreError> {
+pub(crate) fn stored(c: &Completed) -> Result<StoredRound, rl_store::StoreError> {
     let flags = if c.flags & rl_sched::FLAG_CLOCK_STEP != 0 {
         rl_store::FLAG_CLOCK_STEP
     } else {
@@ -660,7 +824,7 @@ fn stored(c: &Completed) -> Result<StoredRound, rl_store::StoreError> {
 /// Returns how many rounds were rejected as invalid (and so not stored).
 fn store_loop(
     mut w: Writer,
-    rx: &mpsc::Receiver<Completed>,
+    rx: &mpsc::Receiver<Input>,
     latest: &Latest,
     counters: &Mutex<StoreCounters>,
     alerting: &mut Alerting,
@@ -693,7 +857,7 @@ fn store_loop(
 
 fn store_rounds(
     w: &mut Writer,
-    rx: &mpsc::Receiver<Completed>,
+    rx: &mpsc::Receiver<Input>,
     latest: &Latest,
     counters: &Mutex<StoreCounters>,
     alerting: &mut Alerting,
@@ -705,27 +869,20 @@ fn store_rounds(
     loop {
         let wait = next_sync.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
-            Ok(c) => match stored(&c).and_then(|r| {
-                let newest = latest_round(&c, &r);
-                // The writer takes the round; alerts need it after.
-                w.append(c.series, r.clone()).map(|a| (a, newest, r))
-            }) {
-                Ok((Appended::Stored, newest, r)) => {
-                    latest.record(c.series, newest);
-                    alerting.round(c.series, &r);
+            Ok(input) => match append(w, input) {
+                (series, Ok((Appended::Stored, newest, r))) => {
+                    latest.record(series, newest);
+                    alerting.round(series, &r);
                 }
-                Ok((Appended::Late, _, _)) => *late += 1,
-                Err(rl_store::StoreError::InvalidRound(msg)) => {
+                (_, Ok((Appended::Late, _, _))) => *late += 1,
+                (series, Err(rl_store::StoreError::InvalidRound(msg))) => {
                     *rejected += 1;
                     if last_invalid.as_deref() != Some(msg) {
-                        eprintln!(
-                            "routelith server: store: series {}: invalid round: {msg}",
-                            c.series
-                        );
+                        eprintln!("routelith server: store: series {series}: invalid round: {msg}");
                         last_invalid = Some(msg.to_string());
                     }
                 }
-                Err(e) => return Err(e),
+                (_, Err(e)) => return Err(e),
             },
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
@@ -744,6 +901,35 @@ fn store_rounds(
     }
 }
 
+/// Append one input round. Returns its series and, when it was taken,
+/// how, with the newest-round summary and the round for the alerts.
+fn append(
+    w: &mut Writer,
+    input: Input,
+) -> (
+    u64,
+    Result<(Appended, LatestRound, StoredRound), rl_store::StoreError>,
+) {
+    let (series, prepared) = match input {
+        Input::Local(c) => (
+            c.series,
+            stored(&c).map(|r| {
+                let newest = latest_round(&c, &r);
+                (r, newest)
+            }),
+        ),
+        Input::Remote {
+            series,
+            round,
+            latest,
+        } => (series, Ok((round, latest))),
+    };
+    // The writer takes the round; alerts need it after.
+    let result =
+        prepared.and_then(|(r, newest)| w.append(series, r.clone()).map(|a| (a, newest, r)));
+    (series, result)
+}
+
 /// What `/metrics` shows of the store, refreshed once a second.
 #[derive(Debug, Clone, Copy, Default)]
 struct StoreCounters {
@@ -755,7 +941,7 @@ struct StoreCounters {
 }
 
 /// The API's view of the series.
-fn series_infos(plans: &[SeriesPlan], ids: &[u64], vantage: &str) -> Vec<SeriesInfo> {
+fn series_infos(plans: &[SeriesPlan], ids: &[u64]) -> Vec<SeriesInfo> {
     plans
         .iter()
         .zip(ids)
@@ -768,7 +954,7 @@ fn series_infos(plans: &[SeriesPlan], ids: &[u64], vantage: &str) -> Vec<SeriesI
             };
             SeriesInfo {
                 id,
-                key: SeriesKey::new(vantage, &p.target, p.family.as_str()),
+                key: SeriesKey::new(&p.vantage, &p.target, p.family.as_str()),
                 group: p.group.clone(),
                 probe: probe.to_string(),
                 host: p.host.clone(),
@@ -803,26 +989,24 @@ fn median(sorted: &[u32]) -> Option<u32> {
 }
 
 /// The newest round as `/metrics` shows it.
-fn latest_round(c: &Completed, r: &StoredRound) -> LatestRound {
+/// The newest-round summary of a round an agent measured.
+fn remote_latest(r: &StoredRound, http: Option<&rl_fed::pb::HttpSummary>) -> LatestRound {
+    let mut l = summary(r);
+    if let Some(h) = http {
+        l.http_phases_us = Some(HttpPhases {
+            connect: h.connect_us,
+            tls: h.tls_us,
+            ttfb: h.ttfb_us,
+            total: h.total_us,
+        });
+        l.cert_not_after_s = h.cert_not_after_s;
+    }
+    l
+}
+
+/// The parts of the newest-round summary that come from the stored round.
+fn summary(r: &StoredRound) -> LatestRound {
     let q = |p: usize| nearest_rank(&r.rtts_us, p);
-    let http = match &c.outcome {
-        Outcome::Measured(m) => m.http.as_ref(),
-        Outcome::Failed { .. } => None,
-    };
-    let http_phases_us = http.map(|h| {
-        let done: Vec<&rl_core::round::PhaseTimings> = h.phases.iter().flatten().collect();
-        let median = |f: &dyn Fn(&rl_core::round::PhaseTimings) -> Option<u32>| {
-            let mut v: Vec<u32> = done.iter().filter_map(|p| f(p)).collect();
-            v.sort_unstable();
-            (!v.is_empty()).then(|| v[(v.len() - 1) / 2])
-        };
-        HttpPhases {
-            connect: median(&|p| Some(p.connect_us)),
-            tls: median(&|p| p.tls_us),
-            ttfb: median(&|p| Some(p.ttfb_us)),
-            total: median(&|p| Some(p.total_us)),
-        }
-    });
     LatestRound {
         ts_ms: r.ts_ms,
         sent: u32::from(r.sent),
@@ -832,11 +1016,42 @@ fn latest_round(c: &Completed, r: &StoredRound) -> LatestRound {
         p90_us: q(90),
         max_us: q(100),
         errors: r.errors.total(),
-        http_phases_us,
-        cert_not_after_s: http
-            .and_then(|h| h.cert_not_after)
-            .map(|t| to_ms(t).div_euclid(1000)),
+        http_phases_us: None,
+        cert_not_after_s: None,
     }
+}
+
+/// HTTP phase medians and certificate expiry of a measured round.
+pub(crate) fn http_summary(c: &Completed) -> Option<(HttpPhases, Option<i64>)> {
+    let http = match &c.outcome {
+        Outcome::Measured(m) => m.http.as_ref(),
+        Outcome::Failed { .. } => None,
+    }?;
+    let done: Vec<&rl_core::round::PhaseTimings> = http.phases.iter().flatten().collect();
+    let median = |f: &dyn Fn(&rl_core::round::PhaseTimings) -> Option<u32>| {
+        let mut v: Vec<u32> = done.iter().filter_map(|p| f(p)).collect();
+        v.sort_unstable();
+        (!v.is_empty()).then(|| v[(v.len() - 1) / 2])
+    };
+    let phases = HttpPhases {
+        connect: median(&|p| Some(p.connect_us)),
+        tls: median(&|p| p.tls_us),
+        ttfb: median(&|p| Some(p.ttfb_us)),
+        total: median(&|p| Some(p.total_us)),
+    };
+    Some((
+        phases,
+        http.cert_not_after.map(|t| to_ms(t).div_euclid(1000)),
+    ))
+}
+
+fn latest_round(c: &Completed, r: &StoredRound) -> LatestRound {
+    let mut l = summary(r);
+    if let Some((phases, cert)) = http_summary(c) {
+        l.http_phases_us = Some(phases);
+        l.cert_not_after_s = cert;
+    }
+    l
 }
 
 /// Scheduler and store counters for `/metrics`.
@@ -1049,7 +1264,7 @@ mod tests {
         let parsed = config::parse(src);
         let cfg = parsed.config.expect("valid config");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let fams: Vec<_> = series_plans(&cfg)
+        let fams: Vec<_> = series_plans(&cfg, &[])
             .iter()
             .map(|p| (p.target.clone(), p.family.as_str()))
             .collect();
@@ -1061,6 +1276,59 @@ mod tests {
                 ("b".to_string(), "v6")
             ]
         );
+    }
+
+    #[test]
+    fn agents_get_their_own_series_after_the_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = format!(
+            "[server]\ndata_dir = {:?}\nvantage = \"home\"\nlisten_agents = \"127.0.0.1:0\"\n\
+             [[group]]\nname = \"g\"\nvantages = [\"home\", \"genk\"]\n\
+             [[group.target]]\nname = \"a\"\nhost = \"h\"\n\
+             [[group]]\nname = \"all\"\nvantages = [\"*\"]\n\
+             [[group.target]]\nname = \"b\"\nhost = \"h\"\nfamily = \"both\"\n",
+            dir.path().display().to_string()
+        );
+        let parsed = config::parse(&src);
+        let cfg = parsed.config.expect("valid config");
+        // "*" takes in enrolled agents that are not revoked.
+        let reg = rl_fed::registry::Registry::new(dir.path());
+        for (name, revoked) in [("gent", None), ("old", Some(1))] {
+            reg.save(&rl_fed::registry::AgentRecord {
+                name: name.into(),
+                cert_sha256: name.into(),
+                enrolled_ms: 0,
+                cert_expires_ms: 0,
+                version: String::new(),
+                revoked_ms: revoked,
+            })
+            .unwrap();
+        }
+        let agents = agent_vantages(&cfg).unwrap();
+        assert_eq!(agents, ["genk", "gent"]);
+        let plans = series_plans(&cfg, &agents);
+        let got: Vec<_> = plans
+            .iter()
+            .map(|p| format!("{}/{}/{}", p.vantage, p.target, p.family.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "home/a/v4",
+                "home/b/v4",
+                "home/b/v6",
+                "genk/a/v4",
+                "genk/b/v4",
+                "genk/b/v6",
+                "gent/b/v4",
+                "gent/b/v6"
+            ]
+        );
+        let ids: Vec<u64> = (1..=8).collect();
+        let a = assignments(&plans[3..], &ids[3..]);
+        assert!(a.owns("genk", 4) && a.owns("genk", 6) && !a.owns("genk", 7));
+        assert!(a.owns("gent", 7) && !a.owns("gent", 1));
+        assert_eq!(a.snapshot("genk").assignments.len(), 3);
     }
 
     #[test]
@@ -1174,8 +1442,8 @@ mod tests {
         };
         let (tx, rx) = mpsc::sync_channel(4);
         // Year 11,000: outside what the store accepts.
-        tx.send(failed(284_000_000_000)).unwrap();
-        tx.send(failed(1_800_000_000)).unwrap();
+        tx.send(Input::Local(failed(284_000_000_000))).unwrap();
+        tx.send(Input::Local(failed(1_800_000_000))).unwrap();
         drop(tx);
         let latest = Latest::default();
         let counters = Mutex::new(StoreCounters::default());

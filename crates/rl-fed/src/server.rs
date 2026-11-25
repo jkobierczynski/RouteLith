@@ -16,6 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::server::Connected;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::assign::Assignments;
 use crate::ca::Ca;
 use crate::pb::agent_server::{Agent, AgentServer};
 use crate::pb::{self, AgentMessage, EnrollRequest, EnrollResponse, ServerMessage};
@@ -35,6 +36,20 @@ pub struct ServerOptions {
     pub recheck: Duration,
     /// How long a new stream may take to say Hello.
     pub hello_timeout: Duration,
+    /// What each agent measures.
+    pub assignments: Arc<Assignments>,
+    /// Where rounds from agents go; `None` drops them (tests).
+    pub rounds: Option<mpsc::Sender<AgentRounds>>,
+}
+
+/// Rounds from one agent, for the store. Answer on `done` once they are
+/// stored (`Ok`), or with why not; the agent gets an Ack only for `Ok`.
+#[derive(Debug)]
+pub struct AgentRounds {
+    pub agent: String,
+    /// Rounds of the agent's own series only.
+    pub rounds: Vec<pb::Round>,
+    pub done: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
 impl ServerOptions {
@@ -46,6 +61,8 @@ impl ServerOptions {
             own_vantage: own_vantage.to_string(),
             recheck: Duration::from_secs(10),
             hello_timeout: Duration::from_secs(30),
+            assignments: Arc::new(Assignments::default()),
+            rounds: None,
         }
     }
 }
@@ -71,6 +88,19 @@ pub enum AgentEvent {
     },
     /// An agent or would-be agent was turned away.
     Refused { addr: SocketAddr, reason: String },
+    /// An agent took its configuration.
+    Configured {
+        name: String,
+        series: usize,
+        /// Series it will not measure, with why.
+        refused: Vec<(u64, String)>,
+    },
+    /// Rounds an agent sent that could not be taken (counted per batch).
+    Dropped {
+        name: String,
+        rounds: usize,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for AgentEvent {
@@ -94,6 +124,22 @@ impl std::fmt::Display for AgentEvent {
                 write!(f, "agent {name} at {addr} disconnected: {reason}")
             }
             AgentEvent::Refused { addr, reason } => write!(f, "refused {addr}: {reason}"),
+            AgentEvent::Configured {
+                name,
+                series,
+                refused,
+            } => {
+                write!(f, "agent {name} measures {series} series")?;
+                for (id, why) in refused {
+                    write!(f, "; refused series {id}: {why}")?;
+                }
+                Ok(())
+            }
+            AgentEvent::Dropped {
+                name,
+                rounds,
+                reason,
+            } => write!(f, "agent {name}: dropped {rounds} round(s): {reason}"),
         }
     }
 }
@@ -433,6 +479,13 @@ impl Agent for Svc {
             })),
         };
         out.send(Ok(welcome)).await.map_err(internal)?;
+        let snapshot = self.opts.assignments.snapshot(&rec.name);
+        let assigned = snapshot.assignments.len();
+        out.send(Ok(ServerMessage {
+            msg: Some(pb::server_message::Msg::Config(snapshot)),
+        }))
+        .await
+        .map_err(internal)?;
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -455,6 +508,7 @@ impl Agent for Svc {
         let active = self.active.clone();
         let registry = self.registry.clone();
         let recheck = self.opts.recheck;
+        let opts = self.opts.clone();
         tokio::spawn(async move {
             let name = rec.name.clone();
             let mut tick = tokio::time::interval(recheck);
@@ -462,7 +516,31 @@ impl Agent for Svc {
             let reason = loop {
                 tokio::select! {
                     m = inbound.message() => match m {
-                        // Nothing else to handle yet (results come in step 2).
+                        Ok(Some(AgentMessage { msg: Some(pb::agent_message::Msg::Results(b)) })) => {
+                            match take_rounds(&opts, &name, b.rounds, &events).await {
+                                Ok(Some(up_to_seq)) => {
+                                    let ack = ServerMessage {
+                                        msg: Some(pb::server_message::Msg::Ack(pb::Ack { up_to_seq })),
+                                    };
+                                    if out.send(Ok(ack)).await.is_err() {
+                                        break "the stream closed".to_string();
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(why) => {
+                                    let _ = out.send(Err(Status::unavailable(why.clone()))).await;
+                                    break why;
+                                }
+                            }
+                        }
+                        Ok(Some(AgentMessage { msg: Some(pb::agent_message::Msg::Applied(a)) })) => {
+                            let _ = events.try_send(AgentEvent::Configured {
+                                name: name.clone(),
+                                series: assigned.saturating_sub(a.refused.len()),
+                                refused: a.refused.into_iter().map(|r| (r.series_id, r.reason)).collect(),
+                            });
+                        }
+                        // Unknown messages from newer agents are ignored.
                         Ok(Some(_)) => {}
                         Ok(None) => break "the agent closed the stream".to_string(),
                         Err(s) => break format!("stream error: {}", s.message()),
@@ -507,6 +585,47 @@ impl Agent for Svc {
         });
         Ok(Response::new(ReceiverStream::new(out_rx)))
     }
+}
+
+/// Hand a batch to the store. Returns the seq to acknowledge, `None` when
+/// there is nothing to acknowledge, or why the stream must end.
+async fn take_rounds(
+    opts: &ServerOptions,
+    name: &str,
+    rounds: Vec<pb::Round>,
+    events: &mpsc::Sender<AgentEvent>,
+) -> Result<Option<u64>, String> {
+    let Some(up_to) = rounds.iter().map(|r| r.seq).max() else {
+        return Ok(None);
+    };
+    let total = rounds.len();
+    let own: Vec<pb::Round> = rounds
+        .into_iter()
+        .filter(|r| opts.assignments.owns(name, r.series_id))
+        .collect();
+    if own.len() < total {
+        let _ = events.try_send(AgentEvent::Dropped {
+            name: name.to_string(),
+            rounds: total - own.len(),
+            reason: "series not assigned to this agent".into(),
+        });
+    }
+    if let (Some(tx), false) = (&opts.rounds, own.is_empty()) {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        tx.send(AgentRounds {
+            agent: name.to_string(),
+            rounds: own,
+            done,
+        })
+        .await
+        .map_err(|_| "the server is shutting down".to_string())?;
+        match wait.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err("the server is shutting down".to_string()),
+        }
+    }
+    Ok(Some(up_to))
 }
 
 impl Svc {
