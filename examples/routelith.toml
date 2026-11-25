@@ -70,6 +70,18 @@ groups   = ["Internet"]          # or targets = [...]; neither: every target
 rrule    = "FREQ=WEEKLY;BYDAY=SU;BYHOUR=2;BYMINUTE=0"
 duration = "2h"
 
+# Service levels, checked by the monthly SLA report (`routelith ctl report
+# sla`, or the link on the overview): availability is the share of rounds
+# that got at least one reply; latency is checked at a percentile of every
+# reply in the month (default 95). Give any of the three.
+[[sla]]
+name         = "internet"
+groups       = ["Internet"]       # or targets = [...]; neither: every target
+availability = "99.9%"
+loss         = "1%"
+latency      = "40ms"
+percentile   = 95
+
 # Events sent on as they happen. Each output has its own queue and thread,
 # so one that is down never slows the others or the store. Filters (all
 # optional): events (alert_raised, alert_cleared, ip_changed,

@@ -129,6 +129,21 @@ alerts are still logged and shown, and outputs do not send them unless an
 output sets `quiet = true`. See
 `examples/routelith.toml`.
 
+SLA reports check targets against `[[sla]]` tables (some `targets` or
+`groups`, or every target): `availability = "99.9%"` (the share of rounds
+that got at least one reply), `loss = "1%"` and `latency = "20ms"` at
+`percentile = 95`. A month's report (UTC) comes from the hourly tier, kept
+400 days, as a print-ready HTML page (print it to PDF from the browser) or
+CSV: `routelith ctl report sla -c routelith.toml --month 2026-11
+--format html|csv -o report.html`, or `GET
+/api/v1/reports/sla?month=2026-11&format=csv`; the overview links last
+month's and this month's. Each target also shows how much of the month was
+measured, and time the server was not measuring counts neither for nor
+against it. Hours stored by a version before this one did not count rounds
+without a reply; they are counted from the raw rounds while those are kept
+(30 days), and otherwise estimated from the hour's loss, which the report
+says.
+
 History from SmokePing comes over with `routelith ctl import smokeping`,
 with the server stopped. It reads `rrdtool dump` XML, so the RRD files can
 be dumped on the SmokePing machine and copied over:

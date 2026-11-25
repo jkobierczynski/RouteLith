@@ -148,6 +148,7 @@ pub(crate) async fn alerts(State(s): State<Arc<AppState>>) -> Response {
         "active": list,
         "rules": s.alerts.rules,
         "silences": silences,
+        "slas": s.slas.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(),
     }))
     .into_response()
 }

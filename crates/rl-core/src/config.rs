@@ -79,6 +79,36 @@ pub struct Config {
     pub silences: Vec<crate::silence::Silence>,
     /// Outputs, in file order (§21.5 F7).
     pub outputs: Vec<Output>,
+    /// Service levels the SLA report checks, in file order (§21.5 F13).
+    pub slas: Vec<Sla>,
+}
+
+/// A `[[sla]]` table: what its targets must reach each month.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sla {
+    pub name: String,
+    /// Targets it covers; with `groups` empty too, every target.
+    pub targets: Vec<String>,
+    pub groups: Vec<String>,
+    /// Least share of rounds with a reply, in percent.
+    pub availability: Option<f64>,
+    /// Most loss over the month, in percent.
+    pub loss: Option<f64>,
+    /// Most latency at `percentile`, in microseconds.
+    pub latency_us: Option<u32>,
+    /// The percentile `latency` is checked at, 50 to 99.
+    pub percentile: u8,
+    /// Line of the table, for messages.
+    pub line: usize,
+}
+
+impl Sla {
+    /// Whether it covers `target` of `group`.
+    pub fn covers(&self, target: &str, group: &str) -> bool {
+        (self.targets.is_empty() && self.groups.is_empty())
+            || self.targets.iter().any(|t| t == target)
+            || self.groups.iter().any(|g| g == group)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +259,12 @@ pub struct HttpUrl {
     pub host: String,
     pub port: u16,
     pub path: String,
+}
+
+/// `"99.9%"` as 99.9; `None` unless 0 to 100 with a `%`.
+pub fn parse_percent(s: &str) -> Option<f64> {
+    let v: f64 = s.trim().strip_suffix('%')?.trim().parse().ok()?;
+    (v.is_finite() && (0.0..=100.0).contains(&v)).then_some(v)
 }
 
 /// Parse an absolute `http` or `https` URL without user info or fragment.
@@ -530,6 +566,23 @@ struct RawConfig {
     silences: Vec<Spanned<RawSilence>>,
     #[serde(default, rename = "output")]
     outputs: Vec<Spanned<RawOutput>>,
+    #[serde(default, rename = "sla")]
+    slas: Vec<Spanned<RawSla>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSla {
+    name: Spanned<String>,
+    targets: Option<Spanned<Vec<String>>>,
+    groups: Option<Spanned<Vec<String>>>,
+    availability: Option<Spanned<String>>,
+    loss: Option<Spanned<String>>,
+    latency: Option<Spanned<String>>,
+    percentile: Option<Spanned<i64>>,
+    /// Free text for people; not used.
+    #[allow(dead_code)]
+    comment: Option<Spanned<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -849,6 +902,7 @@ impl Validator<'_> {
         self.parents(&parents, &target_names, &targets);
         let silences = self.silences(&raw.silences, &target_names, &group_names);
         let outputs = self.outputs(&raw.outputs, &target_names, &group_names);
+        let slas = self.slas(&raw.slas, &target_names, &group_names);
 
         let server = server?;
         // Packets per day as integers (every step divides a day), so a
@@ -891,7 +945,116 @@ impl Validator<'_> {
             alerts,
             silences,
             outputs,
+            slas,
         })
+    }
+
+    /// The `[[sla]]` tables (§21.5 F13).
+    fn slas(
+        &mut self,
+        raw: &[Spanned<RawSla>],
+        targets: &HashMap<String, usize>,
+        groups: &HashMap<String, Range<usize>>,
+    ) -> Vec<Sla> {
+        let mut out = Vec::new();
+        let mut first_line: HashMap<String, usize> = HashMap::new();
+        for s in raw {
+            let line = self.position(s.span().start).0;
+            let errors_before = self.error_count();
+            let span = s.span();
+            let s = s.get_ref();
+            let name = s.name.get_ref().clone();
+            if !valid_name(&name) {
+                self.error(&s.name.span(), name_rule("sla name"));
+            } else if let Some(first) = first_line.get(&name) {
+                self.error(
+                    &s.name.span(),
+                    format!("duplicate sla name {name:?} (first defined on line {first})"),
+                );
+            } else {
+                first_line.insert(name.clone(), line);
+            }
+            let mut list =
+                |v: &Option<Spanned<Vec<String>>>, what: &str, known: &dyn Fn(&str) -> bool| {
+                    let Some(v) = v else {
+                        return Vec::new();
+                    };
+                    for n in v.get_ref() {
+                        if !known(n) {
+                            self.error(&v.span(), format!("sla {name:?}: unknown {what} {n:?}"));
+                        }
+                    }
+                    v.get_ref().clone()
+                };
+            let t = list(&s.targets, "target", &|n| targets.contains_key(n));
+            let g = list(&s.groups, "group", &|n| groups.contains_key(n));
+            let percent = |v: &Option<Spanned<String>>, key: &str, me: &mut Self| {
+                let v = v.as_ref()?;
+                match parse_percent(v.get_ref()) {
+                    Some(p) => Some(p),
+                    None => {
+                        me.error(
+                            &v.span(),
+                            format!("sla {name:?}: {key} must be a percentage from 0% to 100%, as in \"99.9%\""),
+                        );
+                        None
+                    }
+                }
+            };
+            let availability = percent(&s.availability, "availability", self);
+            let loss = percent(&s.loss, "loss", self);
+            let latency_us = s.latency.as_ref().and_then(|v| {
+                let d = self.duration("latency", v)?;
+                match u32::try_from(d.as_micros()) {
+                    Ok(us) if us > 0 => Some(us),
+                    _ => {
+                        self.error(
+                            &v.span(),
+                            format!("sla {name:?}: latency must be above 0 and below an hour"),
+                        );
+                        None
+                    }
+                }
+            });
+            let percentile = match &s.percentile {
+                None => 95,
+                Some(p) => match u8::try_from(*p.get_ref()) {
+                    Ok(p) if (50..=99).contains(&p) => p,
+                    _ => {
+                        self.error(
+                            &p.span(),
+                            format!("sla {name:?}: percentile must be 50 to 99"),
+                        );
+                        95
+                    }
+                },
+            };
+            if let (Some(p), None) = (&s.percentile, &s.latency) {
+                self.error(
+                    &p.span(),
+                    format!("sla {name:?}: percentile applies with latency only"),
+                );
+            }
+            if s.availability.is_none() && s.loss.is_none() && s.latency.is_none() {
+                self.error(
+                    &span,
+                    format!("sla {name:?} needs availability, loss or latency"),
+                );
+            }
+            if self.error_count() == errors_before {
+                out.push(Sla {
+                    name,
+                    targets: t,
+                    groups: g,
+                    availability,
+                    loss,
+                    latency_us,
+                    percentile,
+                    line,
+                });
+            }
+        }
+        out
     }
 
     /// `parent` settings: each names another target, and they form no loop.
@@ -3575,6 +3738,62 @@ graph    = "off"
             "{:?}",
             errors(&local)
         );
+    }
+
+    #[test]
+    fn slas_parse_and_mistakes_are_reported() {
+        let src = format!(
+            "{MINIMAL}\n[[sla]]\nname = \"core\"\ngroups = [\"Core\"]\navailability = \"99.9%\"\n\
+             loss = \"0.5 %\"\nlatency = \"20ms\"\npercentile = 90\n\n\
+             [[sla]]\nname = \"all\"\navailability = \"99%\"\n"
+        );
+        let p = parse(&src);
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let c = p.config.unwrap();
+        assert_eq!(c.slas.len(), 2);
+        let s = &c.slas[0];
+        assert_eq!(
+            (s.availability, s.loss, s.latency_us, s.percentile),
+            (Some(99.9), Some(0.5), Some(20_000), 90)
+        );
+        assert!(s.covers("core-fw", "Core") && !s.covers("x", "Other"));
+        assert_eq!((c.slas[1].percentile, c.slas[1].latency_us), (95, None));
+        assert!(c.slas[1].covers("anything", "Other"));
+
+        for (sla, message) in [
+            ("name = \"x\"\n", "needs availability, loss or latency"),
+            (
+                "name = \"x\"\navailability = \"99.9\"\n",
+                "must be a percentage",
+            ),
+            ("name = \"x\"\nloss = \"101%\"\n", "must be a percentage"),
+            (
+                "name = \"x\"\nlatency = \"0ms\"\n",
+                "latency must be above 0",
+            ),
+            (
+                "name = \"x\"\nlatency = \"5ms\"\npercentile = 100\n",
+                "percentile must be 50 to 99",
+            ),
+            (
+                "name = \"x\"\nloss = \"1%\"\npercentile = 90\n",
+                "percentile applies with latency only",
+            ),
+            (
+                "name = \"x\"\nloss = \"1%\"\ntargets = [\"nope\"]\n",
+                "unknown target \"nope\"",
+            ),
+            (
+                "name = \"x\"\nloss = \"1%\"\n\n[[sla]]\nname = \"x\"\nloss = \"1%\"\n",
+                "duplicate sla name",
+            ),
+        ] {
+            let errs = errors(&format!("{MINIMAL}\n[[sla]]\n{sla}"));
+            assert!(
+                errs.iter().any(|e| e.contains(message)),
+                "{message}: {errs:?}"
+            );
+        }
     }
 
     #[test]

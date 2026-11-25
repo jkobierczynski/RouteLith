@@ -411,6 +411,8 @@ fn convert(d: &Dump, today: i64) -> Result<Converted, String> {
                     sent: pdp.saturating_mul(u32::from(sent)),
                     received,
                     quantiles_us: quantiles(&rtts),
+                    // An averaged RRD row cannot tell a down round.
+                    down: None,
                 },
             ));
         }
@@ -732,6 +734,7 @@ mod tests {
                     sent: rounds,
                     received: rounds,
                     quantiles_us: vec![w as u32; rl_store::QUANTILES],
+                    down: None,
                 },
             )
         };

@@ -139,6 +139,7 @@ form.silence button[type="submit"] {
 form.silence button:disabled { opacity: 0.6; cursor: wait; }
 .error { color: var(--alert); }
 ul.silences { font-size: 13px; }
+p.reports { margin-top: 12px; font-size: 13px; }
 
 main { padding: 16px; max-width: 1200px; }
 h1 { font-size: 18px; margin: 0 0 4px; }

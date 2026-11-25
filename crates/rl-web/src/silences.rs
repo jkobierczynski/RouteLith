@@ -86,7 +86,7 @@ impl Default for Silences {
 }
 
 /// `2026-12-01T22:00:00.000Z`, which [`parse_time`] reads back exactly.
-fn stamp(ms: i64) -> String {
+pub(crate) fn stamp(ms: i64) -> String {
     const DAY: i64 = 86_400_000;
     let (y, m, d) = civil_from_days(ms.div_euclid(DAY));
     let t = ms.rem_euclid(DAY);

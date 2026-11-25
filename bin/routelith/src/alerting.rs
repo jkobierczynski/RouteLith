@@ -780,6 +780,7 @@ mod tests {
             sent: 1200,
             received: 1141,
             quantiles_us: (1..=rl_store::QUANTILES as u32).map(|i| i * 1000).collect(),
+            down: Some(0),
         };
         let v = hour_values(&p);
         let loss = v.metric(rl_core::alert::Metric::Loss).unwrap();
