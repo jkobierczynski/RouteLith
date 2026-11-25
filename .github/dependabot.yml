@@ -13,6 +13,10 @@ updates:
         versions: [">= 0.14.6"]
       - dependency-name: tonic-prost
         versions: [">= 0.14.6"]
+      # 0.6 pulls in ctutils, whose constant-time fix (RUSTSEC-2026-0385,
+      # ctutils 0.4.4) needs Rust 1.87. Stay on 0.5 until the MSRV moves.
+      - dependency-name: argon2
+        versions: [">= 0.6"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
