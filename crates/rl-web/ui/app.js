@@ -419,7 +419,7 @@
       const [data, alerts] = await Promise.all([getJson("/api/v1/latest"), getJson("/api/v1/alerts")]);
       if (gen !== generation) return;
       showAlerts(alertPanel, alerts);
-      if (reports.hidden && alerts.slas && alerts.slas.length) showReports(reports, alerts.now);
+      if (reports.hidden) showReports(reports, alerts.now, alerts.slas && alerts.slas.length > 0);
       const alerting = new Map();
       for (const a of alerts.active) {
         if (!alerting.has(a.series)) alerting.set(a.series, []);
@@ -454,8 +454,9 @@
     poll(gen, refresh, OVERVIEW_REFRESH_MS);
   }
 
-  // Links to the SLA reports (UTC months): last month and this one so far.
-  function showReports(p, now) {
+  // Links to the reports (UTC months): the incident timeline of this
+  // month, and the SLA reports of last month and this one so far.
+  function showReports(p, now, slas) {
     const d = new Date(now);
     const month = (y, m) => {
       const t = new Date(Date.UTC(y, m, 1));
@@ -463,13 +464,22 @@
     };
     const last = month(d.getUTCFullYear(), d.getUTCMonth() - 1);
     const current = month(d.getUTCFullYear(), d.getUTCMonth());
-    const link = (m, format, text) =>
-      el("a", { href: "/api/v1/reports/sla?month=" + m + "&format=" + format, target: "_blank", rel: "noopener", text });
-    p.replaceChildren(
-      "SLA report: ",
-      link(last, "html", last), " (", link(last, "csv", "CSV"), ") · ",
-      link(current, "html", current + " so far"), " (", link(current, "csv", "CSV"), ")"
-    );
+    const link = (kind, m, format, text) =>
+      el("a", { href: "/api/v1/reports/" + kind + "?month=" + m + "&format=" + format, target: "_blank", rel: "noopener", text });
+    const parts = [
+      "Incidents: ",
+      link("incidents", current, "html", current), " (", link("incidents", current, "csv", "CSV"), ", ",
+      link("incidents", current, "json", "JSON"), ") · ",
+      link("incidents", last, "html", last),
+    ];
+    if (slas) {
+      parts.push(
+        " · SLA report: ",
+        link("sla", last, "html", last), " (", link("sla", last, "csv", "CSV"), ") · ",
+        link("sla", current, "html", current + " so far"), " (", link("sla", current, "csv", "CSV"), ")"
+      );
+    }
+    p.replaceChildren(...parts);
     p.hidden = false;
   }
 

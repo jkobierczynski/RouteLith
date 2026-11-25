@@ -202,6 +202,7 @@ fn fixture() -> Fixture {
             percentile: 95,
             line: 1,
         }],
+        parents: Default::default(),
     };
     Fixture {
         _dir: dir,
@@ -624,6 +625,32 @@ async fn sla_reports_come_as_html_or_csv() {
 
     for bad in ["month=2026-13", "month=9999-01", "format=pdf"] {
         let (st, _, body) = get(&f.router, &format!("/api/v1/reports/sla?{bad}")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn incident_timelines_come_as_html_json_or_csv() {
+    let f = fixture();
+    let (st, h, body) = get(&f.router, "/api/v1/reports/incidents?month=2026-10").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(h["content-type"].to_str().unwrap().starts_with("text/html"));
+    assert!(body.contains("Incident timeline, 2026-10"), "{body}");
+    let (st, h, body) = get(
+        &f.router,
+        "/api/v1/reports/incidents?month=2026-10&format=json",
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        h["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains("routelith-incidents-2026-10.json")
+    );
+    assert_eq!(json(&body)["incidents"].as_array().map(Vec::len), Some(0));
+    for bad in ["month=2026-13", "format=pdf", "gap=5000", "month=9999-01"] {
+        let (st, _, body) = get(&f.router, &format!("/api/v1/reports/incidents?{bad}")).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {body}");
     }
 }

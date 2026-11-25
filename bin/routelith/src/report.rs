@@ -1,5 +1,6 @@
-//! `routelith ctl report sla`: a month's SLA report (doc §21.5 F13) as
-//! print-ready HTML or CSV, read from the store; the server may run.
+//! `routelith ctl report sla` and `incidents`: a month's SLA report (doc
+//! §21.5 F13) as print-ready HTML or CSV, and its NIS2 incident timeline
+//! (F14) as HTML, JSON or CSV, read from the store; the server may run.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -125,6 +126,117 @@ fn report(args: &SlaArgs, now: i64) -> Result<Option<String>, (u8, String)> {
                 } else {
                     ""
                 }
+            )))
+        }
+    }
+}
+
+/// Each target's parent.
+pub(crate) fn parents(cfg: &Config) -> std::collections::HashMap<String, String> {
+    cfg.targets
+        .iter()
+        .filter_map(|t| Some((t.id.clone(), t.parent.clone()?)))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum IncidentFormat {
+    Html,
+    Json,
+    Csv,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct IncidentArgs {
+    /// Configuration file, for the targets' parents and data directory.
+    #[arg(short, long)]
+    config: PathBuf,
+    /// The month, as 2026-11 (UTC; default: this month).
+    #[arg(long)]
+    month: Option<String>,
+    #[arg(long, value_enum, default_value = "html")]
+    format: IncidentFormat,
+    /// Alerts starting within this long after the last one ended join its
+    /// incident.
+    #[arg(long, default_value = "15m")]
+    gap: String,
+    /// Write here instead of standard output.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+pub(crate) fn run_incidents(args: &IncidentArgs) -> ExitCode {
+    match incidents(args, now_ms()) {
+        Ok(Some(msg)) => {
+            eprintln!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Ok(None) => ExitCode::SUCCESS,
+        Err((code, msg)) => {
+            eprintln!("routelith ctl report incidents: {msg}");
+            ExitCode::from(code)
+        }
+    }
+}
+
+fn incidents(args: &IncidentArgs, now: i64) -> Result<Option<String>, (u8, String)> {
+    use rl_web::incidents;
+    let src = std::fs::read_to_string(&args.config)
+        .map_err(|e| (2, format!("{}: {e}", args.config.display())))?;
+    let cfg = config::parse(&src).config.ok_or_else(|| {
+        (
+            2,
+            format!(
+                "{} is invalid; check it with `routelith ctl verify`",
+                args.config.display()
+            ),
+        )
+    })?;
+    let month = match &args.month {
+        Some(m) => {
+            Month::parse(m).ok_or_else(|| (1, format!("month {m:?}: write it as 2026-11")))?
+        }
+        None => Month::of(now),
+    };
+    let gap = rl_core::duration::parse(&args.gap)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .filter(|&ms| ms <= 86_400_000)
+        .ok_or_else(|| {
+            (
+                1,
+                format!("gap {:?}: a duration up to 24h, as in 15m", args.gap),
+            )
+        })?;
+    // Peaks need the store; the timeline itself only the event log.
+    let reader = Reader::open(&cfg.server.data_dir).ok();
+    let t = incidents::for_month(
+        &cfg.server.data_dir,
+        reader.as_ref(),
+        &parents(&cfg),
+        &cfg.server.vantage,
+        month,
+        gap,
+        now,
+    )
+    .map_err(|e| (1, e))?;
+    let body = match args.format {
+        IncidentFormat::Html => incidents::html(&t),
+        IncidentFormat::Json => incidents::json(&t),
+        IncidentFormat::Csv => incidents::csv(&t),
+    };
+    match &args.output {
+        None => {
+            print!("{body}");
+            Ok(None)
+        }
+        Some(path) => {
+            std::fs::write(path, body).map_err(|e| (2, format!("{}: {e}", path.display())))?;
+            Ok(Some(format!(
+                "wrote {} incident{} of {month} to {}",
+                t.incidents.len(),
+                if t.incidents.len() == 1 { "" } else { "s" },
+                path.display()
             )))
         }
     }

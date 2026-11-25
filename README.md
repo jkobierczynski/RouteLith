@@ -144,6 +144,23 @@ without a reply; they are counted from the raw rounds while those are kept
 (30 days), and otherwise estimated from the hour's loss, which the report
 says.
 
+The NIS2 incident timeline builds incidents from the event log: alerts on a
+target and its children (through `parent`) belong to the same incident, and
+alerts that start within the gap (15 minutes by default) after the last one
+ended join it too; an incident still open takes in every later alert below
+the same root. Each incident shows when the degradation began, when the first
+alert was raised, when it recovered, the affected targets with each alert's
+peak loss and median, address changes and server restarts in between, and the
+deadlines counted from detection: the early warning within 24 hours, the
+notification within 72 hours and the final report a month after that.
+Incidents where every alert was silenced are marked planned. Whether an
+incident is significant under NIS2 is for people to decide. A month's
+timeline (UTC) comes as HTML, JSON or CSV: `routelith ctl report incidents
+-c routelith.toml --month 2026-11 --format html|json|csv --gap 15m -o
+incidents.html`, or `GET
+/api/v1/reports/incidents?month=2026-11&format=json&gap=15` (the gap in
+minutes); the overview links this month's and last month's.
+
 History from SmokePing comes over with `routelith ctl import smokeping`,
 with the server stopped. It reads `rrdtool dump` XML, so the RRD files can
 be dumped on the SmokePing machine and copied over:
