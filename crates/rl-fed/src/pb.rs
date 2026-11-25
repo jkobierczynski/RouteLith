@@ -56,6 +56,13 @@ pub struct Hello {
     /// Operating system and architecture, e.g. "linux x86_64".
     #[prost(string, tag = "2")]
     pub os: ::prost::alloc::string::String,
+    /// The agent's spool (§21.7 G8): random, made when the spool is created.
+    /// Seqs count within one spool; a new spool starts again at 1.
+    #[prost(uint64, tag = "3")]
+    pub spool_id: u64,
+    /// The highest seq the agent has an Ack for.
+    #[prost(uint64, tag = "4")]
+    pub acked_seq: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ServerMessage {
@@ -82,6 +89,10 @@ pub struct Welcome {
     pub name: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub server_version: ::prost::alloc::string::String,
+    /// The highest seq of this spool the server has stored (0 if none): the
+    /// agent resends from the one after it.
+    #[prost(uint64, tag = "3")]
+    pub stored_seq: u64,
 }
 /// Everything this agent measures (§21.7 G5): sent after Welcome and
 /// whenever it changes. It replaces the previous snapshot whole.
@@ -125,7 +136,8 @@ pub struct Refusal {
     #[prost(string, tag = "2")]
     pub reason: ::prost::alloc::string::String,
 }
-/// Finished rounds, in the order they finished (at most 1 s old).
+/// Rounds in seq order: new ones within 1 s of finishing, or older ones
+/// replayed from the spool after an outage.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResultBatch {
     #[prost(message, repeated, tag = "1")]
@@ -180,7 +192,8 @@ pub struct HttpSummary {
     #[prost(int64, optional, tag = "5")]
     pub cert_not_after_s: ::core::option::Option<i64>,
 }
-/// Rounds up to this seq are stored; the agent may forget them.
+/// Rounds up to this seq are stored and synced to disk; the agent may
+/// forget them.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Ack {
     #[prost(uint64, tag = "1")]

@@ -194,9 +194,8 @@ default). On Windows it uses the ICMP helper API and needs no privileges.
 ## Agents
 
 Agents measure from other sites and report to one server (milestone M3,
-in progress: no on-disk spool yet, so rounds measured while the server is
-unreachable are kept in memory only). The server accepts them on
-`listen_agents`, and a group's `vantages` says who measures it:
+in progress). The server accepts them on `listen_agents`, and a group's
+`vantages` says who measures it:
 
 ```toml
 [server]
@@ -210,8 +209,8 @@ vantages = ["home", "plant-genk"]   # the server and agent plant-genk
 ```
 
 A group without `vantages` is measured by the server only. Agents get
-their targets from the server when they connect and store nothing but
-their identity; their series appear under the agent's name. Groups with
+their targets from the server when they connect; their series appear
+under the agent's name. Groups with
 `"*"` include agents enrolled before the server started, so restart the
 server after enrolling a new agent for them, as after any configuration
 change. An HTTP target's `ca_file` is read on the agent.
@@ -244,6 +243,19 @@ ctl agent list` shows enrolled agents and waiting tokens; `routelith ctl
 agent revoke <name>` refuses an agent's certificate from then on and drops
 its stream within 10 seconds. Enrolling an agent again (with a new token)
 replaces its certificate.
+
+Every round an agent measures goes to its spool, `data_dir/spool/`, before
+it is sent, and stays there until the server has stored it and synced it
+to disk. While the server is unreachable the agent keeps measuring; when
+it is back the agent sends the backlog in order, and the server drops any
+round it already has, so an outage or a restart on either side loses
+nothing and stores nothing twice. The spool is bounded at 512 MB or 30
+days (`spool_max_mb`, `spool_max_days` in `agent.toml`); beyond that the
+oldest rounds are dropped and the agent logs how many. Alerts raised or
+cleared by a round more than 10 minutes old are marked late (`"late":
+true` in JSON outputs, "late:" before the message elsewhere), so a replay
+does not read as something happening now. The server keeps how far it got
+with each agent in `data_dir/agents.json`.
 
 ## Running as a service
 

@@ -1614,6 +1614,7 @@ name = "rl-fed"
 version = "0.0.0"
 dependencies = [
  "base64 0.23.1",
+ "crc32c",
  "hyper-util",
  "prost",
  "rcgen",
