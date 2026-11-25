@@ -1,0 +1,7 @@
+# Example Routelith agent configuration. The agent measures what the
+# server assigns to it; targets are never listed here.
+#   routelith agent enroll -c agent.toml --token rlt1-…   (once)
+#   routelith agent run -c agent.toml
+
+server   = "monitor.example.be:4443"   # the server's listen_agents (port 4443 if left out)
+data_dir = "/var/lib/routelith-agent"  # identity (key, certificate, server CA)

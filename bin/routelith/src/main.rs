@@ -1,10 +1,11 @@
 //! The `routelith` binary: one executable, several modes (architecture doc §3).
 //!
 //! `server`, `service install|uninstall`, `check icmp|tcp|dns|http`,
-//! `ctl calibrate`, `ctl verify`, `ctl render`, `ctl import smokeping` and
-//! `ctl user` work.
+//! `ctl calibrate`, `ctl verify`, `ctl render`, `ctl import smokeping`,
+//! `ctl user`, `ctl agent` and `agent enroll|run` work.
 #![forbid(unsafe_code)]
 
+mod agent;
 mod alerting;
 mod calibrate;
 mod check;
@@ -37,6 +38,11 @@ enum Command {
     Check {
         #[command(subcommand)]
         probe: CheckProbe,
+    },
+    /// Run as an agent that measures for a server (§21.7).
+    Agent {
+        #[command(subcommand)]
+        action: agent::AgentAction,
     },
     /// Install, remove or run the server as a Windows Service.
     Service {
@@ -79,6 +85,8 @@ enum CtlAction {
     },
     /// Add, change and remove the web UI's users.
     User(user::UserArgs),
+    /// Enrollment tokens and enrolled agents.
+    Agent(agent::CtlAgentArgs),
     /// Reports from the store.
     Report {
         #[command(subcommand)]
@@ -123,6 +131,10 @@ fn main() -> ExitCode {
         } => run(verify::run(args)),
         Command::Server(args) => run(server::run(args)),
         Command::Service { action } => service::run(action),
+        Command::Agent { action } => agent::agent(action),
+        Command::Ctl {
+            action: CtlAction::Agent(args),
+        } => agent::ctl(args),
         Command::Ctl {
             action: CtlAction::Render(args),
         } => render::run(&args),

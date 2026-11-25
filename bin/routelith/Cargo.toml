@@ -19,6 +19,7 @@ rl-store.workspace = true
 rl-sys.workspace = true
 rl-web.workspace = true
 rl-out.workspace = true
+rl-fed.workspace = true
 # 0.20: newer releases need a newer Rust than the 1.85 MSRV.
 roxmltree = "0.20"
 # Asks for passwords in `ctl user` without echoing them.

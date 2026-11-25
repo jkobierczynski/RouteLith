@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["bin/routelith", "crates/*"]
+# Code generator for the agent protocol; needs a newer Rust than the MSRV.
+exclude = ["crates/rl-fed/gen"]
 
 [workspace.package]
 version = "0.0.0"
@@ -20,12 +22,14 @@ rl-store = { path = "crates/rl-store" }
 rl-render = { path = "crates/rl-render" }
 rl-web = { path = "crates/rl-web" }
 rl-out = { path = "crates/rl-out" }
+rl-fed = { path = "crates/rl-fed" }
 crc32c = "0.6"
 # 0.26 needs Rust 1.88, above the 1.85 MSRV.
 hickory-proto = { version = "0.25.2", default-features = false, features = ["std"] }
 # Password hashes for UI users (§21.5 F11); salts come from ring.
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 http-body-util = "0.1"
@@ -35,8 +39,11 @@ hyper-util = { version = "0.1.10", default-features = false, features = ["tokio"
 # CA certificates, no native-tls or OpenSSL.
 lettre = { version = "0.11.24", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "rustls-native-certs"] }
 libc = "0.2"
+# Agent protocol (§21.7 G2): 0.14.6 and later need Rust 1.88.
+prost = "0.14"
 proptest = "1.11"
-rcgen = "0.14"
+# The server CA signs agent certificates from their CSRs (§21.7 G3, G4).
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 redb = "2.6"
 regex = "1.11"
 ring = "0.17"
@@ -51,6 +58,8 @@ socket2 = { version = "0.6", features = ["all"] }
 tempfile = "3"
 thiserror = "2"
 toml = "1.2"
+tonic = { version = "0.14.5", default-features = false, features = ["codegen", "router", "server", "channel"] }
+tonic-prost = "0.14.5"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 zstd = "0.14"

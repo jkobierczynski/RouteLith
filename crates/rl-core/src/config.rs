@@ -129,6 +129,9 @@ pub struct ServerConfig {
     pub anonymous: bool,
     /// Certificate and key for TLS on `listen_ui`.
     pub tls: Option<UiTls>,
+    /// Where agents connect (gRPC with mutual TLS, §21.7 G2); `None`
+    /// unless set.
+    pub listen_agents: Option<std::net::SocketAddr>,
 }
 
 /// PEM files for TLS on the web UI.
@@ -2178,12 +2181,22 @@ impl Validator<'_> {
             },
             None => DEFAULT_MAX_PPS,
         };
-        if let Some(v) = &raw.listen_agents {
-            self.warning(
-                &v.span(),
-                "listen_agents is ignored until agents arrive (milestone M3)",
-            );
-        }
+        let listen_agents = match &raw.listen_agents {
+            None => None,
+            Some(v) if v.get_ref().trim() == "off" => None,
+            Some(v) => match v.get_ref().trim().parse::<std::net::SocketAddr>() {
+                Ok(a) => Some(a),
+                Err(_) => {
+                    self.error(
+                        &v.span(),
+                        "listen_agents must be an address and port such as \"0.0.0.0:4443\" \
+                         or \"[::]:4443\", or \"off\"",
+                    );
+                    ok = false;
+                    None
+                }
+            },
+        };
         let listen_ui = match &raw.listen_ui {
             None => DEFAULT_LISTEN_UI.parse().ok(),
             Some(v) if v.get_ref().trim() == "off" => None,
@@ -2250,6 +2263,7 @@ impl Validator<'_> {
             users_file: users_file.unwrap_or_default(),
             anonymous,
             tls,
+            listen_agents,
         })
     }
 
@@ -4528,6 +4542,28 @@ vantages = ["local", "hasselt", "antwerp"]
         assert_eq!((h.port, h.path.as_str()), (443, "/health"));
         assert_eq!(h.expect_status, vec![(200, 299)]);
         assert_eq!(h.metric, HttpMetric::Ttfb);
+    }
+
+    #[test]
+    fn listen_agents_is_an_address_or_off() {
+        let at = |v: &str| {
+            let p = parse(&format!(
+                "[server]\ndata_dir = \"d\"\nlisten_agents = \"{v}\"\n[[group]]\nname = \"g\"\n\
+                 [[group.target]]\nname = \"t\"\nhost = \"192.0.2.1\"\n"
+            ));
+            let errors: Vec<String> = p.errors().map(|d| d.message.clone()).collect();
+            (p.config.map(|c| c.server.listen_agents), errors)
+        };
+        let (a, e) = at("0.0.0.0:4443");
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(a, Some(Some("0.0.0.0:4443".parse().unwrap())));
+        assert_eq!(at("off").0, Some(None));
+        let (a, e) = at("4443");
+        assert!(a.is_none());
+        assert!(
+            e.iter().any(|m| m.contains("listen_agents must be")),
+            "{e:?}"
+        );
     }
 
     #[test]

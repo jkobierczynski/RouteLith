@@ -233,6 +233,26 @@ pub(crate) async fn serve(
         }
     };
 
+    // The agent side (§21.7 G2): bind now too.
+    let agents = match cfg.server.listen_agents {
+        None => None,
+        Some(addr) => {
+            let opts = rl_fed::server::ServerOptions::new(
+                addr,
+                cfg.server.data_dir.clone(),
+                env!("CARGO_PKG_VERSION"),
+                &cfg.server.vantage,
+            );
+            match rl_fed::server::bind(opts).await {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    eprintln!("routelith server: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    };
+
     // Alerts: the engine, its event log, and the state of the last run.
     let alert_series: Vec<crate::alerting::SeriesAlerts> = plans
         .iter()
@@ -362,6 +382,21 @@ pub(crate) async fn serve(
             let _ = stop.wait_for(|s| *s).await;
         }))
     });
+    let agents = agents.map(|mut l| {
+        eprintln!(
+            "routelith server: agents connect to {} (CA fingerprint SHA-256 {}); \
+             add one with `routelith ctl agent add <name>`",
+            l.local_addr,
+            rl_fed::fingerprint_text(&l.ca_sha256)
+        );
+        let mut events = l.take_events();
+        tokio::spawn(async move {
+            while let Some(e) = events.recv().await {
+                eprintln!("routelith server: {e}");
+            }
+        });
+        l
+    });
     eprintln!(
         "routelith server: measuring {} series of {} targets from vantage {:?}, data in {}",
         jobs.len(),
@@ -418,6 +453,9 @@ pub(crate) async fn serve(
 
     eprintln!("routelith server: stopping");
     let _ = stop_tx.send(true);
+    if let Some(a) = agents {
+        a.shutdown();
+    }
     while let Some(r) = jobs.join_next().await {
         if r.is_err() {
             panicked += 1;
@@ -975,7 +1013,7 @@ fn stats_line(s: &Snapshot, window: &str) -> String {
 /// Ctrl-C everywhere, SIGTERM on Unix.
 /// Install the Ctrl-C and SIGTERM handlers now; the returned future
 /// completes on the first signal.
-fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+pub(crate) fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};

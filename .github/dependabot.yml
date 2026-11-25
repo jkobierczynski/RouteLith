@@ -8,6 +8,11 @@ updates:
       # 0.26 needs Rust 1.88, above the 1.85 MSRV.
       - dependency-name: hickory-proto
         versions: [">= 0.26"]
+      # 0.14.6 and later need Rust 1.88 (agent protocol, rl-fed).
+      - dependency-name: tonic
+        versions: [">= 0.14.6"]
+      - dependency-name: tonic-prost
+        versions: [">= 0.14.6"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

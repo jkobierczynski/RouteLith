@@ -11,6 +11,7 @@ data_dir = "/var/lib/routelith"
 # users_file = "/etc/routelith/users.toml"  # default: users.toml in data_dir;
 #                     # add users with `routelith ctl user add NAME --role ROLE`
 # anonymous = true    # with users: read without logging in (wall displays)
+# listen_agents = "0.0.0.0:4443"  # accept agents (gRPC, mutual TLS); off unless set
 
 # Settings here apply to every target unless a group or target overrides them.
 [defaults]
