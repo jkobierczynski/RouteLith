@@ -22,4 +22,4 @@ png = ["dep:resvg"]
 resvg = { version = "0.45.1", default-features = false, features = ["text"], optional = true }
 
 [dev-dependencies]
-png = "0.17"
+png = "0.18"
