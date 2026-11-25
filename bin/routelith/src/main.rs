@@ -90,6 +90,8 @@ enum CtlAction {
 enum ReportKind {
     /// A month's SLA report, as print-ready HTML or CSV.
     Sla(report::SlaArgs),
+    /// A month's NIS2 incident timeline, as HTML, JSON or CSV.
+    Incidents(report::IncidentArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +140,12 @@ fn main() -> ExitCode {
                 kind: ReportKind::Sla(args),
             },
         } => report::run(&args),
+        Command::Ctl {
+            action:
+                CtlAction::Report {
+                    kind: ReportKind::Incidents(args),
+                },
+        } => report::run_incidents(&args),
     }
 }
 

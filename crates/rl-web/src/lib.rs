@@ -13,6 +13,7 @@ mod alerts;
 mod api;
 pub mod auth;
 mod host;
+pub mod incidents;
 mod metrics;
 pub mod silences;
 pub mod sla;
@@ -154,6 +155,8 @@ pub struct AppState {
     pub auth: Arc<Auth>,
     /// The `[[sla]]` tables, for the SLA report.
     pub slas: Vec<rl_core::config::Sla>,
+    /// Each target's parent, for the incident timeline.
+    pub parents: std::collections::HashMap<String, String>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -179,6 +182,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/alerts", get(alerts::alerts))
         .route("/api/v1/events", get(alerts::events))
         .route("/api/v1/reports/sla", get(sla::handler))
+        .route("/api/v1/reports/incidents", get(incidents::handler))
         .route("/api/v1/silences", post(silences::create))
         .route("/api/v1/silences/{name}", delete(silences::end_now))
         .route("/api/v1/render/{file}", get(api::render))
