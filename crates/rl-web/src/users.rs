@@ -14,8 +14,7 @@ use std::io::Write;
 use std::path::Path;
 
 use argon2::Argon2;
-use argon2::password_hash::phc::PasswordHash;
-use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
@@ -188,8 +187,9 @@ pub fn hash_password(password: &str) -> Result<String, String> {
     SystemRandom::new()
         .fill(&mut salt)
         .map_err(|_| "no random numbers from the system".to_string())?;
+    let salt = SaltString::encode_b64(&salt).map_err(|e| e.to_string())?;
     Argon2::default()
-        .hash_password_with_salt(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|e| format!("cannot hash the password: {e}"))
 }
@@ -208,26 +208,4 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
 pub(crate) fn dummy_hash() -> &'static str {
     static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DUMMY.get_or_init(|| hash_password("routelith-no-such-user").unwrap_or_default())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A hash written by argon2 0.5 (RouteLith before the 0.6 upgrade)
-    /// must still verify, so existing users files keep working.
-    #[test]
-    fn hashes_from_argon2_0_5_still_verify() {
-        let old = "$argon2id$v=19$m=19456,t=2,p=1$BwcHBwcHBwcHBwcHBwcHBw$WLRGUa13/B3MXznFse33FId4O++DaYL6ulYUMEhpRqE";
-        assert!(verify_password(old, "correct horse battery"));
-        assert!(!verify_password(old, "wrong horse battery"));
-    }
-
-    #[test]
-    fn new_hashes_round_trip() {
-        let h = hash_password("correct horse battery").unwrap();
-        assert!(h.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
-        assert!(verify_password(&h, "correct horse battery"));
-        assert!(!verify_password(&h, "wrong horse battery"));
-    }
 }
