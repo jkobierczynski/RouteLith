@@ -1,0 +1,15 @@
+# Generates ../src/pb.rs from ../proto/agent.proto. Not part of the
+# workspace: tonic-prost-build needs a newer Rust than the 1.85 MSRV, and
+# only developers who change the protocol run it.
+[package]
+name = "rl-fed-gen"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace]
+
+[dependencies]
+tonic-prost-build = "=0.14.5"
+protoc-bin-vendored = "3"

@@ -191,6 +191,46 @@ On Linux, ICMP runs without root through ping sockets; the user's group must
 be inside `net.ipv4.ping_group_range` (most distributions allow every group by
 default). On Windows it uses the ICMP helper API and needs no privileges.
 
+## Agents
+
+Agents measure from other sites and report to one server (milestone M3,
+in progress: agents enroll and connect; measuring for the server comes
+next). The server accepts them on `listen_agents`:
+
+```toml
+[server]
+listen_agents = "0.0.0.0:4443"
+```
+
+At first use the server creates its own CA in `data_dir/ca/`; keep
+`ca.key` private. Enrolling an agent takes one token, made on the server:
+
+```console
+$ routelith ctl agent add plant-genk -c routelith.toml
+Enrollment token for agent plant-genk, valid for 24h, works once:
+
+rlt1-…
+```
+
+The agent needs only a small configuration file, `agent.toml`:
+
+```toml
+server   = "monitor.example.be:4443"
+data_dir = "/var/lib/routelith-agent"
+```
+
+```console
+$ routelith agent enroll -c agent.toml --token rlt1-…
+$ routelith agent run -c agent.toml
+```
+
+The token carries the fingerprint of the server's CA, so the agent trusts
+only that server, and the agent's private key never leaves it. `routelith
+ctl agent list` shows enrolled agents and waiting tokens; `routelith ctl
+agent revoke <name>` refuses an agent's certificate from then on and drops
+its stream within 10 seconds. Enrolling an agent again (with a new token)
+replaces its certificate.
+
 ## Running as a service
 
 **Linux (systemd):** `packaging/linux/routelith.service` runs
@@ -229,8 +269,9 @@ not signed yet.
 | `crates/rl-alert` | Alert engine: thresholds with hysteresis, SmokePing patterns |
 | `crates/rl-web` | HTTP server: REST API, `/metrics`, the web UI (plain JS in `ui/`) |
 | `crates/rl-out` | Outputs: syslog (UDP, TCP, TLS) and JSON-lines files, each with its own queue |
+| `crates/rl-fed` | Agents: gRPC protocol (`proto/`, generated code checked in; `gen/` regenerates it), server CA, enrollment |
 
-Later milestones add `rl-path`, `rl-fed` and `rl-reflector`.
+Later milestones add `rl-path` and `rl-reflector`.
 
 ## Building
 

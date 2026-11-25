@@ -1,0 +1,66 @@
+// Routelith agent protocol (architecture doc §9, §21.7 G2).
+//
+// Changes within routelith.agent.v1 are additive only: new fields and
+// messages get new numbers, nothing is renumbered or removed, so a server
+// talks to agents of its own and the previous version.
+//
+// The Rust code in src/pb.rs is generated from this file and checked in,
+// so building Routelith needs no protoc. After changing this file run
+// `cargo run -p rl-fed-gen` in crates/rl-fed/gen (see its README).
+syntax = "proto3";
+
+package routelith.agent.v1;
+
+service Agent {
+  // Trade a single-use enrollment token for a client certificate. Called
+  // without a client certificate; the agent checks the server against the
+  // CA fingerprint inside the token.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+
+  // The agent's one long-lived stream, with its client certificate.
+  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
+}
+
+message EnrollRequest {
+  // The token's secret part (the CA fingerprint stays on the agent).
+  bytes secret = 1;
+  // PKCS#10 certificate signing request for the agent's own key.
+  bytes csr_der = 2;
+  // Agent version, for the server's log.
+  string version = 3;
+}
+
+message EnrollResponse {
+  // The agent's name, as given to `routelith ctl agent add`.
+  string name = 1;
+  // The signed client certificate.
+  bytes cert_der = 2;
+  // The server's CA certificate, which the agent pins from now on.
+  bytes ca_der = 3;
+}
+
+message AgentMessage {
+  oneof msg {
+    Hello hello = 1;
+  }
+}
+
+// First message on every stream.
+message Hello {
+  string version = 1;
+  // Operating system and architecture, e.g. "linux x86_64".
+  string os = 2;
+}
+
+message ServerMessage {
+  oneof msg {
+    Welcome welcome = 1;
+  }
+}
+
+// Answer to Hello.
+message Welcome {
+  // The name the server knows this agent by (from its certificate).
+  string name = 1;
+  string server_version = 2;
+}
