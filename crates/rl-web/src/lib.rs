@@ -137,6 +137,9 @@ fn round2(v: f64) -> f64 {
 /// store counters).
 pub type ExtraMetrics = Arc<dyn Fn(&mut MetricsWriter) + Send + Sync>;
 
+/// The agents' state for `/api/v1/agents`, as a JSON array (§21.7 G12).
+pub type AgentsJson = Arc<dyn Fn() -> serde_json::Value + Send + Sync>;
+
 /// Everything the handlers need.
 pub struct AppState {
     pub reader: Arc<Reader>,
@@ -157,6 +160,8 @@ pub struct AppState {
     pub slas: Vec<rl_core::config::Sla>,
     /// Each target's parent, for the incident timeline.
     pub parents: std::collections::HashMap<String, String>,
+    /// Enrolled agents and their state; `None` without `listen_agents`.
+    pub agents: Option<AgentsJson>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -177,6 +182,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/logout", post(auth::logout))
         .route("/api/v1/latest", get(api::latest))
         .route("/api/v1/series", get(api::series))
+        .route("/api/v1/agents", get(api::agents))
         .route("/api/v1/series/{id}/data", get(api::data))
         .route("/api/v1/health", get(host::history))
         .route("/api/v1/alerts", get(alerts::alerts))

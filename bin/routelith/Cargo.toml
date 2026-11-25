@@ -24,6 +24,7 @@ rl-fed.workspace = true
 roxmltree = "0.21"
 # Asks for passwords in `ctl user` without echoing them.
 rpassword = "7.3"
+serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -34,7 +35,6 @@ windows-service.workspace = true
 embed-resource = "3.0.12"
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

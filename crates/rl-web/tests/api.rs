@@ -203,6 +203,7 @@ fn fixture() -> Fixture {
             line: 1,
         }],
         parents: Default::default(),
+        agents: None,
     };
     Fixture {
         _dir: dir,

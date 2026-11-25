@@ -43,11 +43,7 @@ fn run(
     let mut log: Option<HealthLog> = None;
     // One message per change between storing and not storing.
     let mut failing = false;
-    let mut prev: Option<Baseline> = None;
-    loop {
-        let t = now_ms();
-        let cur = rl_sys::host::read();
-        let s = sample(prev.as_ref(), &cur, t);
+    every_minute(stop, now_ms, |s, cur| {
         // Opened (again) each minute until it works: a full disk or a
         // permission fixed later lets history resume without a restart.
         if log.is_none() {
@@ -78,9 +74,23 @@ fn run(
             sample: s,
             nics: cur.nics.iter().flatten().map(total).collect(),
         });
+    });
+}
+
+/// Take a sample now and then on every whole minute (UTC, so samples line
+/// up across machines and restarts), handing each to `f`, until `stop`.
+pub(crate) fn every_minute(
+    stop: &Receiver<()>,
+    now_ms: fn() -> i64,
+    mut f: impl FnMut(HealthSample, &HostReading),
+) {
+    let mut prev: Option<Baseline> = None;
+    loop {
+        let t = now_ms();
+        let cur = rl_sys::host::read();
+        let s = sample(prev.as_ref(), &cur, t);
+        f(s, &cur);
         prev = Some(baseline(prev, cur, t));
-        // Sleep to the next whole minute (UTC), so samples line up across
-        // machines and restarts.
         let wait = MINUTE_MS - now_ms().rem_euclid(MINUTE_MS);
         let wait = Duration::from_millis(u64::try_from(wait).unwrap_or(0).max(1));
         match stop.recv_timeout(wait) {

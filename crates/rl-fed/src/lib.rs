@@ -16,6 +16,7 @@ pub mod registry;
 pub mod seen;
 pub mod server;
 pub mod spool;
+pub mod status;
 mod tls;
 pub mod token;
 
@@ -78,4 +79,11 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Current Unix time in microseconds (0 before 1970).
+pub fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }

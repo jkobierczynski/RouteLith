@@ -262,6 +262,7 @@ pub(crate) async fn serve(
             );
             opts.assignments = Arc::new(assignments(&plans[local_n..], &ids[local_n..]));
             opts.rounds = Some(agent_rounds_tx);
+            opts.health = Some(spawn_health_writer(cfg.server.data_dir.clone()));
             match rl_fed::server::bind(opts).await {
                 Ok(l) => Some(l),
                 Err(e) => {
@@ -324,7 +325,11 @@ pub(crate) async fn serve(
                     stats.clone(),
                     store_stats.clone(),
                     output_stats.clone(),
+                    agents.as_ref().map(|l| l.board.clone()),
                 )),
+                agents: agents
+                    .as_ref()
+                    .map(|l| agents_json(l.board.clone(), cfg.server.data_dir.clone())),
                 alerts: board.clone(),
                 auth: auth.clone(),
                 slas: cfg.slas.clone(),
@@ -349,6 +354,7 @@ pub(crate) async fn serve(
     // the agent keeps them until they are acknowledged.
     let remote_tx = tx.clone();
     let agent_feed = tokio::spawn(feed_agent_rounds(agent_rounds_rx, remote_tx));
+    let event_tx = tx.clone();
     let sink: Sink = Arc::new(move |c| tx.try_send(Input::Local(c)).is_ok());
     let (health_stop, health_rx) = mpsc::channel::<()>();
     let health = match crate::health::spawn(
@@ -421,13 +427,8 @@ pub(crate) async fn serve(
         for note in &l.notes {
             eprintln!("routelith server: warning: {note}");
         }
-        let mut events = l.take_events();
-        tokio::spawn(async move {
-            while let Some(e) = events.recv().await {
-                eprintln!("routelith server: {e}");
-            }
-        });
-        l
+        let events = l.take_events();
+        (l, tokio::spawn(log_agent_events(events, event_tx)))
     });
     eprintln!(
         "routelith server: measuring {} series of {} targets from vantage {:?}, data in {}",
@@ -492,8 +493,10 @@ pub(crate) async fn serve(
 
     eprintln!("routelith server: stopping");
     let _ = stop_tx.send(true);
-    if let Some(a) = agents {
+    if let Some((a, events)) = agents {
         a.shutdown();
+        // It holds a store sender: the store ends only once it is gone.
+        events.abort();
     }
     agent_feed.abort();
     while let Some(r) = jobs.join_next().await {
@@ -718,6 +721,146 @@ enum Input {
         latest: LatestRound,
     },
     Synced(tokio::sync::oneshot::Sender<Result<(), String>>),
+    /// An event about an agent (§21.7 G10), for the event log.
+    Event(rl_store::Event),
+}
+
+/// An agent event as the event log keeps it, if it goes there.
+fn agent_event(e: &rl_fed::server::AgentEvent, now_ms: i64) -> Option<rl_store::Event> {
+    use rl_fed::server::AgentEvent as A;
+    use rl_store::EventKind as K;
+    let (kind, t, value) = match e {
+        A::Enrolled { .. } => (K::AgentEnrolled, now_ms, None),
+        A::Up { .. } => (K::AgentConnected, now_ms, None),
+        A::Down { since_ms, .. } => (K::AgentDisconnected, *since_ms, None),
+        A::Revoked { .. } => (K::AgentRevoked, now_ms, None),
+        A::ClockSkewed { offset_ms, .. } => (K::AgentClockSkew, now_ms, Some(offset_ms.round())),
+        A::ClockOk { offset_ms, .. } => (K::AgentClockOk, now_ms, Some(offset_ms.round())),
+        #[allow(clippy::cast_precision_loss)]
+        A::RoundsLost { rounds, .. } => (K::AgentRoundsLost, now_ms, Some(*rounds as f64)),
+        _ => return None,
+    };
+    let mut ev = rl_store::Event::new(t, kind, e.agent()?, e.to_string());
+    ev.value = value;
+    Some(ev)
+}
+
+/// Log every agent event, and hand those that belong in the event log to
+/// the store thread.
+async fn log_agent_events(
+    mut rx: tokio::sync::mpsc::Receiver<rl_fed::server::AgentEvent>,
+    tx: mpsc::SyncSender<Input>,
+) {
+    while let Some(e) = rx.recv().await {
+        match agent_event(&e, now_ms()) {
+            Some(ev) => {
+                let tx = tx.clone();
+                let sent =
+                    tokio::task::spawn_blocking(move || tx.send(Input::Event(ev)).is_ok()).await;
+                if !matches!(sent, Ok(true)) {
+                    return;
+                }
+            }
+            // The store thread says these.
+            None => eprintln!("routelith server: {e}"),
+        }
+    }
+}
+
+/// Store agents' health snapshots (§21.7 G10) under their names, as the
+/// server's own are under its vantage.
+fn spawn_health_writer(
+    data_dir: PathBuf,
+) -> tokio::sync::mpsc::Sender<rl_fed::server::AgentHealth> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<rl_fed::server::AgentHealth>(64);
+    std::thread::spawn(move || {
+        let mut logs: HashMap<String, rl_store::health::HealthLog> = HashMap::new();
+        let mut last_error: Option<String> = None;
+        while let Some(h) = rx.blocking_recv() {
+            let result = serde_json::from_slice::<rl_store::health::HealthSample>(&h.sample_json)
+                .map_err(|e| format!("agent {}: invalid health snapshot: {e}", h.agent))
+                .and_then(|sample| {
+                    let log = match logs.entry(h.agent.clone()) {
+                        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(v) => v.insert(
+                            rl_store::health::HealthLog::open(
+                                &data_dir,
+                                &h.agent,
+                                crate::health::KEEP_DAYS,
+                            )
+                            .map_err(|e| format!("agent {}: {e}", h.agent))?,
+                        ),
+                    };
+                    log.append(&sample)
+                        .map_err(|e| format!("agent {}: {e}", h.agent))
+                });
+            if let Err(msg) = result {
+                if last_error.as_deref() != Some(msg.as_str()) {
+                    eprintln!("routelith server: cannot store a health snapshot: {msg}");
+                    last_error = Some(msg);
+                }
+            }
+        }
+    });
+    tx
+}
+
+/// `/api/v1/agents`: every enrolled agent and every one seen since the
+/// start, with what the server knows of it now.
+fn agents_json(board: Arc<rl_fed::status::Board>, data_dir: PathBuf) -> rl_web::AgentsJson {
+    Arc::new(move || {
+        let registry = rl_fed::registry::Registry::new(&data_dir);
+        let records = registry.list().unwrap_or_default();
+        let mut live: HashMap<String, rl_fed::status::AgentStatus> = board
+            .snapshot()
+            .into_iter()
+            .map(|s| (s.name.clone(), s))
+            .collect();
+        let mut out = Vec::new();
+        let mut names: Vec<String> = records.iter().map(|r| r.name.clone()).collect();
+        names.extend(
+            live.keys()
+                .filter(|n| !records.iter().any(|r| &r.name == *n))
+                .cloned(),
+        );
+        names.sort();
+        for name in names {
+            let rec = records.iter().find(|r| r.name == name);
+            let s = live
+                .remove(&name)
+                .unwrap_or_else(|| rl_fed::status::AgentStatus {
+                    name: name.clone(),
+                    ..Default::default()
+                });
+            out.push(serde_json::json!({
+                "name": name,
+                "enrolled_ms": rec.map(|r| r.enrolled_ms),
+                "cert_expires_ms": rec.map(|r| r.cert_expires_ms),
+                "revoked_ms": rec.and_then(|r| r.revoked_ms),
+                "connected": s.connected,
+                "addr": s.addr.map(|a| a.to_string()),
+                "version": if s.version.is_empty() { rec.map(|r| r.version.clone()) } else { Some(s.version.clone()) },
+                "os": (!s.os.is_empty()).then_some(s.os.clone()),
+                "capabilities": s.capabilities,
+                "connected_ms": s.connected_ms,
+                "last_seen_ms": s.last_seen_ms,
+                "clock_offset_ms": s.clock_offset_ms,
+                "clock_delay_ms": s.clock_delay_ms,
+                "clock_skewed": s.clock_skewed,
+                "timing": s.timing.iter()
+                    .filter_map(|&c| rl_core::TimingBackend::from_code(c))
+                    .map(rl_core::TimingBackend::describe)
+                    .collect::<Vec<_>>(),
+                "spool_bytes": s.spool_bytes,
+                "spool_backlog": s.spool_backlog,
+                "rounds_lost": s.rounds_lost,
+                "refused": s.refused.iter()
+                    .map(|(id, why)| serde_json::json!({"series": id, "reason": why}))
+                    .collect::<Vec<_>>(),
+            }));
+        }
+        serde_json::Value::Array(out)
+    })
 }
 
 /// Move agents' batches into the store queue, waiting for room (on a
@@ -880,6 +1023,7 @@ fn store_rounds(
         let wait = next_sync.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
             Ok(Input::Synced(done)) => synced.push(done),
+            Ok(Input::Event(e)) => alerting.event(e),
             Ok(input) => match append(w, input) {
                 (series, Ok((Appended::Stored, newest, r))) => {
                     latest.record(series, newest);
@@ -937,7 +1081,9 @@ fn append(
             round,
             latest,
         } => (series, Ok((round, latest))),
-        Input::Synced(_) => unreachable!("store_rounds answers sync requests itself"),
+        Input::Synced(_) | Input::Event(_) => {
+            unreachable!("store_rounds handles sync requests and events itself")
+        }
     };
     // The writer takes the round; alerts need it after.
     let result =
@@ -1074,6 +1220,7 @@ fn extra_metrics(
     stats: Arc<Stats>,
     store: Arc<Mutex<StoreCounters>>,
     outputs: Vec<Arc<rl_out::OutputStats>>,
+    agents: Option<Arc<rl_fed::status::Board>>,
 ) -> rl_web::ExtraMetrics {
     Arc::new(move |m: &mut MetricsWriter| {
         let s = stats.snapshot(false);
@@ -1169,7 +1316,68 @@ fn extra_metrics(
             }
         }
         output_metrics(m, &outputs);
+        if let Some(board) = &agents {
+            agent_metrics(m, &board.snapshot());
+        }
     })
+}
+
+/// Per-agent gauges (§21.7 G10, G12), labelled with the agent's name.
+fn agent_metrics(m: &mut MetricsWriter, agents: &[rl_fed::status::AgentStatus]) {
+    m.family(
+        "routelith_agent_connected",
+        "gauge",
+        "Whether the agent is connected now (1) or not (0).",
+    );
+    for a in agents {
+        m.sample(
+            "routelith_agent_connected",
+            &[("agent", &a.name)],
+            if a.connected { 1.0 } else { 0.0 },
+        );
+    }
+    m.family(
+        "routelith_agent_clock_offset_seconds",
+        "gauge",
+        "Agent clock minus server clock.",
+    );
+    for a in agents {
+        if let Some(ms) = a.clock_offset_ms {
+            m.sample(
+                "routelith_agent_clock_offset_seconds",
+                &[("agent", &a.name)],
+                ms / 1000.0,
+            );
+        }
+    }
+    m.family(
+        "routelith_agent_spool_bytes",
+        "gauge",
+        "Bytes of rounds in the agent's spool.",
+    );
+    for a in agents {
+        if let Some(b) = a.spool_bytes {
+            #[allow(clippy::cast_precision_loss)]
+            m.sample(
+                "routelith_agent_spool_bytes",
+                &[("agent", &a.name)],
+                b as f64,
+            );
+        }
+    }
+    m.family(
+        "routelith_agent_rounds_lost_total",
+        "counter",
+        "Rounds the agent measured that never arrived, since the server started.",
+    );
+    for a in agents {
+        #[allow(clippy::cast_precision_loss)]
+        m.sample(
+            "routelith_agent_rounds_lost_total",
+            &[("agent", &a.name)],
+            a.rounds_lost as f64,
+        );
+    }
 }
 
 /// Per-output counters (§21.5 F7), labelled with the output's name and type.
@@ -1291,6 +1499,79 @@ mod tests {
                 ("b".to_string(), "v6")
             ]
         );
+    }
+
+    #[test]
+    fn agent_events_reach_the_event_log_with_their_values() {
+        use rl_fed::server::AgentEvent as A;
+        use rl_store::EventKind as K;
+        let e = agent_event(
+            &A::ClockSkewed {
+                name: "genk".into(),
+                offset_ms: 150.4,
+            },
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            (e.kind, e.t, e.value),
+            (K::AgentClockSkew, 1_000, Some(150.0))
+        );
+        assert_eq!(e.vantage, "genk");
+        assert!(e.series.is_none() && e.target.is_none());
+        let e = agent_event(
+            &A::Down {
+                name: "genk".into(),
+                since_ms: 400,
+            },
+            1_000,
+        )
+        .unwrap();
+        assert_eq!((e.kind, e.t), (K::AgentDisconnected, 400));
+        let e = agent_event(
+            &A::RoundsLost {
+                name: "genk".into(),
+                rounds: 7,
+            },
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(e.value, Some(7.0));
+        // Per-connection news stays in the server's log.
+        assert!(
+            agent_event(
+                &A::Connected {
+                    name: "genk".into(),
+                    addr: "192.0.2.7:1".parse().unwrap(),
+                    version: "1".into(),
+                    os: "linux".into(),
+                },
+                1_000,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn agent_gauges_carry_the_agents_name() {
+        let mut m = MetricsWriter::default();
+        agent_metrics(
+            &mut m,
+            &[rl_fed::status::AgentStatus {
+                name: "genk".into(),
+                connected: true,
+                clock_offset_ms: Some(-12.0),
+                spool_bytes: Some(4096),
+                ..Default::default()
+            }],
+        );
+        let text = m.finish();
+        assert!(
+            text.contains("routelith_agent_connected{agent=\"genk\"} 1"),
+            "{text}"
+        );
+        assert!(text.contains("routelith_agent_clock_offset_seconds{agent=\"genk\"} -0.012"));
+        assert!(text.contains("routelith_agent_spool_bytes{agent=\"genk\"} 4096"));
     }
 
     #[test]

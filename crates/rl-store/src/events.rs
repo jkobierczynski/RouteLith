@@ -34,6 +34,19 @@ pub enum EventKind {
     IpChanged,
     ServerStarted,
     ServerStopped,
+    /// Agents (§21.7 G11); the vantage is the agent.
+    AgentEnrolled,
+    /// Connected for the first time since the server started, or again
+    /// after a reported outage.
+    AgentConnected,
+    /// Gone for a minute.
+    AgentDisconnected,
+    AgentRevoked,
+    /// Clock off by more than 100 ms; `value` is the offset in ms.
+    AgentClockSkew,
+    AgentClockOk,
+    /// Rounds its spool dropped; `value` is how many.
+    AgentRoundsLost,
     /// A kind written by a newer version.
     #[serde(other)]
     Unknown,
@@ -47,6 +60,13 @@ impl EventKind {
             EventKind::IpChanged => "ip_changed",
             EventKind::ServerStarted => "server_started",
             EventKind::ServerStopped => "server_stopped",
+            EventKind::AgentEnrolled => "agent_enrolled",
+            EventKind::AgentConnected => "agent_connected",
+            EventKind::AgentDisconnected => "agent_disconnected",
+            EventKind::AgentRevoked => "agent_revoked",
+            EventKind::AgentClockSkew => "agent_clock_skew",
+            EventKind::AgentClockOk => "agent_clock_ok",
+            EventKind::AgentRoundsLost => "agent_rounds_lost",
             EventKind::Unknown => "unknown",
         }
     }

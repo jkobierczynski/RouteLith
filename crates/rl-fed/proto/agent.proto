@@ -44,6 +44,9 @@ message AgentMessage {
     Hello hello = 1;
     ResultBatch results = 2;
     ConfigApplied applied = 3;
+    ClockReply clock = 4;
+    AgentStatus status = 5;
+    Health health = 6;
   }
 }
 
@@ -57,6 +60,9 @@ message Hello {
   uint64 spool_id = 3;
   // The highest seq the agent has an Ack for.
   uint64 acked_seq = 4;
+  // What the agent can measure (§21.7 G10): "icmp4", "icmp6", "tcp",
+  // "dns", "http". The server does not assign it the rest.
+  repeated string capabilities = 5;
 }
 
 message ServerMessage {
@@ -64,6 +70,7 @@ message ServerMessage {
     Welcome welcome = 1;
     ConfigSnapshot config = 2;
     Ack ack = 3;
+    ClockProbe clock = 4;
   }
 }
 
@@ -150,4 +157,30 @@ message HttpSummary {
 // forget them.
 message Ack {
   uint64 up_to_seq = 1;
+}
+
+// Clock offset, NTP-style (§21.7 G10): the server sends its time t1; the
+// agent answers with t1 and its own receive (t2) and send (t3) times. All
+// in Unix microseconds.
+message ClockProbe {
+  int64 t1_us = 1;
+}
+
+message ClockReply {
+  int64 t1_us = 1;
+  int64 t2_us = 2;
+  int64 t3_us = 3;
+}
+
+// The agent's state, every 30 s.
+message AgentStatus {
+  // Spool size and rounds in it the server has not acknowledged.
+  uint64 spool_bytes = 1;
+  uint64 spool_backlog = 2;
+}
+
+// A health snapshot (§21.3 E13), once a minute.
+message Health {
+  // rl_store::HealthSample as JSON, so it can grow without protocol changes.
+  bytes sample_json = 1;
 }

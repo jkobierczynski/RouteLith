@@ -44,9 +44,19 @@ pub struct Header {
 /// Severity (RFC 5424 §6.2.1) of an event kind.
 fn severity(kind: EventKind) -> u8 {
     match kind {
-        EventKind::AlertRaised => 4,                         // warning
-        EventKind::AlertCleared | EventKind::IpChanged => 5, // notice
-        EventKind::ServerStarted | EventKind::ServerStopped | EventKind::Unknown => 6, // info
+        EventKind::AlertRaised
+        | EventKind::AgentDisconnected
+        | EventKind::AgentRevoked
+        | EventKind::AgentClockSkew
+        | EventKind::AgentRoundsLost => 4, // warning
+        EventKind::AlertCleared
+        | EventKind::IpChanged
+        | EventKind::AgentConnected
+        | EventKind::AgentClockOk => 5, // notice
+        EventKind::ServerStarted
+        | EventKind::ServerStopped
+        | EventKind::AgentEnrolled
+        | EventKind::Unknown => 6, // info
     }
 }
 

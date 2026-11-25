@@ -326,7 +326,16 @@ pub fn build(
                 }
                 EventKind::IpChanged => mine && within,
                 EventKind::ServerStarted | EventKind::ServerStopped => within,
-                EventKind::Unknown => false,
+                // An agent's outage only matters to its own series' incidents;
+                // the timeline is per target, so these stay out.
+                EventKind::AgentEnrolled
+                | EventKind::AgentConnected
+                | EventKind::AgentDisconnected
+                | EventKind::AgentRevoked
+                | EventKind::AgentClockSkew
+                | EventKind::AgentClockOk
+                | EventKind::AgentRoundsLost
+                | EventKind::Unknown => false,
             };
             if keep {
                 tl.push(Entry {

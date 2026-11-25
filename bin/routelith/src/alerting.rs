@@ -489,6 +489,11 @@ impl Alerting {
         e
     }
 
+    /// An event from elsewhere (an agent's), logged and sent like any.
+    pub(crate) fn event(&mut self, e: Event) {
+        self.record(e);
+    }
+
     /// Write an event, say it on stderr and queue it for the outputs. A
     /// write that fails is counted and reported, but does not stop the
     /// store.
