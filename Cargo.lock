@@ -1568,7 +1568,7 @@ dependencies = [
 name = "rl-fed"
 version = "0.0.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "hyper-util",
  "prost",
  "rcgen",
