@@ -213,8 +213,17 @@ pub struct Session {
     /// The name the server knows this agent by.
     pub name: String,
     pub server_version: String,
+    /// The highest seq of our spool the server has stored (0 if none).
+    pub stored_seq: u64,
     pub inbound: tonic::Streaming<ServerMessage>,
     pub outbound: mpsc::Sender<AgentMessage>,
+}
+
+/// The agent's spool, as Hello reports it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Resume {
+    pub spool_id: u64,
+    pub acked_seq: u64,
 }
 
 /// Open the agent stream: Hello, then wait for Welcome.
@@ -222,6 +231,7 @@ pub async fn connect(
     server: &ServerAddr,
     id: &Identity,
     version: &str,
+    resume: Resume,
 ) -> Result<Session, FedError> {
     let config = tls::client_config(&id.ca, id.cert.clone(), id.key.clone_key())?;
     let channel = channel(server, config).await?;
@@ -230,6 +240,8 @@ pub async fn connect(
         msg: Some(pb::agent_message::Msg::Hello(pb::Hello {
             version: version.to_string(),
             os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            spool_id: resume.spool_id,
+            acked_seq: resume.acked_seq,
         })),
     };
     tx.send(hello)
@@ -246,6 +258,7 @@ pub async fn connect(
         }))) => Ok(Session {
             name: w.name,
             server_version: w.server_version,
+            stored_seq: w.stored_seq,
             inbound,
             outbound: tx,
         }),

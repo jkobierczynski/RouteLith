@@ -52,6 +52,11 @@ message Hello {
   string version = 1;
   // Operating system and architecture, e.g. "linux x86_64".
   string os = 2;
+  // The agent's spool (§21.7 G8): random, made when the spool is created.
+  // Seqs count within one spool; a new spool starts again at 1.
+  uint64 spool_id = 3;
+  // The highest seq the agent has an Ack for.
+  uint64 acked_seq = 4;
 }
 
 message ServerMessage {
@@ -67,6 +72,9 @@ message Welcome {
   // The name the server knows this agent by (from its certificate).
   string name = 1;
   string server_version = 2;
+  // The highest seq of this spool the server has stored (0 if none): the
+  // agent resends from the one after it.
+  uint64 stored_seq = 3;
 }
 
 // Everything this agent measures (§21.7 G5): sent after Welcome and
@@ -101,7 +109,8 @@ message Refusal {
   string reason = 2;
 }
 
-// Finished rounds, in the order they finished (at most 1 s old).
+// Rounds in seq order: new ones within 1 s of finishing, or older ones
+// replayed from the spool after an outage.
 message ResultBatch {
   repeated Round rounds = 1;
 }
@@ -137,7 +146,8 @@ message HttpSummary {
   optional int64 cert_not_after_s = 5;
 }
 
-// Rounds up to this seq are stored; the agent may forget them.
+// Rounds up to this seq are stored and synced to disk; the agent may
+// forget them.
 message Ack {
   uint64 up_to_seq = 1;
 }

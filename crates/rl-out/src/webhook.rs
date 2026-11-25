@@ -410,9 +410,10 @@ pub(crate) fn title(e: &Event) -> String {
         .as_deref()
         .map(|r| format!(" ({r})"))
         .unwrap_or_default();
+    let late = if e.late { " (late)" } else { "" };
     match &e.target {
-        Some(t) => format!("Routelith: {t} {what}{rule}"),
-        None => format!("Routelith: {what}{rule}"),
+        Some(t) => format!("Routelith: {t} {what}{rule}{late}"),
+        None => format!("Routelith: {what}{rule}{late}"),
     }
 }
 
@@ -428,6 +429,11 @@ pub(crate) fn facts(e: &Event) -> Vec<(&'static str, String)> {
         ("To", e.to.clone()),
         ("Vantage", Some(e.vantage.clone())),
         ("Time", Some(rfc3339(e.t))),
+        (
+            "Late",
+            e.late
+                .then(|| "yes: measured more than 10 minutes earlier".to_string()),
+        ),
     ]
     .into_iter()
     .filter_map(|(k, v)| Some((k, v?)))

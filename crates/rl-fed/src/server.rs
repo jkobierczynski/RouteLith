@@ -21,6 +21,7 @@ use crate::ca::Ca;
 use crate::pb::agent_server::{Agent, AgentServer};
 use crate::pb::{self, AgentMessage, EnrollRequest, EnrollResponse, ServerMessage};
 use crate::registry::{AgentRecord, Registry};
+use crate::seen::Seen;
 use crate::{FedError, tls};
 
 /// How the agent listener is set up.
@@ -43,7 +44,8 @@ pub struct ServerOptions {
 }
 
 /// Rounds from one agent, for the store. Answer on `done` once they are
-/// stored (`Ok`), or with why not; the agent gets an Ack only for `Ok`.
+/// stored and synced to disk (`Ok`), or with why not; the agent gets an
+/// Ack only for `Ok`.
 #[derive(Debug)]
 pub struct AgentRounds {
     pub agent: String,
@@ -151,6 +153,8 @@ pub struct AgentListener {
     /// SHA-256 of the CA certificate (what tokens carry).
     pub ca_sha256: [u8; 32],
     pub events: mpsc::Receiver<AgentEvent>,
+    /// Problems found at start-up that did not stop it, for the log.
+    pub notes: Vec<String>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -254,8 +258,10 @@ pub async fn bind(opts: ServerOptions) -> Result<AgentListener, FedError> {
         }
     });
 
+    let (seen, seen_note) = Seen::load(&opts.data_dir);
     let svc = Svc {
         registry: Registry::new(&opts.data_dir),
+        seen: Arc::new(seen),
         ca: Arc::new(ca),
         events: events_tx,
         opts: Arc::new(opts),
@@ -275,6 +281,7 @@ pub async fn bind(opts: ServerOptions) -> Result<AgentListener, FedError> {
         local_addr,
         ca_sha256,
         events,
+        notes: seen_note.into_iter().collect(),
         tasks: vec![accept, serve],
     })
 }
@@ -340,6 +347,7 @@ type Active = Arc<Mutex<HashMap<String, (u64, watch::Sender<bool>)>>>;
 
 struct Svc {
     registry: Registry,
+    seen: Arc<Seen>,
     ca: Arc<Ca>,
     events: mpsc::Sender<AgentEvent>,
     opts: Arc<ServerOptions>,
@@ -472,10 +480,12 @@ impl Agent for Svc {
         };
 
         let (out, out_rx) = mpsc::channel(16);
+        let spool = hello.spool_id;
         let welcome = ServerMessage {
             msg: Some(pb::server_message::Msg::Welcome(pb::Welcome {
                 name: rec.name.clone(),
                 server_version: self.opts.version.clone(),
+                stored_seq: self.seen.stored(&rec.name, spool),
             })),
         };
         out.send(Ok(welcome)).await.map_err(internal)?;
@@ -509,6 +519,7 @@ impl Agent for Svc {
         let registry = self.registry.clone();
         let recheck = self.opts.recheck;
         let opts = self.opts.clone();
+        let seen = self.seen.clone();
         tokio::spawn(async move {
             let name = rec.name.clone();
             let mut tick = tokio::time::interval(recheck);
@@ -517,7 +528,7 @@ impl Agent for Svc {
                 tokio::select! {
                     m = inbound.message() => match m {
                         Ok(Some(AgentMessage { msg: Some(pb::agent_message::Msg::Results(b)) })) => {
-                            match take_rounds(&opts, &name, b.rounds, &events).await {
+                            match take_rounds(&opts, &seen, (&name, spool), b.rounds, &events).await {
                                 Ok(Some(up_to_seq)) => {
                                     let ack = ServerMessage {
                                         msg: Some(pb::server_message::Msg::Ack(pb::Ack { up_to_seq })),
@@ -589,17 +600,34 @@ impl Agent for Svc {
 
 /// Hand a batch to the store. Returns the seq to acknowledge, `None` when
 /// there is nothing to acknowledge, or why the stream must end.
+///
+/// Rounds at or below the agent's high-water mark are replays and are
+/// only acknowledged again; so is a round whose seq does not go up.
 async fn take_rounds(
     opts: &ServerOptions,
-    name: &str,
+    seen: &Arc<Seen>,
+    (name, spool): (&str, u64),
     rounds: Vec<pb::Round>,
     events: &mpsc::Sender<AgentEvent>,
 ) -> Result<Option<u64>, String> {
     let Some(up_to) = rounds.iter().map(|r| r.seq).max() else {
         return Ok(None);
     };
-    let total = rounds.len();
-    let own: Vec<pb::Round> = rounds
+    let lock = seen.lock(name);
+    let _held = lock.lock().await;
+    let mut high = seen.stored(name, spool);
+    if up_to <= high {
+        return Ok(Some(up_to));
+    }
+    let mut fresh = Vec::with_capacity(rounds.len());
+    for r in rounds {
+        if r.seq > high {
+            high = r.seq;
+            fresh.push(r);
+        }
+    }
+    let total = fresh.len();
+    let own: Vec<pb::Round> = fresh
         .into_iter()
         .filter(|r| opts.assignments.owns(name, r.series_id))
         .collect();
@@ -625,6 +653,12 @@ async fn take_rounds(
             Err(_) => return Err("the server is shutting down".to_string()),
         }
     }
+    let seen = seen.clone();
+    let agent = name.to_string();
+    tokio::task::spawn_blocking(move || seen.record(&agent, spool, up_to))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("cannot record what was stored: {e}"))?;
     Ok(Some(up_to))
 }
 

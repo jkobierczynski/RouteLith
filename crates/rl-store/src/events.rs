@@ -89,6 +89,10 @@ pub struct Event {
     /// one was: logged, not sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suppressed_by: Option<String>,
+    /// Raised or cleared by a round more than [`LATE_MS`] old when it was
+    /// evaluated: an agent's round replayed after an outage (§21.7 G9).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub late: bool,
     /// One line for people.
     #[serde(default)]
     pub message: String,
@@ -111,10 +115,14 @@ impl Event {
             to: None,
             silenced_by: None,
             suppressed_by: None,
+            late: false,
             message: message.into(),
         }
     }
 }
+
+/// How old a round may be before the events it causes are marked late.
+pub const LATE_MS: i64 = 10 * 60 * 1000;
 
 /// `data/events`.
 pub fn events_dir(data_dir: &Path) -> PathBuf {

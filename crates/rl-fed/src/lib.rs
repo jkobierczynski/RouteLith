@@ -13,7 +13,9 @@ pub mod client;
 mod files;
 pub mod pb;
 pub mod registry;
+pub mod seen;
 pub mod server;
+pub mod spool;
 mod tls;
 pub mod token;
 

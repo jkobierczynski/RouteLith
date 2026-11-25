@@ -418,6 +418,9 @@ pub(crate) async fn serve(
             l.local_addr,
             rl_fed::fingerprint_text(&l.ca_sha256)
         );
+        for note in &l.notes {
+            eprintln!("routelith server: warning: {note}");
+        }
         let mut events = l.take_events();
         tokio::spawn(async move {
             while let Some(e) = events.recv().await {
@@ -705,7 +708,8 @@ fn assignments(plans: &[SeriesPlan], ids: &[u64]) -> rl_fed::assign::Assignments
 }
 
 /// What the store thread takes: a round measured here, or one an agent
-/// measured (already in stored form).
+/// measured (already in stored form), or a request to be told once
+/// everything before it is synced to disk.
 enum Input {
     Local(Completed),
     Remote {
@@ -713,6 +717,7 @@ enum Input {
         round: StoredRound,
         latest: LatestRound,
     },
+    Synced(tokio::sync::oneshot::Sender<Result<(), String>>),
 }
 
 /// Move agents' batches into the store queue, waiting for room (on a
@@ -748,7 +753,10 @@ async fn feed_agent_rounds(
                     return;
                 }
             }
-            let _ = batch.done.send(Ok(()));
+            // The agent gets its Ack once the rounds are synced (G7).
+            if let Err(mpsc::SendError(Input::Synced(done))) = tx.send(Input::Synced(batch.done)) {
+                let _ = done.send(Err("the store has stopped".to_string()));
+            }
         })
         .await;
         if result.is_err() {
@@ -866,9 +874,12 @@ fn store_rounds(
 ) -> Result<(), rl_store::StoreError> {
     let mut next_sync = Instant::now() + SYNC_EVERY;
     let mut last_invalid: Option<String> = None;
+    // Waiting for the next sync; dropped unanswered if the store fails.
+    let mut synced: Vec<tokio::sync::oneshot::Sender<Result<(), String>>> = Vec::new();
     loop {
         let wait = next_sync.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
+            Ok(Input::Synced(done)) => synced.push(done),
             Ok(input) => match append(w, input) {
                 (series, Ok((Appended::Stored, newest, r))) => {
                     latest.record(series, newest);
@@ -890,6 +901,9 @@ fn store_rounds(
         if Instant::now() >= next_sync {
             next_sync += SYNC_EVERY;
             w.sync()?;
+            for done in synced.drain(..) {
+                let _ = done.send(Ok(()));
+            }
             w.maintain(now_ms())?;
             *counters.lock().unwrap_or_else(PoisonError::into_inner) = StoreCounters {
                 writer: w.stats(),
@@ -923,6 +937,7 @@ fn append(
             round,
             latest,
         } => (series, Ok((round, latest))),
+        Input::Synced(_) => unreachable!("store_rounds answers sync requests itself"),
     };
     // The writer takes the round; alerts need it after.
     let result =

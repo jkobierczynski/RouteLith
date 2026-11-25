@@ -74,6 +74,8 @@ pub(crate) struct Alerting {
     /// Silence and parent of each raised alert, by series and rule.
     quiet: HashMap<(u64, String), Quiet>,
     pub(crate) outputs: rl_out::Outputs,
+    /// Now, Unix milliseconds (replaced in tests).
+    clock: fn() -> i64,
 }
 
 /// Build the engine and restore the last run's state.
@@ -133,6 +135,7 @@ pub(crate) fn start(
             .map(|t| (t.id.clone(), (t.group.clone(), t.parent.clone())))
             .collect(),
         quiet: HashMap::new(),
+        clock: wall_clock_ms,
         outputs,
     };
 
@@ -265,6 +268,10 @@ fn hour_values(p: &rl_store::RollupPoint) -> RoundValues {
     let mut v = RoundValues::from_sorted(p.ts_ms, p.sent, &p.quantiles_us);
     v.received = p.received.min(p.sent);
     v
+}
+
+fn wall_clock_ms() -> i64 {
+    rl_fed::now_ms()
 }
 
 fn values(r: &StoredRound) -> RoundValues {
@@ -453,6 +460,8 @@ impl Alerting {
         let mut e = Event::new(t, kind, &self.vantage, String::new());
         e.series = Some(series);
         if let Some(k) = self.keys.get(&series) {
+            // An agent's series: the event is about its vantage.
+            e.vantage.clone_from(&k.vantage);
             e.target = Some(k.target.clone());
             e.family = Some(k.family.clone());
         }
@@ -483,7 +492,11 @@ impl Alerting {
     /// Write an event, say it on stderr and queue it for the outputs. A
     /// write that fails is counted and reported, but does not stop the
     /// store.
-    fn record(&mut self, e: Event) {
+    fn record(&mut self, mut e: Event) {
+        if e.series.is_some() && (self.clock)().saturating_sub(e.t) > rl_store::events::LATE_MS {
+            e.late = true;
+            e.message = format!("late: {}", e.message);
+        }
         eprintln!("routelith server: event: {}", e.message);
         self.outputs.send(&e);
         if let Err(err) = self.log.append(&e) {
@@ -586,6 +599,38 @@ mod tests {
         assert_eq!(
             (events[4].from.as_deref(), events[4].to.as_deref()),
             (Some("192.0.2.1"), Some("192.0.2.9"))
+        );
+    }
+
+    #[test]
+    fn replayed_rounds_give_late_events_for_the_agents_vantage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(tmp.path(), SLOW);
+        let mut list = series(&["slow"]);
+        list[0].key = SeriesKey::new("plant-genk", "a", "v4");
+        let mut a = start(&cfg, &list, T0).unwrap();
+        fn half_an_hour_in() -> i64 {
+            T0 + 30 * STEP
+        }
+        a.clock = half_an_hour_in;
+        a.round(1, &round(1, 30, "192.0.2.1")); // 29 minutes old: late
+        a.round(1, &round(25, 10, "192.0.2.1")); // 5 minutes old: not late
+        let events = rl_store::read_events(tmp.path(), 0, i64::MAX).unwrap();
+        let alerts: Vec<(&str, bool, &str)> = events
+            .iter()
+            .filter(|e| e.rule.is_some())
+            .map(|e| (e.vantage.as_str(), e.late, e.message.as_str()))
+            .collect();
+        assert_eq!(
+            alerts,
+            [
+                (
+                    "plant-genk",
+                    true,
+                    "late: a (v4): slow raised: median 30ms > 20ms"
+                ),
+                ("plant-genk", false, "a (v4): slow cleared: median 10ms"),
+            ]
         );
     }
 

@@ -5,6 +5,8 @@
 //! server   = "monitor.example.be:4443"
 //! data_dir = "/var/lib/routelith-agent"
 //! max_pps  = 1000   # optional
+//! spool_max_mb   = 512   # optional bounds on the spool (§21.7 G8)
+//! spool_max_days = 30
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -17,10 +19,12 @@ use crate::client::ServerAddr;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     pub server: ServerAddr,
-    /// Identity (key, certificate, pinned CA) and, from M3 step 3, the spool.
+    /// Identity (key, certificate, pinned CA) and the spool.
     pub data_dir: PathBuf,
     /// Packets-per-second ceiling for everything this agent measures.
     pub max_pps: u32,
+    /// Bounds on the spool of rounds not yet stored by the server.
+    pub spool: crate::spool::Limits,
 }
 
 /// Default `max_pps`, as for the server.
@@ -32,6 +36,8 @@ struct Raw {
     server: String,
     data_dir: String,
     max_pps: Option<i64>,
+    spool_max_mb: Option<i64>,
+    spool_max_days: Option<i64>,
 }
 
 impl AgentConfig {
@@ -46,10 +52,25 @@ impl AgentConfig {
                 FedError::Invalid("max_pps must be a whole number of 1 or more".into())
             })?,
         };
+        let mut spool = crate::spool::Limits::default();
+        if let Some(mb) = raw.spool_max_mb {
+            let mb = u64::try_from(mb)
+                .ok()
+                .filter(|mb| (1..=1 << 20).contains(mb))
+                .ok_or_else(|| FedError::Invalid("spool_max_mb must be 1 to 1048576".into()))?;
+            spool.max_bytes = mb * 1024 * 1024;
+        }
+        if let Some(days) = raw.spool_max_days {
+            if !(1..=3650).contains(&days) {
+                return Err(FedError::Invalid("spool_max_days must be 1 to 3650".into()));
+            }
+            spool.max_age_ms = days * 86_400_000;
+        }
         Ok(AgentConfig {
             server: ServerAddr::parse(&raw.server)?,
             data_dir: PathBuf::from(raw.data_dir),
             max_pps,
+            spool,
         })
     }
 
@@ -81,5 +102,17 @@ mod tests {
         assert!(AgentConfig::parse("server = \"x\"\ndata_dir = \"d\"\nmax_pps = 0\n").is_err());
         let c = AgentConfig::parse("server = \"x\"\ndata_dir = \"d\"\nmax_pps = 50\n").unwrap();
         assert_eq!(c.max_pps, 50);
+        assert!(
+            AgentConfig::parse("server = \"x\"\ndata_dir = \"d\"\nspool_max_mb = 0\n").is_err()
+        );
+        assert!(
+            AgentConfig::parse("server = \"x\"\ndata_dir = \"d\"\nspool_max_days = 0\n").is_err()
+        );
+        let c = AgentConfig::parse(
+            "server = \"x\"\ndata_dir = \"d\"\nspool_max_mb = 8\nspool_max_days = 2\n",
+        )
+        .unwrap();
+        assert_eq!(c.spool.max_bytes, 8 << 20);
+        assert_eq!(c.spool.max_age_ms, 2 * 86_400_000);
     }
 }

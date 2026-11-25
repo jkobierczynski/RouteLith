@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
@@ -16,6 +16,7 @@ use rl_fed::ca::Ca;
 use rl_fed::client::{self, Identity};
 use rl_fed::pb;
 use rl_fed::registry::{Registry, TOKEN_TTL_MS};
+use rl_fed::spool::{Dropped, Spool, spool_dir};
 use rl_fed::token::Token;
 use rl_probe::{Probe, RateLimiter};
 use rl_sched::{Completed, Job, Sink, Stats};
@@ -135,21 +136,41 @@ async fn run(path: &Path) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let dir = spool_dir(&cfg.data_dir);
+    let spool = match Spool::open(&dir, cfg.spool, rl_fed::now_ms()) {
+        Ok((s, opened)) => {
+            for note in opened.notes {
+                eprintln!("routelith agent: spool: {note}");
+            }
+            s
+        }
+        Err(e) => {
+            eprintln!("routelith agent: spool: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if spool.backlog() > 0 {
+        eprintln!(
+            "routelith agent: {} round(s) in {} wait for the server",
+            spool.backlog(),
+            dir.display()
+        );
+    }
     eprintln!("routelith agent: {} connecting to {}", id.name, cfg.server);
     tokio::pin!(signal);
-    let (round_tx, mut round_rx) = tokio::sync::mpsc::channel::<pb::Round>(QUEUE);
-    let mut m = Measuring::new(&id.name, cfg.max_pps, round_tx);
+    let outbox = Arc::new(Outbox::new(spool));
+    let mut m = Measuring::new(&id.name, cfg.max_pps, outbox.clone());
     let mut backoff = Backoff::default();
     loop {
         let started = Instant::now();
         let attempt = async {
-            match client::connect(&cfg.server, &id, VERSION).await {
+            match client::connect(&cfg.server, &id, VERSION, outbox.resume()).await {
                 Ok(s) => {
                     eprintln!(
                         "routelith agent: connected to {} as {} (server version {})",
                         cfg.server, s.name, s.server_version
                     );
-                    let why = session(s, &mut m, &mut round_rx).await;
+                    let why = session(s, &mut m, &outbox).await;
                     eprintln!("routelith agent: disconnected: {why}");
                 }
                 Err(e) => eprintln!("routelith agent: {e}"),
@@ -158,6 +179,7 @@ async fn run(path: &Path) -> ExitCode {
         tokio::select! {
             () = &mut signal => break,
             () = attempt => {
+                outbox.report_drops();
                 let wait = backoff.next(started.elapsed());
                 eprintln!("routelith agent: trying again in {} s", wait.as_secs());
                 tokio::select! {
@@ -169,30 +191,136 @@ async fn run(path: &Path) -> ExitCode {
     }
     eprintln!("routelith agent: stopping");
     m.stop().await;
-    let dropped = m.dropped.load(Ordering::Relaxed);
-    if dropped > 0 {
-        eprintln!("routelith agent: {dropped} round(s) were dropped because the queue was full");
+    let mut spool = outbox.lock();
+    if let Err(e) = spool.sync() {
+        eprintln!("routelith agent: spool: {e}");
+    }
+    if spool.backlog() > 0 {
+        eprintln!(
+            "routelith agent: {} round(s) stay in the spool for next time",
+            spool.backlog()
+        );
+    }
+    let failed = outbox.failed.load(Ordering::Relaxed);
+    if failed > 0 {
+        eprintln!(
+            "routelith agent: {failed} round(s) were lost because the spool could not be written"
+        );
     }
     ExitCode::SUCCESS
 }
 
-/// Rounds kept in memory while the server is unreachable (the on-disk
-/// spool replaces this in M3 step 3).
-const QUEUE: usize = 16_384;
-/// Rounds per batch at most; a batch also goes out 1 s after its first round.
+/// Rounds per batch at most; a batch also goes out 1 s after its first
+/// round. Replays after an outage send larger batches.
 const BATCH: usize = 500;
+const REPLAY_BATCH: usize = 5_000;
+/// Encoded size per batch at most (gRPC refuses messages over 4 MiB).
+const BATCH_BYTES: usize = 1 << 20;
+/// Rounds sent and not yet acknowledged at most.
+const WINDOW: u64 = 10_000;
 
-/// One connection: take the configuration, send rounds, until the stream
-/// ends. Returns why it ended.
-async fn session(
-    mut s: client::Session,
-    m: &mut Measuring,
-    rounds: &mut tokio::sync::mpsc::Receiver<pb::Round>,
-) -> String {
-    let mut batch: Vec<pb::Round> = Vec::new();
-    let mut deadline: Option<tokio::time::Instant> = None;
+/// The spool and what the measuring jobs and the stream share about it.
+struct Outbox {
+    spool: Mutex<Spool>,
+    /// Woken when a round is spooled.
+    ready: tokio::sync::Notify,
+    /// Rounds the spool could not take.
+    failed: AtomicU64,
+    last_error: Mutex<Option<String>>,
+    /// Drops by the spool's bounds already reported.
+    reported: Mutex<Dropped>,
+}
+
+impl Outbox {
+    fn new(spool: Spool) -> Self {
+        Outbox {
+            spool: Mutex::new(spool),
+            ready: tokio::sync::Notify::new(),
+            failed: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+            reported: Mutex::new(Dropped::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Spool> {
+        self.spool.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn resume(&self) -> client::Resume {
+        let s = self.lock();
+        client::Resume {
+            spool_id: s.id(),
+            acked_seq: s.acked(),
+        }
+    }
+
+    /// Spool a finished round.
+    fn push(&self, round: pb::Round) -> bool {
+        let pushed = self.lock().push(round, rl_fed::now_ms());
+        match pushed {
+            Ok(_) => {
+                self.ready.notify_one();
+                true
+            }
+            Err(e) => {
+                self.failed.fetch_add(1, Ordering::Relaxed);
+                self.error(e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Log a spool error unless it is the same as the last one.
+    fn error(&self, msg: String) {
+        let mut last = self
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last.as_deref() != Some(msg.as_str()) {
+            eprintln!("routelith agent: spool: {msg}");
+            *last = Some(msg);
+        }
+    }
+
+    /// Log rounds dropped by the spool's bounds since the last report.
+    fn report_drops(&self) {
+        let now = self.lock().dropped();
+        let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
+        if now.rounds > reported.rounds {
+            eprintln!(
+                "routelith agent: spool full or too old: dropped {} round(s) the server had not stored",
+                now.rounds - reported.rounds
+            );
+        }
+        *reported = now;
+    }
+}
+
+/// One connection: take the configuration, send spooled rounds, until
+/// the stream ends. Returns why it ended.
+async fn session(mut s: client::Session, m: &mut Measuring, outbox: &Outbox) -> String {
+    let mut sent = {
+        let mut sp = outbox.lock();
+        // The server may have stored more than we heard about (an Ack lost
+        // with the connection).
+        let stored = s.stored_seq;
+        let r = if stored > sp.last_seq() {
+            sp.skip_past(stored)
+        } else {
+            sp.ack(stored)
+        };
+        if let Err(e) = r {
+            outbox.error(e.to_string());
+        }
+        if sp.backlog() > 0 {
+            eprintln!("routelith agent: sending {} spooled round(s)", sp.backlog());
+        }
+        sp.acked()
+    };
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let flush_at = deadline;
+        let mut due = false;
         tokio::select! {
             msg = s.inbound.message() => match msg {
                 Ok(Some(pb::ServerMessage { msg: Some(pb::server_message::Msg::Config(snap)) })) => {
@@ -202,32 +330,64 @@ async fn session(
                         return "the stream closed".to_string();
                     }
                 }
-                // Acks matter once rounds are spooled (step 3).
+                Ok(Some(pb::ServerMessage { msg: Some(pb::server_message::Msg::Ack(a)) })) => {
+                    let r = outbox.lock().ack(a.up_to_seq);
+                    if let Err(e) = r {
+                        outbox.error(e.to_string());
+                    }
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => return "the server closed the stream".to_string(),
                 Err(st) => return st.message().to_string(),
             },
-            Some(r) = rounds.recv(), if batch.len() < BATCH => {
-                if batch.is_empty() {
-                    deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+            () = outbox.ready.notified() => {}
+            _ = tick.tick() => {
+                due = true;
+                let r = outbox.lock().enforce(rl_fed::now_ms());
+                if let Err(e) = r {
+                    outbox.error(e.to_string());
                 }
-                batch.push(r);
+                outbox.report_drops();
             }
-            () = async {
-                match flush_at {
-                    Some(t) => tokio::time::sleep_until(t).await,
-                    None => std::future::pending().await,
-                }
-            } => {}
         }
-        let due = deadline.is_some_and(|t| t <= tokio::time::Instant::now());
-        if !batch.is_empty() && (due || batch.len() >= BATCH) {
+        // Send what is waiting: a full batch at once, the rest once a
+        // second, never more than WINDOW unacknowledged.
+        loop {
+            let batch = {
+                let mut sp = outbox.lock();
+                let (acked, last) = (sp.acked(), sp.last_seq());
+                sent = sent.max(acked);
+                let pending = last - sent;
+                if pending == 0 || sent - acked >= WINDOW || (pending < BATCH as u64 && !due) {
+                    break;
+                }
+                let max = if pending > BATCH as u64 {
+                    REPLAY_BATCH
+                } else {
+                    BATCH
+                };
+                match sp
+                    .sync()
+                    .and_then(|()| sp.read_after(sent, max, BATCH_BYTES))
+                {
+                    Ok(b) if b.is_empty() => {
+                        // Dropped by the spool's bounds meanwhile.
+                        sent = last;
+                        break;
+                    }
+                    Ok(b) => b,
+                    Err(e) => {
+                        outbox.error(e.to_string());
+                        break;
+                    }
+                }
+            };
+            sent = batch.last().map_or(sent, |r| r.seq);
             let msg = pb::AgentMessage {
                 msg: Some(pb::agent_message::Msg::Results(pb::ResultBatch {
-                    rounds: std::mem::take(&mut batch),
+                    rounds: batch,
                 })),
             };
-            deadline = None;
             if s.outbound.send(msg).await.is_err() {
                 return "the stream closed".to_string();
             }
@@ -241,17 +401,13 @@ struct Measuring {
     limiter: Arc<RateLimiter>,
     stats: Arc<Stats>,
     sink: Sink,
-    dropped: Arc<AtomicU64>,
     version: Option<String>,
     stop: Option<tokio::sync::watch::Sender<bool>>,
     jobs: tokio::task::JoinSet<()>,
 }
 
 impl Measuring {
-    fn new(name: &str, max_pps: u32, tx: tokio::sync::mpsc::Sender<pb::Round>) -> Self {
-        let seq = Arc::new(AtomicU64::new(0));
-        let dropped = Arc::new(AtomicU64::new(0));
-        let d = dropped.clone();
+    fn new(name: &str, max_pps: u32, outbox: Arc<Outbox>) -> Self {
         let sink: Sink = Arc::new(move |c: Completed| {
             let round = match crate::server::stored(&c) {
                 Ok(r) => r,
@@ -267,21 +423,14 @@ impl Measuring {
                 total_us: p.total,
                 cert_not_after_s: cert,
             });
-            let n = seq.fetch_add(1, Ordering::Relaxed) + 1;
-            let ok = tx
-                .try_send(rl_fed::assign::to_wire(n, c.series, &round, http))
-                .is_ok();
-            if !ok {
-                d.fetch_add(1, Ordering::Relaxed);
-            }
-            ok
+            // The spool gives it its seq.
+            outbox.push(rl_fed::assign::to_wire(0, c.series, &round, http))
         });
         Measuring {
             name: name.to_string(),
             limiter: Arc::new(RateLimiter::new(max_pps)),
             stats: Arc::new(Stats::default()),
             sink,
-            dropped,
             version: None,
             stop: None,
             jobs: tokio::task::JoinSet::new(),

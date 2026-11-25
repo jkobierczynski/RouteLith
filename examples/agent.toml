@@ -4,5 +4,7 @@
 #   routelith agent run -c agent.toml
 
 server   = "monitor.example.be:4443"   # the server's listen_agents (port 4443 if left out)
-data_dir = "/var/lib/routelith-agent"  # identity (key, certificate, server CA)
+data_dir = "/var/lib/routelith-agent"  # identity (key, certificate, server CA) and spool
 # max_pps = 1000                       # packets-per-second ceiling for this agent
+# spool_max_mb   = 512                 # rounds kept while the server is unreachable:
+# spool_max_days = 30                  # beyond either bound the oldest are dropped

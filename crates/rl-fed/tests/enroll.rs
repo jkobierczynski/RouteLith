@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use rl_fed::client::{self, Identity, ServerAddr};
+use rl_fed::client::{self, Identity, Resume, ServerAddr};
 use rl_fed::registry::{Registry, TOKEN_TTL_MS};
 use rl_fed::server::{self, AgentEvent, AgentListener, ServerOptions};
 use rl_fed::token::Token;
@@ -100,7 +100,9 @@ async fn an_agent_enrolls_once_and_connects() {
     assert!(err.to_string().contains("already used"), "{err}");
 
     let id = Identity::load(agent_dir.path()).unwrap();
-    let s = client::connect(&lab.addr, &id, "1.0.0").await.unwrap();
+    let s = client::connect(&lab.addr, &id, "1.0.0", Resume::default())
+        .await
+        .unwrap();
     assert_eq!(s.name, "plant-genk");
     assert_eq!(s.server_version, "9.9.9");
     loop {
@@ -167,11 +169,15 @@ async fn revoking_ends_the_stream_and_refuses_reconnects() {
         .await
         .unwrap();
     let id = Identity::load(d.path()).unwrap();
-    let mut s = client::connect(&lab.addr, &id, "1").await.unwrap();
+    let mut s = client::connect(&lab.addr, &id, "1", Resume::default())
+        .await
+        .unwrap();
     assert!(lab.registry().revoke("a", rl_fed::now_ms()).unwrap());
     let status = stream_end(&mut s).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
-    let err = client::connect(&lab.addr, &id, "1").await.unwrap_err();
+    let err = client::connect(&lab.addr, &id, "1", Resume::default())
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("revoked"), "{err}");
     loop {
         if let AgentEvent::Disconnected { name, reason, .. } = lab.next_event().await {
@@ -191,14 +197,22 @@ async fn enrolling_again_retires_the_old_certificate() {
         .await
         .unwrap();
     let old_id = Identity::load(old.path()).unwrap();
-    let mut s = client::connect(&lab.addr, &old_id, "1").await.unwrap();
+    let mut s = client::connect(&lab.addr, &old_id, "1", Resume::default())
+        .await
+        .unwrap();
     client::enroll(&lab.addr, &lab.token("a"), new.path(), "1")
         .await
         .unwrap();
     let _ = stream_end(&mut s).await;
-    assert!(client::connect(&lab.addr, &old_id, "1").await.is_err());
+    assert!(
+        client::connect(&lab.addr, &old_id, "1", Resume::default())
+            .await
+            .is_err()
+    );
     let new_id = Identity::load(new.path()).unwrap();
-    client::connect(&lab.addr, &new_id, "1").await.unwrap();
+    client::connect(&lab.addr, &new_id, "1", Resume::default())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -209,8 +223,12 @@ async fn a_second_connection_replaces_the_first() {
         .await
         .unwrap();
     let id = Identity::load(d.path()).unwrap();
-    let mut first = client::connect(&lab.addr, &id, "1").await.unwrap();
-    let _second = client::connect(&lab.addr, &id, "1").await.unwrap();
+    let mut first = client::connect(&lab.addr, &id, "1", Resume::default())
+        .await
+        .unwrap();
+    let _second = client::connect(&lab.addr, &id, "1", Resume::default())
+        .await
+        .unwrap();
     let end = stream_end(&mut first).await;
     assert_eq!(end.unwrap_err().code(), tonic::Code::Aborted);
 }
@@ -225,7 +243,11 @@ async fn a_certificate_from_another_server_is_refused() {
         .unwrap();
     let id = Identity::load(d.path()).unwrap();
     // The agent does not trust server B's CA, and B does not know the agent.
-    assert!(client::connect(&lab_b.addr, &id, "1").await.is_err());
+    assert!(
+        client::connect(&lab_b.addr, &id, "1", Resume::default())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -279,7 +301,9 @@ async fn an_agent_gets_its_assignments_and_its_rounds_are_acknowledged() {
         .await
         .unwrap();
     let id = Identity::load(d.path()).unwrap();
-    let mut s = client::connect(&lab.addr, &id, "1").await.unwrap();
+    let mut s = client::connect(&lab.addr, &id, "1", Resume::default())
+        .await
+        .unwrap();
 
     let msg = s.inbound.message().await.unwrap().unwrap();
     let Some(server_message::Msg::Config(snap)) = msg.msg else {
@@ -347,10 +371,93 @@ async fn an_agent_with_nothing_assigned_gets_an_empty_snapshot() {
         .await
         .unwrap();
     let id = Identity::load(d.path()).unwrap();
-    let mut s = client::connect(&lab.addr, &id, "1").await.unwrap();
+    let mut s = client::connect(&lab.addr, &id, "1", Resume::default())
+        .await
+        .unwrap();
     let msg = s.inbound.message().await.unwrap().unwrap();
     let Some(rl_fed::pb::server_message::Msg::Config(snap)) = msg.msg else {
         panic!("{msg:?}")
     };
     assert!(snap.assignments.is_empty());
+}
+
+/// Send rounds with these seqs (series 5) and wait for the Ack.
+async fn send_rounds(s: &mut client::Session, seqs: std::ops::RangeInclusive<u64>) -> u64 {
+    use rl_fed::pb::{agent_message, server_message};
+    s.outbound
+        .send(rl_fed::pb::AgentMessage {
+            msg: Some(agent_message::Msg::Results(rl_fed::pb::ResultBatch {
+                rounds: seqs.map(|q| round(q, 5)).collect(),
+            })),
+        })
+        .await
+        .unwrap();
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), s.inbound.message())
+            .await
+            .expect("an Ack in time")
+            .unwrap()
+            .unwrap();
+        if let Some(server_message::Msg::Ack(a)) = msg.msg {
+            return a.up_to_seq;
+        }
+    }
+}
+
+#[tokio::test]
+async fn replayed_rounds_are_acknowledged_but_stored_once() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<server::AgentRounds>(4);
+    let lab = lab_with(|o| {
+        let mut a = rl_fed::assign::Assignments::default();
+        a.insert("genk", vec![rl_fed::assign::assignment(5, "web", &spec())]);
+        o.assignments = std::sync::Arc::new(a);
+        o.rounds = Some(tx);
+    })
+    .await;
+    let stored = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let s2 = stored.clone();
+    tokio::spawn(async move {
+        while let Some(b) = rx.recv().await {
+            s2.lock().unwrap().extend(b.rounds.iter().map(|r| r.seq));
+            let _ = b.done.send(Ok(()));
+        }
+    });
+    let d = tempfile::tempdir().unwrap();
+    client::enroll(&lab.addr, &lab.token("genk"), d.path(), "1")
+        .await
+        .unwrap();
+    let id = Identity::load(d.path()).unwrap();
+    let spool = |spool_id| Resume {
+        spool_id,
+        acked_seq: 0,
+    };
+
+    let mut s = client::connect(&lab.addr, &id, "1", spool(42))
+        .await
+        .unwrap();
+    assert_eq!(s.stored_seq, 0);
+    assert_eq!(send_rounds(&mut s, 1..=3).await, 3);
+    // The Ack for 3 was lost: the agent sends 2 to 5.
+    assert_eq!(send_rounds(&mut s, 2..=5).await, 5);
+    assert_eq!(*stored.lock().unwrap(), [1, 2, 3, 4, 5]);
+
+    // After a reconnect the server says how far it got.
+    drop(s);
+    let mut s = client::connect(&lab.addr, &id, "1", spool(42))
+        .await
+        .unwrap();
+    assert_eq!(s.stored_seq, 5);
+    assert_eq!(send_rounds(&mut s, 1..=5).await, 5);
+    assert_eq!(stored.lock().unwrap().len(), 5, "nothing stored twice");
+
+    // A new spool (data_dir wiped) starts over at 1.
+    drop(s);
+    let mut s = client::connect(&lab.addr, &id, "1", spool(43))
+        .await
+        .unwrap();
+    assert_eq!(s.stored_seq, 0);
+    assert_eq!(send_rounds(&mut s, 1..=2).await, 2);
+    assert_eq!(*stored.lock().unwrap(), [1, 2, 3, 4, 5, 1, 2]);
+    let marks = std::fs::read_to_string(lab.server_dir.path().join("agents.json")).unwrap();
+    assert!(marks.contains("\"000000000000002b\""), "{marks}");
 }

@@ -18,6 +18,7 @@ rl-core.workspace = true
 rl-store.workspace = true
 rcgen.workspace = true
 ring.workspace = true
+crc32c.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true
