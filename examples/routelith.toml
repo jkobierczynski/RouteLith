@@ -35,6 +35,8 @@ name      = "down"
 metric    = "loss"          # median, min, max, p90 (ms), loss (%) or mos
 condition = ">= 100%"
 for       = "2 rounds"      # rounds in a row before it is raised
+# min_vantages = 2          # with agents: one alert, raised only when 2 or
+                            # more vantages match at once (default 1)
 
 [[alert]]
 name      = "slow"

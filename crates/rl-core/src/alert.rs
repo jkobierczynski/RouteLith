@@ -23,6 +23,9 @@ use std::fmt;
 pub struct AlertRule {
     pub name: String,
     pub kind: RuleKind,
+    /// Vantages that must match at once to raise one alert for the target
+    /// (§21.7 G13); 1 is one alert per series.
+    pub min_vantages: u32,
     /// Line of the `[[alert]]` table, for messages.
     pub line: usize,
 }
@@ -125,6 +128,15 @@ impl fmt::Display for Metric {
 impl AlertRule {
     /// The rule in one line, as in the configuration.
     pub fn summary(&self) -> String {
+        let s = self.condition_summary();
+        if self.min_vantages > 1 {
+            format!("{s}; from {} vantages at once", self.min_vantages)
+        } else {
+            s
+        }
+    }
+
+    fn condition_summary(&self) -> String {
         match &self.kind {
             RuleKind::Threshold(t) => {
                 let cmps = |c: &[Comparison]| {
@@ -958,6 +970,7 @@ mod tests {
         let rule = |kind| AlertRule {
             name: "r".into(),
             kind,
+            min_vantages: 1,
             line: 1,
         };
         let t = Threshold {

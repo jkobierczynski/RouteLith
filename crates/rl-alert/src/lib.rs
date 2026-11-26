@@ -5,6 +5,13 @@
 //! the newest rounds a pattern needs, and answers with the alerts raised
 //! and cleared by that round. It does no I/O: the caller writes the
 //! transitions to the event log and rebuilds the state from it at start-up.
+//!
+//! A rule with `min_vantages = N > 1` (§21.7 G13) still runs per series,
+//! but its per-series state only says whether that vantage matches: one
+//! alert per target, family and rule is raised when N or more vantages
+//! that count (connected agents and the server) match at once, and
+//! cleared when fewer do. It is reported under the lowest series id of
+//! the target and family, with the vantages that matched.
 
 #![forbid(unsafe_code)]
 
@@ -104,6 +111,9 @@ pub struct ActiveAlert {
     /// The parent target that had an alert when it was raised; set by
     /// the caller.
     pub suppressed_by: Option<String>,
+    /// For a rule with `min_vantages` > 1: the vantages that matched when
+    /// it was raised. Empty otherwise.
+    pub vantages: Vec<String>,
 }
 
 /// An alert raised or cleared by a round.
@@ -119,6 +129,9 @@ pub struct Transition {
     pub value: Option<f64>,
     /// What happened, for people, without the target's name.
     pub message: String,
+    /// For a rule with `min_vantages` > 1: the vantages that match (on a
+    /// raise) or still match (on a clear). Empty otherwise.
+    pub vantages: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +146,19 @@ struct RuleState {
     clear_streak: u32,
     /// Newest rounds, oldest first, for a pattern rule.
     history: VecDeque<PatternValue>,
+    /// Whether a round was evaluated since the start.
+    observed: bool,
+}
+
+/// One alert over the vantages measuring a target and family, for a rule
+/// with `min_vantages` > 1.
+#[derive(Debug, Clone)]
+struct Group {
+    rule: usize,
+    /// Series ids, ascending; the first one reports the alert.
+    members: Vec<u64>,
+    /// Since when, with which value and vantages, while raised.
+    active: Option<(i64, Option<f64>, Vec<String>)>,
 }
 
 /// Every rule's state for every series it applies to.
@@ -142,6 +168,15 @@ pub struct Engine {
     series: HashMap<u64, Vec<RuleState>>,
     /// Known baselines per series, by metric and baseline (§21.5 F5).
     baselines: HashMap<u64, HashMap<(Metric, Baseline), f64>>,
+    /// Correlated alerts (G13), and the group of each series and rule.
+    groups: Vec<Group>,
+    group_of: HashMap<(u64, usize), usize>,
+    /// Each series' vantage name, for messages.
+    vantage: HashMap<u64, String>,
+    /// Until then (Unix ms), a correlated alert is not cleared while a
+    /// vantage has sent no round since the start: after a restart, its
+    /// agent may not have reconnected yet.
+    settle_until_ms: i64,
 }
 
 const HOUR_MS: i64 = 3_600_000;
@@ -165,6 +200,7 @@ impl Engine {
                     streak_start: 0,
                     clear_streak: 0,
                     history: VecDeque::new(),
+                    observed: false,
                 })
                 .collect();
             if !states.is_empty() {
@@ -175,7 +211,79 @@ impl Engine {
             rules,
             series,
             baselines: HashMap::new(),
+            groups: Vec::new(),
+            group_of: HashMap::new(),
+            vantage: HashMap::new(),
+            settle_until_ms: 0,
         }
+    }
+
+    /// Say which series measure the same target and family (`key`) from
+    /// which vantage, for rules with `min_vantages` > 1.
+    pub fn set_groups<K: std::hash::Hash + Eq + Clone>(
+        &mut self,
+        series: impl IntoIterator<Item = (u64, K, String)>,
+    ) {
+        let mut by_key: HashMap<(K, usize), Vec<u64>> = HashMap::new();
+        for (id, key, vantage) in series {
+            self.vantage.insert(id, vantage);
+            let Some(states) = self.series.get(&id) else {
+                continue;
+            };
+            for st in states {
+                if self.rules[st.rule].min_vantages > 1 {
+                    by_key.entry((key.clone(), st.rule)).or_default().push(id);
+                }
+            }
+        }
+        let mut groups: Vec<Group> = by_key
+            .into_iter()
+            .map(|((_, rule), mut members)| {
+                members.sort_unstable();
+                Group {
+                    rule,
+                    members,
+                    active: None,
+                }
+            })
+            .collect();
+        groups.sort_by_key(|g| (g.members[0], g.rule));
+        self.group_of.clear();
+        for (i, g) in groups.iter().enumerate() {
+            for &m in &g.members {
+                self.group_of.insert((m, g.rule), i);
+            }
+        }
+        self.groups = groups;
+    }
+
+    /// Whether `rule` needs more than one vantage.
+    pub fn correlated(&self, rule: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.name == rule && r.min_vantages > 1)
+    }
+
+    /// Hold back clearing correlated alerts until `t_ms` while a vantage
+    /// has not reported since the start (see the field).
+    pub fn settle_until(&mut self, t_ms: i64) {
+        self.settle_until_ms = t_ms;
+    }
+
+    /// Correlated rules a target can never raise, as fewer vantages
+    /// measure it than the rule needs: (rule, reporting series, vantages).
+    pub fn unreachable_groups(&self) -> Vec<(String, u64, usize)> {
+        self.groups
+            .iter()
+            .filter(|g| g.members.len() < self.rules[g.rule].min_vantages as usize)
+            .map(|g| {
+                (
+                    self.rules[g.rule].name.clone(),
+                    g.members[0],
+                    g.members.len(),
+                )
+            })
+            .collect()
     }
 
     /// The metrics and baselines the rules of `series` use; empty when
@@ -244,6 +352,44 @@ impl Engine {
     /// Mark an alert active again after a restart. Returns `false` if the
     /// rule no longer applies to the series.
     pub fn restore(&mut self, series: u64, rule: &str, since_ms: i64, value: Option<f64>) -> bool {
+        self.restore_with(series, rule, since_ms, value, Vec::new())
+    }
+
+    /// As [`restore`](Self::restore), with the vantages a correlated alert
+    /// was raised from. A correlated alert comes back only under the
+    /// series that reports it (the lowest id of its target and family).
+    pub fn restore_with(
+        &mut self,
+        series: u64,
+        rule: &str,
+        since_ms: i64,
+        value: Option<f64>,
+        vantages: Vec<String>,
+    ) -> bool {
+        let Some(ri) = self.rules.iter().position(|r| r.name == rule) else {
+            return false;
+        };
+        if self.rules[ri].min_vantages > 1 {
+            return match self.group_of.get(&(series, ri)) {
+                Some(&g) if self.groups[g].members[0] == series => {
+                    // The vantages that matched match again, until their
+                    // own rounds clear them.
+                    for &m in &self.groups[g].members {
+                        let matched = self.vantage.get(&m).is_some_and(|v| vantages.contains(v));
+                        let st = self
+                            .series
+                            .get_mut(&m)
+                            .and_then(|v| v.iter_mut().find(|s| s.rule == ri));
+                        if let (true, Some(st)) = (matched, st) {
+                            st.active = Some((since_ms, value));
+                        }
+                    }
+                    self.groups[g].active = Some((since_ms, value, vantages));
+                    true
+                }
+                _ => false,
+            };
+        }
         let rules = &self.rules;
         let Some(st) = self
             .series
@@ -270,14 +416,29 @@ impl Engine {
         }
     }
 
-    /// Evaluate a newly stored round of `series`.
+    /// Evaluate a newly stored round of `series`, with every vantage
+    /// counting.
     pub fn observe(&mut self, series: u64, r: &RoundValues) -> Vec<Transition> {
+        self.observe_with(series, r, &|_| true)
+    }
+
+    /// Evaluate a newly stored round of `series`. `counts` says whether a
+    /// series' vantage counts for correlated rules now (a disconnected
+    /// agent does not).
+    pub fn observe_with(
+        &mut self,
+        series: u64,
+        r: &RoundValues,
+        counts: &dyn Fn(u64) -> bool,
+    ) -> Vec<Transition> {
         let mut out = Vec::new();
+        let mut correlated = Vec::new();
         let Some(states) = self.series.get_mut(&series) else {
             return out;
         };
         let known = self.baselines.get(&series);
         for st in states {
+            st.observed = true;
             let rule = &self.rules[st.rule];
             let t = match &rule.kind {
                 RuleKind::Threshold(t) => {
@@ -286,6 +447,11 @@ impl Engine {
                 }
                 RuleKind::Pattern(p) => pattern(st, p, r),
             };
+            if rule.min_vantages > 1 {
+                // Only whether this vantage matches; the group decides.
+                correlated.push(st.rule);
+                continue;
+            }
             if let Some((raised, since_ms, value, what)) = t {
                 let message = if raised {
                     format!("{} raised: {what}", rule.name)
@@ -300,10 +466,92 @@ impl Engine {
                     since_ms,
                     value,
                     message,
+                    vantages: Vec::new(),
                 });
             }
         }
+        for rule in correlated {
+            out.extend(self.correlate(series, rule, r, counts));
+        }
         out
+    }
+
+    /// Raise or clear the correlated alert of `series`' group for `rule`.
+    fn correlate(
+        &mut self,
+        series: u64,
+        rule: usize,
+        r: &RoundValues,
+        counts: &dyn Fn(u64) -> bool,
+    ) -> Option<Transition> {
+        let &g = self.group_of.get(&(series, rule))?;
+        let need = self.rules[rule].min_vantages as usize;
+        let members = &self.groups[g].members;
+        let (mut matching, mut since, mut unsettled) = (Vec::new(), i64::MIN, false);
+        for &m in members {
+            let Some(st) = self
+                .series
+                .get(&m)
+                .and_then(|v| v.iter().find(|s| s.rule == rule))
+            else {
+                continue;
+            };
+            // A vantage not heard from since the start may be an agent
+            // that has not reconnected yet.
+            unsettled |= !st.observed;
+            if !counts(m) {
+                continue;
+            }
+            if let Some((s, _)) = st.active {
+                matching.push(m);
+                since = since.max(s);
+            }
+        }
+        let names: Vec<String> = matching
+            .iter()
+            .map(|m| {
+                self.vantage
+                    .get(m)
+                    .cloned()
+                    .unwrap_or_else(|| format!("series {m}"))
+            })
+            .collect();
+        let (reporter, total) = (members[0], members.len());
+        let name = self.rules[rule].name.clone();
+        let value = rule_value(&self.rules[rule].kind, r);
+        let settling = unsettled && r.ts_ms < self.settle_until_ms;
+        let group = &mut self.groups[g];
+        let (raised, since_ms, message) = match &group.active {
+            None if matching.len() >= need => {
+                group.active = Some((since, value, names.clone()));
+                let message = format!(
+                    "{name} raised: {} of {total} vantages match ({})",
+                    matching.len(),
+                    names.join(", ")
+                );
+                (true, since, message)
+            }
+            Some((since, _, _)) if matching.len() < need && !settling => {
+                let since = *since;
+                group.active = None;
+                let message = format!(
+                    "{name} cleared: {} of {total} vantages match, fewer than {need}",
+                    matching.len()
+                );
+                (false, since, message)
+            }
+            _ => return None,
+        };
+        Some(Transition {
+            raised,
+            series: reporter,
+            rule: name,
+            ts_ms: r.ts_ms,
+            since_ms,
+            value,
+            message,
+            vantages: names,
+        })
     }
 
     /// Alerts raised now, by series id then rule order.
@@ -312,20 +560,48 @@ impl Engine {
             .series
             .iter()
             .flat_map(|(&series, states)| {
-                states.iter().filter_map(move |st| {
-                    st.active.map(|(since_ms, value)| ActiveAlert {
-                        series,
-                        rule: self.rules[st.rule].name.clone(),
-                        since_ms,
-                        value,
-                        silenced_by: None,
-                        suppressed_by: None,
+                states
+                    .iter()
+                    .filter(|st| self.rules[st.rule].min_vantages <= 1)
+                    .filter_map(move |st| {
+                        st.active.map(|(since_ms, value)| ActiveAlert {
+                            series,
+                            rule: self.rules[st.rule].name.clone(),
+                            since_ms,
+                            value,
+                            silenced_by: None,
+                            suppressed_by: None,
+                            vantages: Vec::new(),
+                        })
                     })
-                })
             })
             .collect();
+        for g in &self.groups {
+            if let Some((since_ms, value, vantages)) = &g.active {
+                out.push(ActiveAlert {
+                    series: g.members[0],
+                    rule: self.rules[g.rule].name.clone(),
+                    since_ms: *since_ms,
+                    value: *value,
+                    silenced_by: None,
+                    suppressed_by: None,
+                    vantages: vantages.clone(),
+                });
+            }
+        }
         out.sort_by(|a, b| (a.series, &a.rule).cmp(&(b.series, &b.rule)));
         out
+    }
+}
+
+/// A round's value in a rule's unit, as a correlated alert reports it.
+fn rule_value(kind: &RuleKind, r: &RoundValues) -> Option<f64> {
+    match kind {
+        RuleKind::Threshold(t) => r.metric(t.metric),
+        RuleKind::Pattern(p) => match p.kind {
+            rl_core::alert::PatternType::Loss => r.loss_pct(),
+            rl_core::alert::PatternType::Rtt => r.metric(Metric::Median),
+        },
     }
 }
 
@@ -485,6 +761,7 @@ pub fn active_from_events(events: &[Event]) -> Vec<ActiveAlert> {
             value: e.value,
             silenced_by: e.silenced_by.clone(),
             suppressed_by: e.suppressed_by.clone(),
+            vantages: e.vantages.clone(),
         })
         .collect();
     out.sort_by(|a, b| (a.series, &a.rule).cmp(&(b.series, &b.rule)));

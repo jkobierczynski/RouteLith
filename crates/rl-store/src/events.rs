@@ -113,6 +113,10 @@ pub struct Event {
     /// evaluated: an agent's round replayed after an outage (§21.7 G9).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub late: bool,
+    /// For a correlated alert (`min_vantages` > 1, §21.7 G13), the
+    /// vantages that matched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vantages: Vec<String>,
     /// One line for people.
     #[serde(default)]
     pub message: String,
@@ -136,6 +140,7 @@ impl Event {
             silenced_by: None,
             suppressed_by: None,
             late: false,
+            vantages: Vec::new(),
             message: message.into(),
         }
     }

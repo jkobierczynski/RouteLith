@@ -28,6 +28,7 @@ fn threshold(
             clear,
             clear_rounds,
         }),
+        min_vantages: 1,
         line: 1,
     }
 }
@@ -37,6 +38,7 @@ fn pattern(name: &str, kind: PatternType, items: &[&str]) -> AlertRule {
     AlertRule {
         name: name.into(),
         kind: RuleKind::Pattern(alert::parse_pattern(&items, kind).unwrap()),
+        min_vantages: 1,
         line: 1,
     }
 }
@@ -189,6 +191,7 @@ fn restored_alerts_clear_normally_and_are_not_raised_twice() {
             value: Some(31.0),
             silenced_by: None,
             suppressed_by: None,
+            vantages: Vec::new(),
         }]
     );
     // Still slow: no second raise.
@@ -362,4 +365,111 @@ fn baseline_statistics() {
     assert_eq!(e.baseline(7, Metric::Loss, b), Some(5.0));
     assert!(run(&mut e, &[round(now / STEP, 1, 1)]).is_empty());
     assert_eq!(run(&mut e, &[round(now / STEP + 1, 1, 2)]), [(0, true)]);
+}
+
+/// Series 1, 2 and 3 measure one target from home, a and b; 9 measures
+/// another target from home. "down" needs 2 vantages.
+fn correlated() -> Engine {
+    let mut rule = threshold("down", Metric::Loss, ">= 100%", 1, None);
+    rule.min_vantages = 2;
+    let mut e = Engine::new(
+        vec![rule],
+        [1, 2, 3, 9].map(|s| (s, vec!["down".to_string()])),
+    );
+    e.set_groups([
+        (1, "web", "home".to_string()),
+        (2, "web", "a".to_string()),
+        (3, "web", "b".to_string()),
+        (9, "dns", "home".to_string()),
+    ]);
+    e
+}
+
+fn dead(i: i64) -> RoundValues {
+    round(i, 5, 20)
+}
+
+#[test]
+fn a_correlated_alert_needs_enough_vantages_at_once() {
+    let mut e = correlated();
+    // One vantage down: nothing raised.
+    assert!(e.observe(2, &dead(1)).is_empty());
+    assert!(e.observe(1, &round(1, 5, 0)).is_empty());
+    assert!(e.active().is_empty());
+    // A second one: raised once, under the lowest series, naming both.
+    let t = e.observe(3, &dead(1));
+    assert_eq!(t.len(), 1);
+    assert!(t[0].raised);
+    assert_eq!(t[0].series, 1);
+    assert_eq!(t[0].vantages, ["a", "b"]);
+    assert_eq!(t[0].message, "down raised: 2 of 3 vantages match (a, b)");
+    assert_eq!(t[0].since_ms, STEP);
+    // A third adds nothing; the other target is not involved.
+    assert!(e.observe(1, &dead(2)).is_empty());
+    assert!(e.observe(9, &dead(2)).is_empty());
+    let a = e.active();
+    assert_eq!(a.len(), 1);
+    assert_eq!(
+        (a[0].series, a[0].vantages.clone()),
+        (1, vec!["a".to_string(), "b".to_string()])
+    );
+    // Down to two: still raised. Down to one: cleared.
+    assert!(e.observe(2, &round(2, 5, 0)).is_empty());
+    let t = e.observe(3, &round(2, 5, 0));
+    assert_eq!(t.len(), 1);
+    assert!(!t[0].raised);
+    assert_eq!(t[0].since_ms, STEP);
+    assert_eq!(t[0].vantages, ["home"]);
+    assert_eq!(
+        t[0].message,
+        "down cleared: 1 of 3 vantages match, fewer than 2"
+    );
+    assert!(e.active().is_empty());
+}
+
+#[test]
+fn a_disconnected_vantage_does_not_count() {
+    let mut e = correlated();
+    let not_b = |s: u64| s != 3;
+    assert!(e.observe_with(2, &dead(1), &not_b).is_empty());
+    // b's round is stored (a replay, say), but its agent is gone.
+    assert!(e.observe_with(3, &dead(1), &not_b).is_empty());
+    let t = e.observe_with(1, &dead(1), &not_b);
+    assert_eq!(t[0].vantages, ["home", "a"]);
+    // a's agent goes away: below two.
+    let t = e.observe_with(1, &dead(2), &|s| s == 1);
+    assert!(!t[0].raised);
+}
+
+#[test]
+fn a_restored_correlated_alert_waits_for_its_vantages() {
+    let mut e = correlated();
+    e.settle_until(10 * STEP);
+    // Restored only under the series that reports it.
+    assert!(!e.restore_with(2, "down", STEP, Some(100.0), vec!["a".into(), "b".into()]));
+    assert!(e.restore_with(1, "down", STEP, Some(100.0), vec!["a".into(), "b".into()]));
+    assert_eq!(e.active()[0].vantages, ["a", "b"]);
+    // Home is fine, a and b have not reported yet: held while settling.
+    assert!(e.observe(1, &round(2, 5, 0)).is_empty());
+    // a is still down: no second raise.
+    assert!(e.observe(2, &dead(2)).is_empty());
+    // b reports, recovered: one left, cleared.
+    let t = e.observe(3, &round(2, 5, 0));
+    assert_eq!(t.len(), 1);
+    assert!(!t[0].raised);
+    assert_eq!(t[0].since_ms, STEP);
+    // After the settling time, agents that did not come back do not count.
+    let mut e = correlated();
+    e.settle_until(2 * STEP);
+    assert!(e.restore_with(1, "down", STEP, None, vec!["a".into(), "b".into()]));
+    let home = |s: u64| s == 1;
+    assert!(e.observe_with(1, &round(1, 5, 0), &home).is_empty());
+    let t = e.observe_with(1, &round(3, 5, 0), &home);
+    assert!(!t[0].raised, "{t:?}");
+}
+
+#[test]
+fn too_few_vantages_are_reported() {
+    let e = correlated();
+    assert_eq!(e.unreachable_groups(), [("down".to_string(), 9, 1)]);
 }

@@ -108,6 +108,9 @@ struct ActiveJson<'a> {
     /// Raised while this parent target had an alert: logged, not sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     suppressed_by: Option<&'a str>,
+    /// For a rule with `min_vantages` > 1, the vantages that matched.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    vantages: &'a [String],
 }
 
 /// Active alerts, the rules and the silences, configured and added.
@@ -127,6 +130,7 @@ pub(crate) async fn alerts(State(s): State<Arc<AppState>>) -> Response {
                 value: a.value.map(crate::round2),
                 silenced_by: a.silenced_by.as_deref(),
                 suppressed_by: a.suppressed_by.as_deref(),
+                vantages: &a.vantages,
             })
         })
         .collect();

@@ -693,6 +693,8 @@ struct RawAlert {
     #[serde(rename = "type")]
     type_: Option<Spanned<String>>,
     pattern: Option<Spanned<Vec<String>>>,
+    /// Correlation (§21.7 G13): vantages that must match at once.
+    min_vantages: Option<Spanned<i64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2056,8 +2058,29 @@ impl Validator<'_> {
             }
             first_line.insert(name.clone(), line);
             self.alert_names.insert(name.clone(), false);
+            let min_vantages = match &a.min_vantages {
+                None => 1,
+                Some(v) => match u32::try_from(*v.get_ref())
+                    .ok()
+                    .filter(|n| (1..=64).contains(n))
+                {
+                    Some(n) => n,
+                    None => {
+                        self.error(
+                            &v.span(),
+                            format!("alert {name:?}: min_vantages must be 1 to 64"),
+                        );
+                        continue;
+                    }
+                },
+            };
             if let Some(kind) = self.alert_kind(a) {
-                out.push(AlertRule { name, kind, line });
+                out.push(AlertRule {
+                    name,
+                    kind,
+                    min_vantages,
+                    line,
+                });
             }
         }
         out
@@ -4024,6 +4047,20 @@ graph    = "off"
         }
         assert_eq!(c.targets[0].alerts, ["loss-burst"]);
         assert_eq!(c.targets[1].alerts, ["loss-burst", "slow"]);
+        assert_eq!(c.alerts[1].min_vantages, 1);
+        // Correlated over vantages (§21.7 G13).
+        let src = ALERTS.replacen(
+            "name      = \"slow\"",
+            "name      = \"slow\"\nmin_vantages = 3",
+            1,
+        );
+        let c = parse(&src).config.unwrap();
+        assert_eq!(c.alerts[1].min_vantages, 3);
+        assert!(
+            c.alerts[1].summary().ends_with("; from 3 vantages at once"),
+            "{}",
+            c.alerts[1].summary()
+        );
     }
 
     #[test]
@@ -4078,6 +4115,11 @@ graph    = "off"
                 "name      = \"slow\"",
                 "name      = \"loss-burst\"",
                 "duplicate alert name",
+            ),
+            (
+                "name      = \"slow\"",
+                "name      = \"slow\"\nmin_vantages = 0",
+                "min_vantages must be 1 to 64",
             ),
         ];
         for (from, to, want) in cases {

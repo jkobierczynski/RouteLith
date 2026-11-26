@@ -154,6 +154,16 @@ impl Board {
         })
     }
 
+    /// Whether the agent's vantage counts for correlated alerts (§21.7
+    /// G13): while connected, and through a short drop until its outage is
+    /// reported, so a reconnect does not clear and raise an alert again.
+    /// Not before its first connection since the server started.
+    pub fn counts(&self, name: &str) -> bool {
+        let map = self.agents.lock().unwrap_or_else(PoisonError::into_inner);
+        map.get(name)
+            .is_some_and(|e| e.status.connected || !e.down_reported)
+    }
+
     /// The agent was refused as revoked; reported once per server run.
     pub fn revoked(&self, name: &str) -> Change {
         self.with(name, |e| {
@@ -238,11 +248,15 @@ mod tests {
     #[test]
     fn up_and_down_are_reported_once_per_outage() {
         let b = Board::default();
+        assert!(!b.counts("genk"));
         assert_eq!(
             b.connected("genk", 1, addr(), "1", "linux", &[], 0),
             Change::Up
         );
+        assert!(b.counts("genk"));
         b.disconnected("genk", 1, 10);
+        // A short drop still counts for correlated alerts.
+        assert!(b.counts("genk"));
         // Back within the grace time: nothing to report.
         assert_eq!(
             b.connected("genk", 2, addr(), "1", "linux", &[], 20),
@@ -250,6 +264,7 @@ mod tests {
         );
         b.disconnected("genk", 2, 30);
         assert_eq!(b.still_down("genk", 2), Change::Down);
+        assert!(!b.counts("genk"));
         assert_eq!(b.still_down("genk", 2), Change::None);
         assert_eq!(
             b.connected("genk", 3, addr(), "1", "linux", &[], 99),

@@ -296,7 +296,13 @@ pub(crate) async fn serve(
             return ExitCode::from(2);
         }
     };
-    let alerting = match crate::alerting::start(&cfg, &alert_series, silences, now_ms()) {
+    let alerting = match crate::alerting::start(
+        &cfg,
+        &alert_series,
+        silences,
+        agents.as_ref().map(|l| l.board.clone()),
+        now_ms(),
+    ) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("routelith server: {e}");
@@ -1814,6 +1820,7 @@ mod tests {
             &cfg,
             &[],
             Arc::new(rl_web::silences::Silences::configured(Vec::new())),
+            None,
             0,
         )
         .unwrap();
