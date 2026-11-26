@@ -329,7 +329,14 @@ pub(crate) async fn serve(
                 )),
                 agents: agents
                     .as_ref()
-                    .map(|l| agents_json(l.board.clone(), cfg.server.data_dir.clone())),
+                    .map(|l| -> Arc<dyn rl_web::agents::AgentAdmin> {
+                        Arc::new(AgentsApi {
+                            board: l.board.clone(),
+                            registry: rl_fed::registry::Registry::new(&cfg.server.data_dir),
+                            ca_sha256: l.ca_sha256,
+                            vantage: cfg.server.vantage.clone(),
+                        })
+                    }),
                 alerts: board.clone(),
                 auth: auth.clone(),
                 slas: cfg.slas.clone(),
@@ -805,13 +812,22 @@ fn spawn_health_writer(
     tx
 }
 
-/// `/api/v1/agents`: every enrolled agent and every one seen since the
-/// start, with what the server knows of it now.
-fn agents_json(board: Arc<rl_fed::status::Board>, data_dir: PathBuf) -> rl_web::AgentsJson {
-    Arc::new(move || {
-        let registry = rl_fed::registry::Registry::new(&data_dir);
-        let records = registry.list().unwrap_or_default();
-        let mut live: HashMap<String, rl_fed::status::AgentStatus> = board
+/// The agents in the API (§21.7 G12): every enrolled agent and every one
+/// seen since the start, with what the server knows of it now; and
+/// enrollment and revocation for admins.
+struct AgentsApi {
+    board: Arc<rl_fed::status::Board>,
+    registry: rl_fed::registry::Registry,
+    ca_sha256: [u8; 32],
+    /// The server's own vantage, which no agent may take.
+    vantage: String,
+}
+
+impl rl_web::agents::AgentAdmin for AgentsApi {
+    fn list(&self) -> serde_json::Value {
+        let records = self.registry.list().unwrap_or_default();
+        let mut live: HashMap<String, rl_fed::status::AgentStatus> = self
+            .board
             .snapshot()
             .into_iter()
             .map(|s| (s.name.clone(), s))
@@ -859,8 +875,54 @@ fn agents_json(board: Arc<rl_fed::status::Board>, data_dir: PathBuf) -> rl_web::
                     .collect::<Vec<_>>(),
             }));
         }
-        serde_json::Value::Array(out)
-    })
+        let now = now_ms();
+        let tokens: Vec<serde_json::Value> = self
+            .registry
+            .pending_tokens(now)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| serde_json::json!({ "name": t.name, "expires_ms": t.expires_ms }))
+            .collect();
+        serde_json::json!({ "agents": out, "tokens": tokens })
+    }
+
+    fn add_token(&self, name: &str) -> Result<(String, i64), (rl_web::StatusCode, String)> {
+        let bad = |m: String| (rl_web::StatusCode::BAD_REQUEST, m);
+        rl_fed::registry::check_name(name).map_err(|e| bad(e.to_string()))?;
+        if name == self.vantage {
+            return Err(bad(format!("{name:?} is the server's own vantage name")));
+        }
+        let now = now_ms();
+        let secret = self
+            .registry
+            .add_token(name, rl_fed::registry::TOKEN_TTL_MS, now)
+            .map_err(|e| match e {
+                rl_fed::FedError::Invalid(m) => bad(m),
+                e => (rl_web::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            })?;
+        let token = rl_fed::token::Token {
+            secret,
+            ca_sha256: self.ca_sha256,
+        };
+        eprintln!("routelith server: an enrollment token for agent {name} was made in the web UI");
+        Ok((token.encode(), now + rl_fed::registry::TOKEN_TTL_MS))
+    }
+
+    fn revoke(&self, name: &str) -> Result<(), (rl_web::StatusCode, String)> {
+        rl_fed::registry::check_name(name)
+            .map_err(|e| (rl_web::StatusCode::BAD_REQUEST, e.to_string()))?;
+        match self.registry.revoke(name, now_ms()) {
+            Ok(true) => {
+                eprintln!("routelith server: agent {name} was revoked in the web UI");
+                Ok(())
+            }
+            Ok(false) => Err((
+                rl_web::StatusCode::NOT_FOUND,
+                format!("no agent named {name}"),
+            )),
+            Err(e) => Err((rl_web::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        }
+    }
 }
 
 /// Move agents' batches into the store queue, waiting for room (on a

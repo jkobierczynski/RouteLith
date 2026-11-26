@@ -234,11 +234,19 @@ fn max_opt(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     }
 }
 
-/// `GET /api/v1/health`: this machine's health snapshots over a range, in
-/// whole-minute buckets sized for `points`.
+/// Whose health: the server's own by default, or an agent's.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct VantageQuery {
+    vantage: Option<String>,
+}
+
+/// `GET /api/v1/health`: a vantage's health snapshots over a range, in
+/// whole-minute buckets sized for `points`. Without `vantage`, this
+/// machine's; agents send theirs once a minute (§21.7 G10).
 pub(crate) async fn history(
     State(s): State<Arc<AppState>>,
     Query(q): Query<RangeQuery>,
+    Query(v): Query<VantageQuery>,
 ) -> Response {
     let (from, to) = match q.resolve() {
         Ok(r) => r,
@@ -248,17 +256,21 @@ pub(crate) async fn history(
     let minutes = ((to - from) / points + MINUTE_MS - 1) / MINUTE_MS;
     let width = minutes.max(1) * MINUTE_MS;
     let dir = s.data_dir.clone();
-    let vantage = s.vantage.clone();
+    let vantage = v.vantage.unwrap_or_else(|| s.vantage.clone());
+    let name = vantage.clone();
     let read =
         tokio::task::spawn_blocking(move || rl_store::read_health(&dir, &vantage, from, to)).await;
     let samples = match read {
         Ok(Ok(v)) => v,
+        Ok(Err(rl_store::StoreError::InvalidKey(v))) => {
+            return error(StatusCode::BAD_REQUEST, format!("no vantage named {v:?}"));
+        }
         Ok(Err(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let (points, network) = summarise(&samples, from, width);
     Json(serde_json::json!({
-        "vantage": s.vantage,
+        "vantage": name,
         "from": from,
         "to": to,
         "width_ms": width,

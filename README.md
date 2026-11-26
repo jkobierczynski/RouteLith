@@ -242,7 +242,25 @@ only that server, and the agent's private key never leaves it. `routelith
 ctl agent list` shows enrolled agents and waiting tokens; `routelith ctl
 agent revoke <name>` refuses an agent's certificate from then on and drops
 its stream within 10 seconds. Enrolling an agent again (with a new token)
-replaces its certificate.
+replaces its certificate. An admin logged in to the web UI can do both on
+the Agents page too (`POST /api/v1/agents/enroll-token` with `{"name":
+…}`, and `DELETE /api/v1/agents/<name>`).
+
+An agent measures only what its own `allow` list lets it, whatever the
+server asks, so a server that is broken into cannot turn agents into
+scanners:
+
+```toml
+allow = ["10.0.0.0/8", "erp.example.be", "*.plant.example", "icmp", "tcp:443"]
+```
+
+Entries are addresses or networks, host names (or every name under a
+domain with `*.`), and probe types with an optional port (`icmp`, `tcp`,
+`tcp:443`, `dns`, `http:8080`). A target must match one entry of each
+kind that the list has; no list allows everything. A target given by
+host name and allowed only by a network is checked against the address
+each round resolves to. Refused series are reported to the server and
+shown in the UI, with why.
 
 Every round an agent measures goes to its spool, `data_dir/spool/`, before
 it is sent, and stays there until the server has stored it and synced it
@@ -280,6 +298,15 @@ vantage:
 | `agent_revoked` | A revoked agent was turned away (once per server run). |
 | `agent_clock_skew`, `agent_clock_ok` | Its clock went beyond 100 ms off, or came back. |
 | `agent_rounds_lost` | Rounds it measured never arrived (its spool was full). |
+
+In the web UI, the overview has a column per vantage; an agent's column
+head shows whether it is connected, and a series it refused says so. The
+target view stacks one graph per vantage, with "Same y-axis for every
+graph" to compare them, and shows each vantage's health. The Agents page
+lists every agent with its status, version, OS, timing, clock offset,
+spool backlog, lost rounds and last contact, and the series it does not
+measure. `/api/v1/health?vantage=<agent>` gives an agent's health
+snapshots.
 
 `/metrics` adds `routelith_agent_connected`,
 `routelith_agent_clock_offset_seconds`, `routelith_agent_spool_bytes` and
