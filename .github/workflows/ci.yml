@@ -323,8 +323,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $exe = "$PWD\target\release\routelith.exe"
           New-Item -ItemType Directory -Force C:\rls, C:\rla | Out-Null
-          Set-Content C:\rls\routelith.toml "[server]`ndata_dir = 'C:\rls\data'`nvantage = 'ci'`nlisten_ui = '127.0.0.1:8090'`nlisten_agents = '127.0.0.1:4443'`n[[group]]`nname = 'remote'`nvantages = ['ci', 'win-agent']`nstep = '10s'`n  [[group.target]]`n  name = 'loopback'`n  host = '127.0.0.1'`n"
+          Set-Content C:\rls\routelith.toml "[server]`ndata_dir = 'C:\rls\data'`nvantage = 'ci'`nlisten_ui = '127.0.0.1:8090'`nlisten_agents = '127.0.0.1:4443'`n[[group]]`nname = 'remote'`nvantages = ['ci', 'win-agent']`nstep = '10s'`npings = 5`n  [[group.target]]`n  name = 'loopback'`n  host = '127.0.0.1'`n"
           Set-Content C:\rla\agent.toml "server = '127.0.0.1:4443'`ndata_dir = 'C:\rla\data'`n"
+          & $exe ctl verify --no-resolve C:\rls\routelith.toml
+          if ($LASTEXITCODE -ne 0) { throw 'the test configuration is invalid' }
           $token = (& $exe ctl agent add win-agent -c C:\rls\routelith.toml | Select-String -Pattern 'rlt1-\S+').Matches[0].Value
           $server = Start-Process $exe -ArgumentList 'server', '-c', 'C:\rls\routelith.toml' -PassThru -NoNewWindow -RedirectStandardError C:\rls\server.log
           foreach ($i in 1..60) { try { Invoke-RestMethod http://127.0.0.1:8090/healthz | Out-Null; break } catch { Start-Sleep 1 } }
