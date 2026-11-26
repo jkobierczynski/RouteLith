@@ -457,9 +457,19 @@
       if (agents) markAgents(heads, agentLine, agents, data.now, cells);
       if (reports.hidden) showReports(reports, alerts.now, alerts.slas && alerts.slas.length > 0);
       const alerting = new Map();
+      const mark = (id, rule) => {
+        if (!alerting.has(id)) alerting.set(id, []);
+        alerting.get(id).push(rule);
+      };
       for (const a of alerts.active) {
-        if (!alerting.has(a.series)) alerting.set(a.series, []);
-        alerting.get(a.series).push(a.rule);
+        if (!a.vantages || !a.vantages.length) {
+          mark(a.series, a.rule);
+          continue;
+        }
+        // One alert over several vantages: mark each that matched.
+        for (const s of series) {
+          if (s.target === a.target && s.family === a.family && a.vantages.includes(s.vantage)) mark(s.id, a.rule);
+        }
       }
       const latest = new Map(data.latest.map((l) => [l.series, l]));
       for (const [id, c] of cells) {
@@ -867,6 +877,9 @@
                 " (" + fmtAge(data.now - a.since) + ")" +
                 (a.value !== undefined ? ", " + fmtValue(a.rule, a.value, data.rules) : ""),
             }),
+            ...(a.vantages && a.vantages.length
+              ? [" ", el("span", { class: "badge vantages", text: "from " + a.vantages.join(", "), title: "The vantages that saw it at once" })]
+              : []),
             ...(a.silenced_by
               ? [" ", el("span", { class: "badge quiet", text: "silenced: " + a.silenced_by, title: "Logged, not sent" })]
               : []),

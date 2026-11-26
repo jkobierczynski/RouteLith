@@ -156,6 +156,7 @@ fn fixture() -> Fixture {
         value: Some(31.25),
         silenced_by: Some("always".into()),
         suppressed_by: None,
+        vantages: Vec::new(),
     }]);
     alerts.count(true);
     let host = Arc::new(LatestHost::default());

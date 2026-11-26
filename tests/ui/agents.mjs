@@ -3,7 +3,9 @@
 // page lists it with its clock and spool and the series its allow-list
 // refused, an admin makes an enrollment token there, the target view
 // stacks one graph per vantage and can share one y-axis, and revoking
-// the agent from the page shows it revoked.
+// the agent from the page shows it revoked. On the way, a rule with
+// min_vantages = 2 raises one alert for a port closed from both vantages,
+// naming both (§21.7 G13).
 //
 //   node tests/ui/agents.mjs target/debug/routelith [screenshot-dir]
 //
@@ -35,6 +37,13 @@ vantage = "home"
 listen_ui = "127.0.0.1:${port}"
 listen_agents = "127.0.0.1:${agentPort}"
 
+[[alert]]
+name = "down-everywhere"
+metric = "loss"
+condition = ">= 100%"
+for = "1 round"
+min_vantages = 2
+
 [[group]]
 name = "local"
 vantages = ["home", "plant-genk"]
@@ -49,7 +58,19 @@ pings = 2
 spread = "500ms"
 timeout = "500ms"
 
-# The agent's allow-list takes only the UI's port, so it refuses this.
+# Closed from both vantages: one correlated alert.
+[[group.target]]
+name = "closed-both"
+host = "127.0.0.1"
+probe = "tcp"
+port = ${port + 3}
+step = "2s"
+pings = 2
+spread = "500ms"
+timeout = "500ms"
+alerts = ["down-everywhere"]
+
+# The agent's allow-list takes only these ports, so it refuses this.
 [[group.target]]
 name = "closed-port"
 host = "127.0.0.1"
@@ -65,7 +86,7 @@ writeFileSync(
   agentCfg,
   `server = "127.0.0.1:${agentPort}"
 data_dir = ${JSON.stringify(join(dir, "agent"))}
-allow = ["127.0.0.0/8", "tcp:${port}"]
+allow = ["127.0.0.0/8", "tcp:${port}", "tcp:${port + 3}"]
 `
 );
 
@@ -143,6 +164,11 @@ try {
   check(/1 agent, 1 connected/.test(await page.textContent("main")), "the overview counts the agents");
   await waitFor(async () => /refused/.test(await page.textContent("table.matrix tbody")), "the refused cell");
   check(true, "the overview marks the series the agent refused");
+  await waitFor(async () => /from (home, plant-genk|plant-genk, home)/.test(await page.textContent("section.alerts")), "the correlated alert", 30000);
+  const raised = await page.$$eval("section.alerts li", (l) => l.map((x) => x.textContent));
+  check(raised.length === 1 && /closed-both.*down-everywhere/.test(raised[0]), "one alert for both vantages, naming them (" + JSON.stringify(raised) + ")");
+  await waitFor(async () => (await page.$$("table.matrix tbody .alerting")).length === 2, "both vantages' cells marked");
+  check(true, "the cells of both vantages are marked");
   if (shots) await page.screenshot({ path: join(shots, "agents-overview.png") });
 
   // The agents page.

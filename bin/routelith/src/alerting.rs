@@ -36,6 +36,8 @@ const DAY_MS: i64 = 86_400_000;
 const HOUR_MS: i64 = 3_600_000;
 /// How long the outputs may take to deliver what is queued at stop.
 const OUTPUT_GRACE: Duration = Duration::from_secs(5);
+/// How long after a start correlated alerts wait for the agents.
+const SETTLE_MS: i64 = 3 * 60_000;
 
 /// Why a raised alert is not sent: (silence, parent target).
 type Quiet = (Option<String>, Option<String>);
@@ -74,6 +76,9 @@ pub(crate) struct Alerting {
     /// Silence and parent of each raised alert, by series and rule.
     quiet: HashMap<(u64, String), Quiet>,
     pub(crate) outputs: rl_out::Outputs,
+    /// The agents' connections, for correlated rules (§21.7 G13): a
+    /// disconnected agent's vantage does not count.
+    agents: Option<Arc<rl_fed::status::Board>>,
     /// Now, Unix milliseconds (replaced in tests).
     clock: fn() -> i64,
 }
@@ -83,6 +88,7 @@ pub(crate) fn start(
     cfg: &Config,
     series: &[SeriesAlerts],
     silences: Arc<Silences>,
+    agents: Option<Arc<rl_fed::status::Board>>,
     now_ms: i64,
 ) -> Result<Alerting, String> {
     let data_dir = &cfg.server.data_dir;
@@ -90,6 +96,26 @@ pub(crate) fn start(
         cfg.alerts.clone(),
         series.iter().map(|s| (s.id, s.rules.clone())),
     );
+    engine.set_groups(series.iter().map(|s| {
+        (
+            s.id,
+            (s.key.target.clone(), s.key.family.clone()),
+            s.key.vantage.clone(),
+        )
+    }));
+    // Agents reconnect within a minute or two of a restart: until then a
+    // correlated alert is not cleared for want of their rounds.
+    engine.settle_until(now_ms + SETTLE_MS);
+    for (rule, series_id, n) in engine.unreachable_groups() {
+        let what = series
+            .iter()
+            .find(|s| s.id == series_id)
+            .map(|s| subject(Some(&s.key.target), Some(&s.key.family)))
+            .unwrap_or_default();
+        eprintln!(
+            "routelith server: warning: {what}alert {rule:?} needs more vantages than the {n} that measure it, so it is never raised"
+        );
+    }
     let rules = cfg
         .alerts
         .iter()
@@ -137,12 +163,19 @@ pub(crate) fn start(
         quiet: HashMap::new(),
         clock: wall_clock_ms,
         outputs,
+        agents,
     };
 
     // Alerts left raised: keep them, or clear those whose rule is gone.
     let mut stale = Vec::new();
     for active in active_from_events(&past) {
-        if engine.restore(active.series, &active.rule, active.since_ms, active.value) {
+        if engine.restore_with(
+            active.series,
+            &active.rule,
+            active.since_ms,
+            active.value,
+            active.vantages.clone(),
+        ) {
             a.quiet.insert(
                 (active.series, active.rule.clone()),
                 (active.silenced_by.clone(), active.suppressed_by.clone()),
@@ -278,6 +311,20 @@ fn values(r: &StoredRound) -> RoundValues {
     RoundValues::from_sorted(r.ts_ms, u32::from(r.sent), &r.rtts_us)
 }
 
+/// Whether a series' vantage counts for correlated rules: the server's
+/// own does, an agent's while it is connected or only briefly away.
+fn counts(
+    keys: &HashMap<u64, SeriesKey>,
+    own: &str,
+    agents: Option<&rl_fed::status::Board>,
+    series: u64,
+) -> bool {
+    match (keys.get(&series), agents) {
+        (Some(k), Some(board)) if k.vantage != own => board.counts(&k.vantage),
+        _ => true,
+    }
+}
+
 /// `target (family): ` for messages.
 fn subject(target: Option<&str>, family: Option<&str>) -> String {
     match (target, family) {
@@ -291,7 +338,9 @@ impl Alerting {
     /// Evaluate a round the store has just written.
     pub(crate) fn round(&mut self, series: u64, r: &StoredRound) {
         self.refresh_baselines(series, r.ts_ms);
-        let transitions = self.engine.observe(series, &values(r));
+        let (keys, own, agents) = (&self.keys, &self.vantage, &self.agents);
+        let counts = |id: u64| counts(keys, own, agents.as_deref(), id);
+        let transitions = self.engine.observe_with(series, &values(r), &counts);
         if !transitions.is_empty() {
             for t in transitions {
                 self.board.count(t.raised);
@@ -480,6 +529,11 @@ impl Alerting {
         e.since = Some(t.since_ms);
         e.silenced_by.clone_from(&quiet.0);
         e.suppressed_by.clone_from(&quiet.1);
+        if !t.vantages.is_empty() || self.engine.correlated(&t.rule) {
+            // About the target, seen from several vantages.
+            e.vantage.clone_from(&self.vantage);
+            e.vantages.clone_from(&t.vantages);
+        }
         e.message = format!(
             "{}{}{}",
             subject(e.target.as_deref(), e.family.as_deref()),
@@ -525,6 +579,7 @@ mod tests {
             cfg,
             series,
             Arc::new(Silences::configured(cfg.silences.clone())),
+            None,
             now_ms,
         )
     }
@@ -604,6 +659,92 @@ mod tests {
         assert_eq!(
             (events[4].from.as_deref(), events[4].to.as_deref()),
             (Some("192.0.2.1"), Some("192.0.2.9"))
+        );
+    }
+
+    #[test]
+    fn a_correlated_alert_counts_connected_vantages_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rule = "[[alert]]\nname = \"down\"\nmetric = \"loss\"\ncondition = \">= 100%\"\nmin_vantages = 2\n";
+        let cfg = config(tmp.path(), rule);
+        let list: Vec<SeriesAlerts> = [(1, "local"), (2, "genk"), (3, "gent")]
+            .into_iter()
+            .map(|(id, v)| SeriesAlerts {
+                id,
+                key: SeriesKey::new(v, "a", "v4"),
+                step_ms: 60_000,
+                rules: vec!["down".into()],
+            })
+            .collect();
+        let board = Arc::new(rl_fed::status::Board::default());
+        let addr = "192.0.2.7:1".parse().unwrap();
+        board.connected("genk", 1, addr, "1", "linux", &[], T0);
+        // gent never connects: its replayed rounds do not count.
+        let mut a = super::start(
+            &cfg,
+            &list,
+            Arc::new(Silences::configured(Vec::new())),
+            Some(board.clone()),
+            T0,
+        )
+        .unwrap();
+        let mut dead = round(1, 5, "192.0.2.1");
+        dead.rtts_us.clear();
+        a.round(3, &dead);
+        a.round(2, &dead);
+        assert!(a.board.active().is_empty());
+        a.round(1, &dead);
+        let active = a.board.active();
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            (active[0].series, &active[0].vantages[..]),
+            (1, &["local".to_string(), "genk".to_string()][..])
+        );
+        // A restart brings it back with its vantages, under the series
+        // that reports it, and does not raise it again.
+        drop(a);
+        let mut a = super::start(
+            &cfg,
+            &list,
+            Arc::new(Silences::configured(Vec::new())),
+            Some(board.clone()),
+            T0 + 2 * STEP,
+        )
+        .unwrap();
+        assert_eq!(a.board.active(), active);
+        dead.ts_ms = T0 + 2 * STEP;
+        a.round(2, &dead);
+        a.round(1, &dead);
+        // genk goes away after the settling time: one left, cleared.
+        board.disconnected("genk", 1, T0 + 6 * STEP);
+        // A short drop still counts; an outage, once reported, does not.
+        dead.ts_ms = T0 + 6 * STEP;
+        a.round(1, &dead);
+        assert_eq!(a.board.active().len(), 1);
+        assert_eq!(board.still_down("genk", 1), rl_fed::status::Change::Down);
+        dead.ts_ms = T0 + 7 * STEP;
+        a.round(1, &dead);
+        assert!(a.board.active().is_empty());
+        let events = rl_store::read_events(tmp.path(), 0, i64::MAX).unwrap();
+        let alerts: Vec<(&str, &[String], &str)> = events
+            .iter()
+            .filter(|e| e.rule.is_some())
+            .map(|e| (e.vantage.as_str(), &e.vantages[..], e.message.as_str()))
+            .collect();
+        assert_eq!(
+            alerts,
+            [
+                (
+                    "local",
+                    &["local".to_string(), "genk".to_string()][..],
+                    "a (v4): down raised: 2 of 3 vantages match (local, genk)"
+                ),
+                (
+                    "local",
+                    &["local".to_string()][..],
+                    "a (v4): down cleared: 1 of 3 vantages match, fewer than 2"
+                ),
+            ]
         );
     }
 
@@ -723,7 +864,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = config(tmp.path(), SLOW);
         let silences = Arc::new(Silences::load(Vec::new(), tmp.path(), T0).unwrap());
-        let mut a = super::start(&cfg, &series(&["slow"]), silences.clone(), T0).unwrap();
+        let mut a = super::start(&cfg, &series(&["slow"]), silences.clone(), None, T0).unwrap();
         a.round(1, &round(1, 30, "192.0.2.1"));
         assert_eq!(a.board.active()[0].silenced_by, None);
 
@@ -751,8 +892,14 @@ mod tests {
         assert_eq!(a.board.active()[0].silenced_by.as_deref(), Some("ui-1"));
         // A restart while the silence is in force keeps the mark.
         drop(a);
-        let mut a =
-            super::start(&cfg, &series(&["slow"]), silences.clone(), T0 + 3 * STEP).unwrap();
+        let mut a = super::start(
+            &cfg,
+            &series(&["slow"]),
+            silences.clone(),
+            None,
+            T0 + 3 * STEP,
+        )
+        .unwrap();
         assert_eq!(a.board.active()[0].silenced_by.as_deref(), Some("ui-1"));
         a.round(1, &round(4, 10, "192.0.2.1"));
         let events = rl_store::read_events(tmp.path(), 0, i64::MAX).unwrap();

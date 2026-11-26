@@ -312,6 +312,31 @@ snapshots.
 `routelith_agent_clock_offset_seconds`, `routelith_agent_spool_bytes` and
 `routelith_agent_rounds_lost_total`, each with an `agent` label.
 
+An alert rule can ask for agreement between vantages, so a problem at
+one site does not read as the target being down:
+
+```toml
+[[alert]]
+name = "down-everywhere"
+metric = "loss"
+condition = ">= 100%"
+for = "2 rounds"
+min_vantages = 2   # raised when 2 or more vantages match at once
+```
+
+The rule still runs on each vantage's series, but only one alert is
+raised per target and family, when `min_vantages` or more vantages match
+at the same time, and it clears when fewer do. The server counts, and so
+does an agent while it is connected; one gone for more than 60 seconds
+(when `agent_disconnected` is logged) no longer does, so a short
+reconnect does not clear an alert and raise it again. The alert names
+the vantages that matched ("2 of 3 vantages match (home, plant-genk)"),
+its event has them under `vantages` and the server's own vantage, and
+the UI shows them next to it. For three minutes after the server starts,
+a raised alert is not cleared just because an agent has not reconnected
+yet. A target measured from fewer vantages than the rule needs never
+raises it, and the server says so at start.
+
 ## Running as a service
 
 **Linux (systemd):** `packaging/linux/routelith.service` runs
