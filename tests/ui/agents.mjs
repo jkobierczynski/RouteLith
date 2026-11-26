@@ -134,6 +134,8 @@ try {
   await page.fill("#login-password", password);
   await page.click("form.login button[type=submit]");
   await page.waitForSelector("table.matrix");
+  // Before the first agent connects there is already a way to the page.
+  check(await page.waitForSelector("main a[href='#/agents']").then(() => true), "the overview links to the Agents page");
 
   // The overview: the agent's column head gets a green dot once it is up.
   await waitFor(async () => (await page.$("table.matrix thead a .dot.up")) !== null, "the agent's column to show connected", 30000);

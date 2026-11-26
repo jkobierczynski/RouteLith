@@ -30,10 +30,16 @@ pub trait AgentAdmin: Send + Sync {
 
 pub(crate) async fn list(State(s): State<Arc<AppState>>) -> Response {
     let Some(a) = s.agents.clone() else {
-        return Json(serde_json::json!({ "agents": [], "tokens": [] })).into_response();
+        return Json(serde_json::json!({ "enabled": false, "agents": [], "tokens": [] }))
+            .into_response();
     };
     match tokio::task::spawn_blocking(move || a.list()).await {
-        Ok(v) => Json(v).into_response(),
+        Ok(mut v) => {
+            // Whether this server takes agents at all, so the UI can
+            // offer the Agents page before the first one is enrolled.
+            v["enabled"] = true.into();
+            Json(v).into_response()
+        }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

@@ -875,7 +875,10 @@ async fn without_agents_the_list_is_empty_and_enrolling_is_refused() {
             .unwrap(),
     )
     .await;
-    assert_eq!(a.body, serde_json::json!({ "agents": [], "tokens": [] }));
+    assert_eq!(
+        a.body,
+        serde_json::json!({ "enabled": false, "agents": [], "tokens": [] })
+    );
     let a = call(
         &f.router,
         write(

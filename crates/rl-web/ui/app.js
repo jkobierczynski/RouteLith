@@ -454,7 +454,7 @@
       ]);
       if (gen !== generation) return;
       showAlerts(alertPanel, alerts);
-      if (agents) markAgents(heads, agentLine, agents.agents, data.now, cells);
+      if (agents) markAgents(heads, agentLine, agents, data.now, cells);
       if (reports.hidden) showReports(reports, alerts.now, alerts.slas && alerts.slas.length > 0);
       const alerting = new Map();
       for (const a of alerts.active) {
@@ -505,10 +505,20 @@
 
   // Overview: a dot in each agent's column head, and how many are up.
   // A series an agent will not measure says so in its cell, with why.
-  function markAgents(heads, line, agents, now, cells) {
+  function markAgents(heads, line, d, now, cells) {
     for (const c of cells.values()) c.refused = false;
-    if (!agents.length) {
+    const agents = d.agents;
+    if (!d.enabled) {
       line.hidden = true;
+      return;
+    }
+    if (!agents.length) {
+      line.replaceChildren(
+        "No agents yet. ",
+        el("a", { href: "#/agents", text: isAdmin() ? "Add one on the Agents page" : "Agents page" }),
+        "."
+      );
+      line.hidden = false;
       return;
     }
     let up = 0;
