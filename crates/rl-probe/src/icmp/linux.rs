@@ -209,7 +209,7 @@ impl Drop for Engine {
 /// it is only trusted while the wall clock and the monotonic clock advanced
 /// alike between send and receive (no NTP step in between) and it is no later
 /// than the user-space receive time. Otherwise the monotonic RTT is used.
-fn select_rtt(
+pub fn select_rtt(
     kernel_rtt: Option<Result<Duration, SystemTimeError>>,
     wall_rtt: Result<Duration, SystemTimeError>,
     user_rtt: Duration,

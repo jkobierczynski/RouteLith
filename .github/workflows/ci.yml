@@ -61,6 +61,20 @@ jobs:
       - run: cargo build --release --locked
       - run: sudo tests/lab/netem-accuracy.sh target/release/routelith
 
+  # `routelith trace` as an unprivileged user over a fake 5-hop path on a
+  # TUN device, IPv4 and IPv6: responders, per-hop loss and RTT
+  # (architecture doc §21.10, "Tracer").
+  trace-lab:
+    name: tracer lab (TUN fake path)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p routelith
+      - run: sudo tests/lab/trace-lab.sh target/release/routelith
+
   # 1,000 loopback targets for one 300 s step: p99 round-start lateness,
   # overruns and CPU (architecture doc §21.2, M0 schedule criterion).
   schedule-bench:

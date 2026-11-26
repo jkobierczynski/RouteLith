@@ -7,7 +7,9 @@ shipped as one self-contained binary.
 
 **Status:** pre-alpha. M0 (ICMP, scheduler, store, SVG smoke graphs) and M1
 (TCP/DNS/HTTP, rollups, web UI, services), M2 (alerts, outputs, reports)
-and M3 (agents) are done. `routelith check icmp`, `check tcp`, `check dns` and
+and M3 (agents) are done; M3.5 (path monitoring) has started with
+`routelith trace --report`, an unprivileged hop-by-hop trace. `routelith
+check icmp`, `check tcp`, `check dns` and
 `check http` work on Linux and Windows, and `routelith server` measures all
 four kinds of target. The server also answers HTTP on `127.0.0.1:8080`
 (`listen_ui` in `[server]`; `"off"` turns it off): a web UI with an overview

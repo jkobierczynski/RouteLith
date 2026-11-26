@@ -115,6 +115,15 @@ namespace, so a container needs it set inside the container.
 On Windows the loopback tests use the ICMP helper API and need no special
 rights. The IPv6 loopback test skips itself when the host has no IPv6.
 
+Where you cannot change the sysctl (a container, the cloud sandbox) but are
+root, run the tests in a new network namespace, whose sysctl is your own:
+
+```sh
+sudo unshare --net sh -c 'ip link set lo up
+  echo "0 2147483647" > /proc/sys/net/ipv4/ping_group_range
+  cargo test --workspace'
+```
+
 ### Smoke-graph goldens
 
 `crates/rl-render/tests/golden.rs` compares rendered SVGs byte for byte with
@@ -145,6 +154,13 @@ sudo tests/lab/netem-accuracy.sh target/release/routelith
 # On a desktop or VM netem itself adds 1–3 ms; loosen the delay tolerance:
 sudo DELAY_TOL_MS=1 tests/lab/netem-accuracy.sh target/release/routelith
 
+# `routelith trace` over a fake 5-hop path on a TUN device, run as user
+# nobody, IPv4 and IPv6 (about 2 minutes). Runs in its own network
+# namespace, so it changes nothing on the host. Needs root, python3,
+# iproute2 and setpriv; no veth or netem, so it also works in containers
+# that have /dev/net/tun.
+sudo tests/lab/trace-lab.sh target/release/routelith
+
 # 1,000 loopback targets for one 300 s step (about 6 minutes):
 # p99 round-start lateness, overruns and CPU. Needs ping_group_range.
 tests/lab/schedule-bench.sh target/release/routelith
@@ -172,6 +188,14 @@ reads late too.
    ```sh
    routelith check icmp 1.1.1.1 -c 5 -i 200ms
    routelith check icmp example.net -6 -q      # IPv6, summary only
+   ```
+
+   Trace the path hop by hop (no root either; same `ping_group_range`),
+   and compare with `traceroute -I` or `mtr`:
+
+   ```sh
+   routelith trace --report -c 20 1.1.1.1
+   routelith trace --json -c 20 -6 example.net
    ```
 
 3. Validate the example configuration:
@@ -252,8 +276,12 @@ cargo build --release
 $env:PATH = "$PWD\target\release;$env:PATH"
 
 routelith check icmp 1.1.1.1 -c 5 -i 200ms
+routelith trace --report -c 20 1.1.1.1
 routelith ctl verify examples\routelith.toml
 ```
+
+`routelith trace` also runs as a standard user; compare its hops with
+`tracert -d 1.1.1.1`.
 
 For the server, use the same `dev.toml` as above. If you give an absolute
 Windows path for `data_dir`, use a TOML literal string (single quotes) so the
@@ -307,6 +335,7 @@ puts the report in the job summary.
 | `rustfmt` | `cargo fmt --all --check` |
 | `test (ubuntu-latest, windows-latest)` | clippy and `cargo test --workspace`; Linux sets `ping_group_range` first so the loopback tests can run |
 | `accuracy lab (netns + netem)` | `tests/lab/netem-accuracy.sh` |
+| `tracer lab (TUN fake path)` | `tests/lab/trace-lab.sh` |
 | `scheduler bench (1,000 targets)` | `tests/lab/schedule-bench.sh` |
 | `R1 calibration (windows-2022, windows-2025)` | `ctl calibrate` on loopback; a missed target is a warning, a failure to measure fails |
 | `check (macos-latest)` | `cargo check` only; macOS is best effort |

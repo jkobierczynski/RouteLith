@@ -34,6 +34,31 @@ pub struct Received {
     pub kernel_time: Option<SystemTime>,
 }
 
+/// What an ICMP error on the error queue says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcmpErrorKind {
+    /// Time Exceeded in transit: a router on the path answered.
+    TimeExceeded,
+    /// Destination Unreachable (any code).
+    Unreachable,
+    /// Any other ICMP error, or a local one (`SO_EE_ORIGIN_LOCAL`).
+    Other,
+}
+
+/// One message read from the error queue of a [`PingSocket`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IcmpError {
+    /// Bytes of the original packet written to the buffer, from its ICMP header.
+    pub len: usize,
+    pub kind: IcmpErrorKind,
+    pub icmp_type: u8,
+    pub icmp_code: u8,
+    /// The host that sent the ICMP error (the router or the destination).
+    pub offender: Option<IpAddr>,
+    /// Kernel receive timestamp of the ICMP error, if enabled.
+    pub kernel_time: Option<SystemTime>,
+}
+
 impl PingSocket {
     /// Open a ping socket. `PermissionDenied` means the caller's group is not in
     /// `net.ipv4.ping_group_range`.
@@ -84,6 +109,79 @@ impl PingSocket {
         } else {
             self.inner.set_ttl_v4(ttl)
         }
+    }
+
+    /// Queue ICMP errors about this socket's own packets (Time Exceeded,
+    /// Destination Unreachable) on the error queue, read with
+    /// [`recv_err`](Self::recv_err). Used by the tracer.
+    pub fn enable_recverr(&self) -> io::Result<()> {
+        let (level, name) = if self.v6 {
+            (libc::SOL_IPV6, libc::IPV6_RECVERR)
+        } else {
+            (libc::SOL_IP, libc::IP_RECVERR)
+        };
+        let on: libc::c_int = 1;
+        // SAFETY: `on` is a live c_int and its exact size is passed as the option length.
+        let rc = unsafe {
+            libc::setsockopt(
+                self.inner.as_raw_fd(),
+                level,
+                name,
+                ptr::from_ref(&on).cast(),
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Read one ICMP error from the error queue. Non-blocking: returns
+    /// `WouldBlock` when the queue is empty. The buffer receives the start of
+    /// the packet the error is about (our echo request, from its ICMP header).
+    pub fn recv_err(&self, buf: &mut [u8]) -> io::Result<IcmpError> {
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        let mut addr = MaybeUninit::<libc::sockaddr_storage>::zeroed();
+        // Room for the timestamp and sock_extended_err + offender sockaddr_in6.
+        let mut control = [0u64; 32];
+        // SAFETY: an all-zero `msghdr` is valid; the fields used are set below.
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_name = addr.as_mut_ptr().cast();
+        msg.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = mem::size_of_val(&control) as _;
+
+        // SAFETY: as in `recv`: every pointer refers to a live local buffer
+        // whose length is given alongside it.
+        let n = unsafe {
+            libc::recvmsg(
+                self.inner.as_raw_fd(),
+                &mut msg,
+                libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT,
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let len = usize::try_from(n).map_err(|_| io::Error::other("negative length"))?;
+        let kernel_time = timestamp_from_control(&msg);
+        let ext = extended_err_from_control(&msg, self.v6)
+            .ok_or_else(|| io::Error::other("error queue message without sock_extended_err"))?;
+        Ok(IcmpError {
+            len,
+            kind: ext.0,
+            icmp_type: ext.1,
+            icmp_code: ext.2,
+            offender: ext.3,
+            kernel_time,
+        })
     }
 
     /// Read one datagram. Non-blocking: returns `WouldBlock` when nothing is queued.
@@ -170,6 +268,62 @@ fn timestamp_from_control(msg: &libc::msghdr) -> Option<SystemTime> {
                 let secs = u64::try_from(ts.tv_sec).ok()?;
                 let nanos = u32::try_from(ts.tv_nsec).ok()?;
                 return Some(UNIX_EPOCH + Duration::new(secs, nanos));
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+    }
+    None
+}
+
+/// The `sock_extended_err` of an error-queue message and the offender
+/// address after it.
+fn extended_err_from_control(
+    msg: &libc::msghdr,
+    v6: bool,
+) -> Option<(IcmpErrorKind, u8, u8, Option<IpAddr>)> {
+    let (level, kind) = if v6 {
+        (libc::SOL_IPV6, libc::IPV6_RECVERR)
+    } else {
+        (libc::SOL_IP, libc::IP_RECVERR)
+    };
+    // SAFETY: as in `timestamp_from_control`; the payload is a
+    // sock_extended_err followed by the offender's sockaddr (SO_EE_OFFENDER),
+    // both read unaligned and only when the cmsg is long enough to hold them.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+        while !cmsg.is_null() {
+            let hdr = &*cmsg;
+            if hdr.cmsg_level == level && hdr.cmsg_type == kind {
+                let data = libc::CMSG_DATA(cmsg);
+                let header = data.offset_from(cmsg.cast::<u8>());
+                let avail = (hdr.cmsg_len as usize).saturating_sub(usize::try_from(header).ok()?);
+                let ee_len = mem::size_of::<libc::sock_extended_err>();
+                if avail < ee_len {
+                    return None;
+                }
+                let ee: libc::sock_extended_err = ptr::read_unaligned(data.cast());
+                let icmp_origin = if v6 {
+                    libc::SO_EE_ORIGIN_ICMP6
+                } else {
+                    libc::SO_EE_ORIGIN_ICMP
+                };
+                let kind = match (ee.ee_origin == icmp_origin, v6, ee.ee_type) {
+                    (true, false, 11) | (true, true, 3) => IcmpErrorKind::TimeExceeded,
+                    (true, false, 3) | (true, true, 1) => IcmpErrorKind::Unreachable,
+                    _ => IcmpErrorKind::Other,
+                };
+                let mut offender = None;
+                if avail >= ee_len + mem::size_of::<libc::sockaddr_in>() {
+                    let mut storage: libc::sockaddr_storage = mem::zeroed();
+                    let take = (avail - ee_len).min(mem::size_of::<libc::sockaddr_storage>());
+                    ptr::copy_nonoverlapping(
+                        data.add(ee_len),
+                        ptr::from_mut(&mut storage).cast::<u8>(),
+                        take,
+                    );
+                    offender = sockaddr_to_ip(&storage);
+                }
+                return Some((kind, ee.ee_type, ee.ee_code, offender));
             }
             cmsg = libc::CMSG_NXTHDR(msg, cmsg);
         }

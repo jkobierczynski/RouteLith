@@ -19,11 +19,13 @@ rl-store.workspace = true
 rl-sys.workspace = true
 rl-web.workspace = true
 rl-out.workspace = true
+rl-path.workspace = true
 rl-fed.workspace = true
 # 0.20: newer releases need a newer Rust than the 1.85 MSRV.
 roxmltree = "0.21"
 # Asks for passwords in `ctl user` without echoing them.
 rpassword = "7.3"
+serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 
