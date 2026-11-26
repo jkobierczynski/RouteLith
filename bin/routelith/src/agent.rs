@@ -156,7 +156,29 @@ async fn run(path: &Path) -> ExitCode {
             dir.display()
         );
     }
-    eprintln!("routelith agent: {} connecting to {}", id.name, cfg.server);
+    let capabilities = capabilities();
+    eprintln!(
+        "routelith agent: {} connecting to {}; can measure {}",
+        id.name,
+        cfg.server,
+        capabilities.join(", ")
+    );
+    // Health snapshots (§21.7 G10), once a minute on the minute.
+    let (health_tx, mut health_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (health_stop, health_stop_rx) = std::sync::mpsc::channel::<()>();
+    let health = std::thread::Builder::new()
+        .name("health".into())
+        .spawn(move || {
+            crate::health::every_minute(&health_stop_rx, rl_fed::now_ms, |s, _| {
+                if let Ok(json) = serde_json::to_vec(&s) {
+                    // Kept while disconnected until the queue is full.
+                    let _ = health_tx.try_send(json);
+                }
+            });
+        });
+    if let Err(e) = &health {
+        eprintln!("routelith agent: warning: no health snapshots: {e}");
+    }
     tokio::pin!(signal);
     let outbox = Arc::new(Outbox::new(spool));
     let mut m = Measuring::new(&id.name, cfg.max_pps, outbox.clone());
@@ -164,13 +186,13 @@ async fn run(path: &Path) -> ExitCode {
     loop {
         let started = Instant::now();
         let attempt = async {
-            match client::connect(&cfg.server, &id, VERSION, outbox.resume()).await {
+            match client::connect(&cfg.server, &id, VERSION, outbox.intro(&capabilities)).await {
                 Ok(s) => {
                     eprintln!(
                         "routelith agent: connected to {} as {} (server version {})",
                         cfg.server, s.name, s.server_version
                     );
-                    let why = session(s, &mut m, &outbox).await;
+                    let why = session(s, &mut m, &outbox, &mut health_rx).await;
                     eprintln!("routelith agent: disconnected: {why}");
                 }
                 Err(e) => eprintln!("routelith agent: {e}"),
@@ -190,6 +212,7 @@ async fn run(path: &Path) -> ExitCode {
         }
     }
     eprintln!("routelith agent: stopping");
+    drop(health_stop);
     m.stop().await;
     let mut spool = outbox.lock();
     if let Err(e) = spool.sync() {
@@ -246,11 +269,12 @@ impl Outbox {
         self.spool.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn resume(&self) -> client::Resume {
+    fn intro(&self, capabilities: &[String]) -> client::Intro {
         let s = self.lock();
-        client::Resume {
+        client::Intro {
             spool_id: s.id(),
             acked_seq: s.acked(),
+            capabilities: capabilities.to_vec(),
         }
     }
 
@@ -296,9 +320,31 @@ impl Outbox {
     }
 }
 
-/// One connection: take the configuration, send spooled rounds, until
-/// the stream ends. Returns why it ended.
-async fn session(mut s: client::Session, m: &mut Measuring, outbox: &Outbox) -> String {
+/// What this agent can measure, for Hello: ICMP only where it may send it.
+fn capabilities() -> Vec<String> {
+    let mut caps = Vec::new();
+    if rl_probe::check_permission(false).is_ok() {
+        caps.push("icmp4".to_string());
+    }
+    if rl_probe::check_permission(true).is_ok() {
+        caps.push("icmp6".to_string());
+    }
+    caps.extend(["tcp", "dns", "http"].map(String::from));
+    caps
+}
+
+/// How often the agent reports its spool.
+const STATUS_EVERY: u32 = 30;
+
+/// One connection: take the configuration, send spooled rounds, answer
+/// clock probes, report status and health, until the stream ends.
+/// Returns why it ended.
+async fn session(
+    mut s: client::Session,
+    m: &mut Measuring,
+    outbox: &Outbox,
+    health: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> String {
     let mut sent = {
         let mut sp = outbox.lock();
         // The server may have stored more than we heard about (an Ack lost
@@ -319,10 +365,20 @@ async fn session(mut s: client::Session, m: &mut Measuring, outbox: &Outbox) -> 
     };
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticks = 0u32;
     loop {
         let mut due = false;
+        let mut extra: Option<pb::agent_message::Msg> = None;
         tokio::select! {
             msg = s.inbound.message() => match msg {
+                Ok(Some(pb::ServerMessage { msg: Some(pb::server_message::Msg::Clock(p)) })) => {
+                    let t2 = rl_fed::now_us();
+                    extra = Some(pb::agent_message::Msg::Clock(pb::ClockReply {
+                        t1_us: p.t1_us,
+                        t2_us: t2,
+                        t3_us: rl_fed::now_us(),
+                    }));
+                }
                 Ok(Some(pb::ServerMessage { msg: Some(pb::server_message::Msg::Config(snap)) })) => {
                     let applied = m.apply(snap).await;
                     let msg = pb::AgentMessage { msg: Some(pb::agent_message::Msg::Applied(applied)) };
@@ -341,13 +397,34 @@ async fn session(mut s: client::Session, m: &mut Measuring, outbox: &Outbox) -> 
                 Err(st) => return st.message().to_string(),
             },
             () = outbox.ready.notified() => {}
+            Some(json) = health.recv() => {
+                extra = Some(pb::agent_message::Msg::Health(pb::Health { sample_json: json }));
+            }
             _ = tick.tick() => {
                 due = true;
+                // The first tick comes at once: report the spool on connect.
+                if ticks % STATUS_EVERY == 0 {
+                    let sp = outbox.lock();
+                    extra = Some(pb::agent_message::Msg::Status(pb::AgentStatus {
+                        spool_bytes: sp.bytes(),
+                        spool_backlog: sp.backlog(),
+                    }));
+                }
+                ticks = ticks.wrapping_add(1);
                 let r = outbox.lock().enforce(rl_fed::now_ms());
                 if let Err(e) = r {
                     outbox.error(e.to_string());
                 }
                 outbox.report_drops();
+            }
+        }
+        if let Some(msg) = extra {
+            if s.outbound
+                .send(pb::AgentMessage { msg: Some(msg) })
+                .await
+                .is_err()
+            {
+                return "the stream closed".to_string();
             }
         }
         // Send what is waiting: a full batch at once, the rest once a

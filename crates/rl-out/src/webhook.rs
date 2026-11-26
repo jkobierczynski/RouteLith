@@ -403,6 +403,13 @@ pub(crate) fn title(e: &Event) -> String {
         EventKind::IpChanged => "address changed",
         EventKind::ServerStarted => "server started",
         EventKind::ServerStopped => "server stopped",
+        EventKind::AgentEnrolled => "agent enrolled",
+        EventKind::AgentConnected => "agent connected",
+        EventKind::AgentDisconnected => "agent disconnected",
+        EventKind::AgentRevoked => "agent revoked",
+        EventKind::AgentClockSkew => "agent clock off",
+        EventKind::AgentClockOk => "agent clock back in line",
+        EventKind::AgentRoundsLost => "agent rounds lost",
         EventKind::Unknown => "event",
     };
     let rule = e
@@ -413,6 +420,10 @@ pub(crate) fn title(e: &Event) -> String {
     let late = if e.late { " (late)" } else { "" };
     match &e.target {
         Some(t) => format!("Routelith: {t} {what}{rule}{late}"),
+        // Agent events: the vantage is the agent.
+        None if e.kind.as_str().starts_with("agent_") => {
+            format!("Routelith: {} {what}", e.vantage)
+        }
         None => format!("Routelith: {what}{rule}{late}"),
     }
 }

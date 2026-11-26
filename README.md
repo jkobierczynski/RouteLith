@@ -257,6 +257,34 @@ true` in JSON outputs, "late:" before the message elsewhere), so a replay
 does not read as something happening now. The server keeps how far it got
 with each agent in `data_dir/agents.json`.
 
+The server keeps track of each agent. `/api/v1/agents` lists every
+enrolled agent with whether it is connected, from where, its version, OS
+and what it can measure, its clock offset, its spool size and backlog,
+and rounds it lost. An agent that cannot send ICMP (no permission) or
+does not know a probe type says so when it connects; the server leaves
+those series out for it and lists them, with why, under `refused`.
+Every 30 seconds the server measures the agent's clock against its own,
+NTP-style; an agent more than 100 ms off is flagged, as its timestamps
+are then off by as much. Agents send a health snapshot (CPU, memory,
+NIC errors) once a minute, kept in `data_dir/health/<agent>/` like the
+server's own.
+
+These go to the event log and the outputs, with the agent's name as
+vantage:
+
+| Event | When |
+|---|---|
+| `agent_enrolled` | An agent used its token. |
+| `agent_connected` | First connection since the server started, or back after a reported outage. |
+| `agent_disconnected` | Gone for more than 60 seconds (shorter drops are not reported). |
+| `agent_revoked` | A revoked agent was turned away (once per server run). |
+| `agent_clock_skew`, `agent_clock_ok` | Its clock went beyond 100 ms off, or came back. |
+| `agent_rounds_lost` | Rounds it measured never arrived (its spool was full). |
+
+`/metrics` adds `routelith_agent_connected`,
+`routelith_agent_clock_offset_seconds`, `routelith_agent_spool_bytes` and
+`routelith_agent_rounds_lost_total`, each with an `agent` label.
+
 ## Running as a service
 
 **Linux (systemd):** `packaging/linux/routelith.service` runs

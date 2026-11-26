@@ -219,11 +219,15 @@ pub struct Session {
     pub outbound: mpsc::Sender<AgentMessage>,
 }
 
-/// The agent's spool, as Hello reports it.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Resume {
+/// What Hello tells the server about the agent besides its version.
+#[derive(Debug, Clone, Default)]
+pub struct Intro {
+    /// The agent's spool and the highest seq it has an Ack for.
     pub spool_id: u64,
     pub acked_seq: u64,
+    /// What it can measure ([`crate::assign::CAPABILITIES`]); empty means
+    /// everything.
+    pub capabilities: Vec<String>,
 }
 
 /// Open the agent stream: Hello, then wait for Welcome.
@@ -231,7 +235,7 @@ pub async fn connect(
     server: &ServerAddr,
     id: &Identity,
     version: &str,
-    resume: Resume,
+    intro: Intro,
 ) -> Result<Session, FedError> {
     let config = tls::client_config(&id.ca, id.cert.clone(), id.key.clone_key())?;
     let channel = channel(server, config).await?;
@@ -240,8 +244,9 @@ pub async fn connect(
         msg: Some(pb::agent_message::Msg::Hello(pb::Hello {
             version: version.to_string(),
             os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-            spool_id: resume.spool_id,
-            acked_seq: resume.acked_seq,
+            spool_id: intro.spool_id,
+            acked_seq: intro.acked_seq,
+            capabilities: intro.capabilities,
         })),
     };
     tx.send(hello)

@@ -67,12 +67,19 @@ pub struct EventFilter {
 }
 
 /// The event kinds an `events` list may name.
-pub const EVENT_KINDS: [&str; 5] = [
+pub const EVENT_KINDS: [&str; 12] = [
     "alert_raised",
     "alert_cleared",
     "ip_changed",
     "server_started",
     "server_stopped",
+    "agent_enrolled",
+    "agent_connected",
+    "agent_disconnected",
+    "agent_revoked",
+    "agent_clock_skew",
+    "agent_clock_ok",
+    "agent_rounds_lost",
 ];
 
 /// A syslog receiver (RFC 5424 or RFC 3164).

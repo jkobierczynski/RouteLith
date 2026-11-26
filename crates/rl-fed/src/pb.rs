@@ -33,7 +33,7 @@ pub struct EnrollResponse {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AgentMessage {
-    #[prost(oneof = "agent_message::Msg", tags = "1, 2, 3")]
+    #[prost(oneof = "agent_message::Msg", tags = "1, 2, 3, 4, 5, 6")]
     pub msg: ::core::option::Option<agent_message::Msg>,
 }
 /// Nested message and enum types in `AgentMessage`.
@@ -46,6 +46,12 @@ pub mod agent_message {
         Results(super::ResultBatch),
         #[prost(message, tag = "3")]
         Applied(super::ConfigApplied),
+        #[prost(message, tag = "4")]
+        Clock(super::ClockReply),
+        #[prost(message, tag = "5")]
+        Status(super::AgentStatus),
+        #[prost(message, tag = "6")]
+        Health(super::Health),
     }
 }
 /// First message on every stream.
@@ -63,10 +69,14 @@ pub struct Hello {
     /// The highest seq the agent has an Ack for.
     #[prost(uint64, tag = "4")]
     pub acked_seq: u64,
+    /// What the agent can measure (§21.7 G10): "icmp4", "icmp6", "tcp",
+    /// "dns", "http". The server does not assign it the rest.
+    #[prost(string, repeated, tag = "5")]
+    pub capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ServerMessage {
-    #[prost(oneof = "server_message::Msg", tags = "1, 2, 3")]
+    #[prost(oneof = "server_message::Msg", tags = "1, 2, 3, 4")]
     pub msg: ::core::option::Option<server_message::Msg>,
 }
 /// Nested message and enum types in `ServerMessage`.
@@ -79,6 +89,8 @@ pub mod server_message {
         Config(super::ConfigSnapshot),
         #[prost(message, tag = "3")]
         Ack(super::Ack),
+        #[prost(message, tag = "4")]
+        Clock(super::ClockProbe),
     }
 }
 /// Answer to Hello.
@@ -198,6 +210,39 @@ pub struct HttpSummary {
 pub struct Ack {
     #[prost(uint64, tag = "1")]
     pub up_to_seq: u64,
+}
+/// Clock offset, NTP-style (§21.7 G10): the server sends its time t1; the
+/// agent answers with t1 and its own receive (t2) and send (t3) times. All
+/// in Unix microseconds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClockProbe {
+    #[prost(int64, tag = "1")]
+    pub t1_us: i64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClockReply {
+    #[prost(int64, tag = "1")]
+    pub t1_us: i64,
+    #[prost(int64, tag = "2")]
+    pub t2_us: i64,
+    #[prost(int64, tag = "3")]
+    pub t3_us: i64,
+}
+/// The agent's state, every 30 s.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AgentStatus {
+    /// Spool size and rounds in it the server has not acknowledged.
+    #[prost(uint64, tag = "1")]
+    pub spool_bytes: u64,
+    #[prost(uint64, tag = "2")]
+    pub spool_backlog: u64,
+}
+/// A health snapshot (§21.3 E13), once a minute.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Health {
+    /// rl_store::HealthSample as JSON, so it can grow without protocol changes.
+    #[prost(bytes = "vec", tag = "1")]
+    pub sample_json: ::prost::alloc::vec::Vec<u8>,
 }
 /// Generated client implementations.
 pub mod agent_client {

@@ -22,6 +22,7 @@ use crate::pb::agent_server::{Agent, AgentServer};
 use crate::pb::{self, AgentMessage, EnrollRequest, EnrollResponse, ServerMessage};
 use crate::registry::{AgentRecord, Registry};
 use crate::seen::Seen;
+use crate::status::{Board, Change};
 use crate::{FedError, tls};
 
 /// How the agent listener is set up.
@@ -41,6 +42,19 @@ pub struct ServerOptions {
     pub assignments: Arc<Assignments>,
     /// Where rounds from agents go; `None` drops them (tests).
     pub rounds: Option<mpsc::Sender<AgentRounds>>,
+    /// Where agents' health snapshots go; `None` drops them.
+    pub health: Option<mpsc::Sender<AgentHealth>>,
+    /// How often each agent's clock is sampled (§21.7 G10).
+    pub clock_every: Duration,
+    /// How long an agent may be gone before that is an event (G11).
+    pub down_after: Duration,
+}
+
+/// An agent's health snapshot (rl_store::HealthSample as JSON).
+#[derive(Debug)]
+pub struct AgentHealth {
+    pub agent: String,
+    pub sample_json: Vec<u8>,
 }
 
 /// Rounds from one agent, for the store. Answer on `done` once they are
@@ -65,12 +79,16 @@ impl ServerOptions {
             hello_timeout: Duration::from_secs(30),
             assignments: Arc::new(Assignments::default()),
             rounds: None,
+            health: None,
+            clock_every: Duration::from_secs(30),
+            down_after: Duration::from_secs(60),
         }
     }
 }
 
-/// Things worth a line in the server's log (and, from M3 step 4, an event).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Things worth a line in the server's log. Those [`AgentEvent::is_event`]
+/// says also go to the event log and outputs (§21.7 G11).
+#[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     Enrolled {
         name: String,
@@ -103,6 +121,53 @@ pub enum AgentEvent {
         rounds: usize,
         reason: String,
     },
+    /// Connected for the first time since the server started, or again
+    /// after an outage that was reported.
+    Up { name: String, addr: SocketAddr },
+    /// Gone for longer than `down_after`, since `since_ms`.
+    Down { name: String, since_ms: i64 },
+    /// Turned away or dropped because it was revoked.
+    Revoked { name: String },
+    /// Its clock is off by more than 100 ms (agent minus server).
+    ClockSkewed { name: String, offset_ms: f64 },
+    /// Back within 100 ms.
+    ClockOk { name: String, offset_ms: f64 },
+    /// Rounds it measured that never arrived: its spool dropped them.
+    RoundsLost { name: String, rounds: u64 },
+}
+
+impl AgentEvent {
+    /// Whether this goes to the event log, not only the server's log.
+    pub fn is_event(&self) -> bool {
+        matches!(
+            self,
+            AgentEvent::Enrolled { .. }
+                | AgentEvent::Up { .. }
+                | AgentEvent::Down { .. }
+                | AgentEvent::Revoked { .. }
+                | AgentEvent::ClockSkewed { .. }
+                | AgentEvent::ClockOk { .. }
+                | AgentEvent::RoundsLost { .. }
+        )
+    }
+
+    /// The agent it is about, if known.
+    pub fn agent(&self) -> Option<&str> {
+        match self {
+            AgentEvent::Refused { .. } => None,
+            AgentEvent::Enrolled { name, .. }
+            | AgentEvent::Connected { name, .. }
+            | AgentEvent::Disconnected { name, .. }
+            | AgentEvent::Configured { name, .. }
+            | AgentEvent::Dropped { name, .. }
+            | AgentEvent::Up { name, .. }
+            | AgentEvent::Down { name, .. }
+            | AgentEvent::Revoked { name }
+            | AgentEvent::ClockSkewed { name, .. }
+            | AgentEvent::ClockOk { name, .. }
+            | AgentEvent::RoundsLost { name, .. } => Some(name),
+        }
+    }
 }
 
 impl std::fmt::Display for AgentEvent {
@@ -142,6 +207,23 @@ impl std::fmt::Display for AgentEvent {
                 rounds,
                 reason,
             } => write!(f, "agent {name}: dropped {rounds} round(s): {reason}"),
+            AgentEvent::Up { name, addr } => write!(f, "agent {name} is connected (from {addr})"),
+            AgentEvent::Down { name, .. } => write!(f, "agent {name} is disconnected"),
+            AgentEvent::Revoked { name } => write!(f, "agent {name} is revoked"),
+            AgentEvent::ClockSkewed { name, offset_ms } => write!(
+                f,
+                "agent {name}: clock is off by {offset_ms:+.0} ms (more than 100 ms)"
+            ),
+            AgentEvent::ClockOk { name, offset_ms } => {
+                write!(
+                    f,
+                    "agent {name}: clock is back within 100 ms ({offset_ms:+.0} ms)"
+                )
+            }
+            AgentEvent::RoundsLost { name, rounds } => write!(
+                f,
+                "agent {name}: {rounds} round(s) were lost (its spool was full or they were too old)"
+            ),
         }
     }
 }
@@ -153,6 +235,8 @@ pub struct AgentListener {
     /// SHA-256 of the CA certificate (what tokens carry).
     pub ca_sha256: [u8; 32],
     pub events: mpsc::Receiver<AgentEvent>,
+    /// Each agent's state now.
+    pub board: Arc<Board>,
     /// Problems found at start-up that did not stop it, for the log.
     pub notes: Vec<String>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -259,7 +343,9 @@ pub async fn bind(opts: ServerOptions) -> Result<AgentListener, FedError> {
     });
 
     let (seen, seen_note) = Seen::load(&opts.data_dir);
+    let board = Arc::new(Board::default());
     let svc = Svc {
+        board: board.clone(),
         registry: Registry::new(&opts.data_dir),
         seen: Arc::new(seen),
         ca: Arc::new(ca),
@@ -281,6 +367,7 @@ pub async fn bind(opts: ServerOptions) -> Result<AgentListener, FedError> {
         local_addr,
         ca_sha256,
         events,
+        board,
         notes: seen_note.into_iter().collect(),
         tasks: vec![accept, serve],
     })
@@ -348,6 +435,7 @@ type Active = Arc<Mutex<HashMap<String, (u64, watch::Sender<bool>)>>>;
 struct Svc {
     registry: Registry,
     seen: Arc<Seen>,
+    board: Arc<Board>,
     ca: Arc<Ca>,
     events: mpsc::Sender<AgentEvent>,
     opts: Arc<ServerOptions>,
@@ -460,6 +548,11 @@ impl Agent for Svc {
                 ));
             }
             Some(r) if r.revoked_ms.is_some() => {
+                if self.board.revoked(&r.name) == Change::Revoked {
+                    let _ = self.events.try_send(AgentEvent::Revoked {
+                        name: r.name.clone(),
+                    });
+                }
                 return refuse(Status::permission_denied(format!(
                     "agent {} is revoked: enroll again with a new token",
                     r.name
@@ -489,7 +582,10 @@ impl Agent for Svc {
             })),
         };
         out.send(Ok(welcome)).await.map_err(internal)?;
-        let snapshot = self.opts.assignments.snapshot(&rec.name);
+        let (snapshot, server_refused) = self
+            .opts
+            .assignments
+            .snapshot_for(&rec.name, &hello.capabilities);
         let assigned = snapshot.assignments.len();
         out.send(Ok(ServerMessage {
             msg: Some(pb::server_message::Msg::Config(snapshot)),
@@ -507,12 +603,27 @@ impl Agent for Svc {
         {
             let _ = older.send(true);
         }
+        let change = self.board.connected(
+            &rec.name,
+            id,
+            info.addr,
+            &hello.version,
+            &hello.os,
+            &hello.capabilities,
+            crate::now_ms(),
+        );
         let _ = self.events.try_send(AgentEvent::Connected {
             name: rec.name.clone(),
             addr: info.addr,
             version: hello.version,
             os: hello.os,
         });
+        if change == Change::Up {
+            let _ = self.events.try_send(AgentEvent::Up {
+                name: rec.name.clone(),
+                addr: info.addr,
+            });
+        }
 
         let events = self.events.clone();
         let active = self.active.clone();
@@ -520,15 +631,22 @@ impl Agent for Svc {
         let recheck = self.opts.recheck;
         let opts = self.opts.clone();
         let seen = self.seen.clone();
+        let board = self.board.clone();
         tokio::spawn(async move {
             let name = rec.name.clone();
             let mut tick = tokio::time::interval(recheck);
             tick.tick().await;
+            let mut clock = tokio::time::interval(opts.clock_every);
+            clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let reason = loop {
                 tokio::select! {
-                    m = inbound.message() => match m {
+                    m = inbound.message() => {
+                    if let Ok(Some(_)) = &m {
+                        board.seen(&name, crate::now_ms());
+                    }
+                    match m {
                         Ok(Some(AgentMessage { msg: Some(pb::agent_message::Msg::Results(b)) })) => {
-                            match take_rounds(&opts, &seen, (&name, spool), b.rounds, &events).await {
+                            match take_rounds(&opts, (&seen, &board), (&name, spool), b.rounds, &events).await {
                                 Ok(Some(up_to_seq)) => {
                                     let ack = ServerMessage {
                                         msg: Some(pb::server_message::Msg::Ack(pb::Ack { up_to_seq })),
@@ -545,17 +663,49 @@ impl Agent for Svc {
                             }
                         }
                         Ok(Some(AgentMessage { msg: Some(pb::agent_message::Msg::Applied(a)) })) => {
+                            let series = assigned.saturating_sub(a.refused.len());
+                            let mut refused = server_refused.clone();
+                            refused.extend(a.refused.into_iter().map(|r| (r.series_id, r.reason)));
+                            board.refused(&name, refused.clone());
                             let _ = events.try_send(AgentEvent::Configured {
                                 name: name.clone(),
-                                series: assigned.saturating_sub(a.refused.len()),
-                                refused: a.refused.into_iter().map(|r| (r.series_id, r.reason)).collect(),
+                                series,
+                                refused,
                             });
+                        }
+                        Ok(Some(AgentMessage { msg: Some(pb::agent_message::Msg::Clock(c)) })) => {
+                            let t4 = crate::now_us();
+                            let (change, offset_ms) = board.clock(&name, [c.t1_us, c.t2_us, c.t3_us, t4]);
+                            let e = match change {
+                                Change::ClockSkewed => Some(AgentEvent::ClockSkewed { name: name.clone(), offset_ms }),
+                                Change::ClockOk => Some(AgentEvent::ClockOk { name: name.clone(), offset_ms }),
+                                _ => None,
+                            };
+                            if let Some(e) = e {
+                                let _ = events.try_send(e);
+                            }
+                        }
+                        Ok(Some(AgentMessage { msg: Some(pb::agent_message::Msg::Status(st)) })) => {
+                            board.spool(&name, st.spool_bytes, st.spool_backlog);
+                        }
+                        Ok(Some(AgentMessage { msg: Some(pb::agent_message::Msg::Health(h)) })) => {
+                            if let Some(tx) = &opts.health {
+                                let _ = tx.try_send(AgentHealth { agent: name.clone(), sample_json: h.sample_json });
+                            }
                         }
                         // Unknown messages from newer agents are ignored.
                         Ok(Some(_)) => {}
                         Ok(None) => break "the agent closed the stream".to_string(),
                         Err(s) => break format!("stream error: {}", s.message()),
-                    },
+                    }},
+                    _ = clock.tick() => {
+                        let probe = ServerMessage {
+                            msg: Some(pb::server_message::Msg::Clock(pb::ClockProbe { t1_us: crate::now_us() })),
+                        };
+                        if out.send(Ok(probe)).await.is_err() {
+                            break "the stream closed".to_string();
+                        }
+                    }
                     _ = stop_rx.changed() => {
                         let _ = out.send(Err(Status::aborted(
                             "replaced by a newer connection from the same agent",
@@ -567,12 +717,18 @@ impl Agent for Svc {
                         let r = registry.clone();
                         let n = name.clone();
                         let now = tokio::task::spawn_blocking(move || r.get(&n)).await;
-                        let still_ok = match now {
-                            Ok(Ok(Some(cur))) => cur.revoked_ms.is_none() && cur.cert_sha256 == rec.cert_sha256,
-                            Ok(Ok(None)) => false,
+                        let (still_ok, revoked) = match now {
+                            Ok(Ok(Some(cur))) => (
+                                cur.revoked_ms.is_none() && cur.cert_sha256 == rec.cert_sha256,
+                                cur.revoked_ms.is_some(),
+                            ),
+                            Ok(Ok(None)) => (false, false),
                             // A read error is not a revocation.
-                            _ => true,
+                            _ => (true, false),
                         };
+                        if revoked && board.revoked(&name) == Change::Revoked {
+                            let _ = events.try_send(AgentEvent::Revoked { name: name.clone() });
+                        }
                         if !still_ok {
                             let _ = out.send(Err(Status::permission_denied(format!(
                                 "agent {name} was revoked or enrolled again"
@@ -588,11 +744,18 @@ impl Agent for Svc {
                     a.remove(&name);
                 }
             }
+            board.disconnected(&name, id, crate::now_ms());
             let _ = events.try_send(AgentEvent::Disconnected {
-                name,
+                name: name.clone(),
                 addr: info.addr,
                 reason,
             });
+            // An outage is an event only once it lasts (§21.7 G11).
+            let since_ms = crate::now_ms();
+            tokio::time::sleep(opts.down_after).await;
+            if board.still_down(&name, id) == Change::Down {
+                let _ = events.try_send(AgentEvent::Down { name, since_ms });
+            }
         });
         Ok(Response::new(ReceiverStream::new(out_rx)))
     }
@@ -605,7 +768,7 @@ impl Agent for Svc {
 /// only acknowledged again; so is a round whose seq does not go up.
 async fn take_rounds(
     opts: &ServerOptions,
-    seen: &Arc<Seen>,
+    (seen, board): (&Arc<Seen>, &Board),
     (name, spool): (&str, u64),
     rounds: Vec<pb::Round>,
     events: &mpsc::Sender<AgentEvent>,
@@ -620,11 +783,24 @@ async fn take_rounds(
         return Ok(Some(up_to));
     }
     let mut fresh = Vec::with_capacity(rounds.len());
+    // Seqs skipped were dropped by the agent's spool before they could be
+    // sent (or lost with its state).
+    let mut lost = 0u64;
+    let mut timing = std::collections::BTreeSet::new();
     for r in rounds {
         if r.seq > high {
+            lost += r.seq - high - 1;
             high = r.seq;
+            timing.insert(u8::try_from(r.timing).unwrap_or(0));
             fresh.push(r);
         }
+    }
+    board.rounds(name, timing, lost);
+    if lost > 0 {
+        let _ = events.try_send(AgentEvent::RoundsLost {
+            name: name.to_string(),
+            rounds: lost,
+        });
     }
     let total = fresh.len();
     let own: Vec<pb::Round> = fresh

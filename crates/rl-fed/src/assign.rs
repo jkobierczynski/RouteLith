@@ -84,6 +84,34 @@ impl Assignments {
             .map_or_else(|| snapshot(Vec::new()), |(s, _)| s.clone())
     }
 
+    /// The agent's snapshot without what it says it cannot measure, and
+    /// those series with why. An agent that names no capabilities (an
+    /// older one) gets everything.
+    pub fn snapshot_for(
+        &self,
+        agent: &str,
+        capabilities: &[String],
+    ) -> (pb::ConfigSnapshot, Vec<(u64, String)>) {
+        let full = self.snapshot(agent);
+        if capabilities.is_empty() {
+            return (full, Vec::new());
+        }
+        let mut refused = Vec::new();
+        let kept = full
+            .assignments
+            .into_iter()
+            .filter(|a| match spec(a).map(|s| missing(&s, capabilities)) {
+                Ok(Some(why)) => {
+                    refused.push((a.series_id, why));
+                    false
+                }
+                // A spec the agent cannot read is its to refuse.
+                _ => true,
+            })
+            .collect();
+        (snapshot(kept), refused)
+    }
+
     /// Whether `series` is one of the agent's.
     pub fn owns(&self, agent: &str, series: u64) -> bool {
         self.by_agent
@@ -94,6 +122,33 @@ impl Assignments {
     pub fn agents(&self) -> impl Iterator<Item = &str> {
         self.by_agent.keys().map(String::as_str)
     }
+}
+
+/// What an agent can measure, as it reports in Hello.
+pub const CAPABILITIES: [&str; 5] = ["icmp4", "icmp6", "tcp", "dns", "http"];
+
+/// Why an agent with `capabilities` cannot measure `spec`, if it cannot.
+pub fn missing(spec: &Spec, capabilities: &[String]) -> Option<String> {
+    let has = |c: &str| capabilities.iter().any(|x| x == c);
+    let ok = match &spec.probe {
+        ProbeConfig::Icmp { .. } => match spec.family {
+            Family::V4 => has("icmp4"),
+            Family::V6 => has("icmp6"),
+            _ => has("icmp4") || has("icmp6"),
+        },
+        ProbeConfig::Tcp { .. } => has("tcp"),
+        ProbeConfig::Dns(_) => has("dns"),
+        ProbeConfig::Http(_) => has("http"),
+    };
+    if ok {
+        return None;
+    }
+    Some(match &spec.probe {
+        ProbeConfig::Icmp { .. } => {
+            "the agent cannot send ICMP for this family (no permission)".to_string()
+        }
+        p => format!("the agent does not support {} probes", p.name()),
+    })
 }
 
 /// A stored round as sent on the wire.
@@ -208,6 +263,38 @@ mod tests {
         assert!(!m.owns("genk", 4));
         assert!(!m.owns("gent", 3));
         assert!(m.snapshot("gent").assignments.is_empty());
+    }
+
+    #[test]
+    fn agents_get_only_what_they_can_measure() {
+        let mut m = Assignments::default();
+        let mut tcp = spec();
+        tcp.probe = ProbeConfig::Tcp {
+            port: 443,
+            mode: rl_core::config::TcpMode::Connect,
+        };
+        let mut v6 = spec();
+        v6.family = Family::V6;
+        m.insert(
+            "genk",
+            vec![
+                assignment(1, "gw", &spec()),
+                assignment(2, "web", &tcp),
+                assignment(3, "gw6", &v6),
+            ],
+        );
+        let caps = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (snap, refused) = m.snapshot_for("genk", &caps(&["icmp4", "tcp"]));
+        let ids: Vec<u64> = snap.assignments.iter().map(|a| a.series_id).collect();
+        assert_eq!(ids, [1, 2]);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].0, 3);
+        let (snap, refused) = m.snapshot_for("genk", &caps(&["icmp6"]));
+        assert_eq!(snap.assignments.len(), 1);
+        assert_eq!(refused.len(), 2);
+        // An older agent names nothing and gets everything.
+        let (snap, refused) = m.snapshot_for("genk", &[]);
+        assert_eq!((snap.assignments.len(), refused.len()), (3, 0));
     }
 
     #[test]

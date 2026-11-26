@@ -25,6 +25,13 @@ pub fn event_id(kind: EventKind) -> (u32, Level) {
         EventKind::IpChanged => (1002, Level::Information),
         EventKind::ServerStarted => (3000, Level::Information),
         EventKind::ServerStopped => (3001, Level::Information),
+        EventKind::AgentEnrolled => (2000, Level::Information),
+        EventKind::AgentConnected => (2001, Level::Information),
+        EventKind::AgentDisconnected => (2002, Level::Warning),
+        EventKind::AgentRevoked => (2003, Level::Warning),
+        EventKind::AgentClockSkew => (2004, Level::Warning),
+        EventKind::AgentClockOk => (2005, Level::Information),
+        EventKind::AgentRoundsLost => (2006, Level::Warning),
         EventKind::Unknown => (3099, Level::Information),
     }
 }
