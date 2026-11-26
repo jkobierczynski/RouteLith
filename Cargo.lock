@@ -109,7 +109,7 @@ dependencies = [
  "nom 7.1.3",
  "num-traits",
  "rusticata-macros",
- "thiserror 2.0.21",
+ "thiserror",
  "time",
 ]
 
@@ -775,7 +775,7 @@ dependencies = [
  "once_cell",
  "rand",
  "ring",
- "thiserror 2.0.21",
+ "thiserror",
  "tinyvec",
  "tracing",
  "url",
@@ -1605,7 +1605,7 @@ version = "0.0.0"
 dependencies = [
  "proptest",
  "serde",
- "thiserror 2.0.21",
+ "thiserror",
  "toml",
 ]
 
@@ -1626,7 +1626,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.21",
+ "thiserror",
  "time",
  "tokio",
  "tokio-rustls",
@@ -1671,7 +1671,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tokio-rustls",
 ]
@@ -1704,7 +1704,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.21",
+ "thiserror",
  "zstd",
 ]
 
@@ -2178,11 +2178,11 @@ dependencies = [
 
 [[package]]
 name = "syslog_rfc5424"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3332b451d5607532b8563a840fe0efa6699bb97756676366866b7a7b67cab23f"
+checksum = "0325229868961bd202714fc201a6e8b3cd7cb93ecdd7abd5b6556fae533e60cd"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror",
  "time",
 ]
 
@@ -2201,31 +2201,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.21",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -2829,7 +2809,7 @@ dependencies = [
  "oid-registry",
  "ring",
  "rusticata-macros",
- "thiserror 2.0.21",
+ "thiserror",
  "time",
 ]
 
