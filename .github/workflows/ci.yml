@@ -279,6 +279,7 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - run: node tests/ui/smoke-graph.mjs target/debug/routelith
       - run: node tests/ui/login.mjs target/debug/routelith
+      - run: node tests/ui/agents.mjs target/debug/routelith
 
   check-macos:
     name: check (macos-latest)

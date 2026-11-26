@@ -155,6 +155,7 @@ table.matrix { border-collapse: collapse; min-width: 100%; }
   white-space: nowrap;
 }
 .matrix thead th { font-weight: 600; color: var(--muted); font-size: 12px; }
+.matrix thead th.cell { text-align: right; }
 .matrix th.group {
   padding-top: 14px;
   font-size: 12px;
@@ -242,3 +243,52 @@ table.matrix { border-collapse: collapse; min-width: 100%; }
 .events ul { margin: 4px 0 0; padding-left: 18px; font-size: 13px; }
 .events li { overflow-wrap: anywhere; }
 .events .event-alert_raised { color: var(--alert); }
+
+/* Agents (§21.7 G12): the agents page, column heads and graph notes. */
+.dot { display: inline-block; width: 8px; height: 8px; margin-right: 5px; border-radius: 50%; background: var(--stale); vertical-align: 0; }
+.dot.up { background: var(--loss-0); }
+.dot.down { background: var(--alert); }
+.dot.revoked { background: var(--muted); }
+.dot.skewed { box-shadow: 0 0 0 2px var(--loss-20); }
+table.agents { border-collapse: collapse; min-width: 100%; font-size: 13px; }
+.agents th, .agents td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; white-space: nowrap; }
+.agents thead th { font-weight: 600; color: var(--muted); font-size: 12px; }
+.agents td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.agents td.bad { color: var(--alert); font-weight: 600; }
+.agents tr.refused td { white-space: normal; color: var(--muted); font-size: 12px; padding-top: 0; }
+.small { font-size: 11px; }
+button.danger {
+  font: inherit;
+  padding: 2px 8px;
+  border: 1px solid var(--alert);
+  border-radius: 4px;
+  background: var(--alert);
+  color: var(--on-accent);
+  cursor: pointer;
+}
+section.enroll, section.tokens { margin: 20px 0; }
+form.enroll { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; }
+form.enroll input {
+  font: inherit;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+form.enroll button[type="submit"] {
+  font: inherit;
+  padding: 4px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--accent);
+  color: var(--on-accent);
+  cursor: pointer;
+}
+.token { margin-top: 10px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); font-size: 13px; }
+.token p { margin: 4px 0; }
+code.secret { font-size: 12px; overflow-wrap: anywhere; user-select: all; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; }
+.toggle { font-size: 13px; color: var(--muted); }
+.agent-note { font-size: 12px; }
+.agent-note[hidden] { display: none; }

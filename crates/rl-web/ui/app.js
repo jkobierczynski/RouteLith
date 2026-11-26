@@ -1,6 +1,7 @@
 // Routelith web UI (architecture doc §20): an overview matrix with the
-// alerts raised now, and a target view of canvas smoke graphs with the
-// target's events, read from /api/v1. Plain JavaScript with no
+// alerts raised now, a target view of canvas smoke graphs (one per
+// vantage) with the target's events, and the agents page (§21.7 G12),
+// read from /api/v1. Plain JavaScript with no
 // build step; the server embeds this file. Once the server has users, a
 // login form comes first (doc §21.5 F11); the session is a cookie the
 // page cannot read, and writes carry its CSRF token.
@@ -31,6 +32,7 @@
   const status = document.getElementById("status");
   const who = document.getElementById("who");
   let series = null; // from /api/v1/series, loaded once
+  let serverVantage = null; // the server's own vantage, from /healthz
   let session = null; // from /api/v1/session: user, role, csrf, ...
   let timer = null;
   let generation = 0; // bumped on navigation; stale fetches are ignored
@@ -98,6 +100,11 @@
     }
     if (!r.ok) throw new Error((answer && answer.error) || r.status + " " + r.statusText);
     return answer;
+  }
+
+  // Only admins who logged in may enroll and revoke agents.
+  function isAdmin() {
+    return !!(session && session.user && session.role === "admin");
   }
 
   // Operators and admins who logged in may add and end silences.
@@ -189,6 +196,7 @@
     if (!series) {
       const [s, h] = await Promise.all([getJson("/api/v1/series"), getJson("/healthz")]);
       series = s.series;
+      serverVantage = h.vantage;
       document.getElementById("vantage").textContent =
         "vantage " + h.vantage + " · v" + h.version;
     }
@@ -293,6 +301,7 @@
     const [path, query] = h.split("?");
     const params = new URLSearchParams(query || "");
     if (path === "/login") return { view: "login" };
+    if (path === "/agents") return { view: "agents" };
     const m = path.match(/^\/target\/(.+)$/);
     if (m) {
       let name;
@@ -302,13 +311,17 @@
         name = m[1];
       }
       const range = RANGES.includes(params.get("range")) ? params.get("range") : "3h";
-      return { view: "target", name, range };
+      return { view: "target", name, range, shared: params.get("y") === "shared" };
     }
     return { view: "overview" };
   }
 
-  function targetHref(name, range) {
-    return "#/target/" + encodeURIComponent(name) + (range && range !== "3h" ? "?range=" + range : "");
+  function targetHref(name, range, shared) {
+    const q = new URLSearchParams();
+    if (range && range !== "3h") q.set("range", range);
+    if (shared) q.set("y", "shared");
+    const qs = q.toString();
+    return "#/target/" + encodeURIComponent(name) + (qs ? "?" + qs : "");
   }
 
   async function route() {
@@ -321,7 +334,8 @@
       if (r.view === "login" || (session.login_required && !session.user)) return showLogin();
       await loadSeries();
       if (gen !== generation) return;
-      if (r.view === "target") await showTarget(r.name, r.range, gen);
+      if (r.view === "target") await showTarget(r.name, r.range, r.shared, gen);
+      else if (r.view === "agents") await showAgents(gen);
       else await showOverview(gen);
     } catch (e) {
       if (gen !== generation) return;
@@ -398,17 +412,34 @@
       }
       tbody.append(tr);
     }
+    // An agent's column head says whether it is connected (§21.7 G12).
+    const heads = new Map();
     const table = el(
       "table",
       { class: "matrix" },
-      el("thead", {}, el("tr", {}, el("th", { text: "Target" }), ...vantages.map((v) => el("th", { class: "cell", text: v })))),
+      el(
+        "thead",
+        {},
+        el(
+          "tr",
+          {},
+          el("th", { text: "Target" }),
+          ...vantages.map((v) => {
+            const th = el("th", { class: "cell", text: v });
+            heads.set(v, th);
+            return th;
+          })
+        )
+      ),
       tbody
     );
+    const agentLine = el("p", { class: "muted", hidden: true });
     const alertPanel = el("section", { class: "alerts", hidden: true });
     const reports = el("p", { class: "muted reports", hidden: true });
     app.replaceChildren(
       el("h1", { text: "Overview" }),
       el("p", { class: "muted", text: series.length + " series. Each cell is the newest round's median." }),
+      agentLine,
       alertPanel,
       lossLegend(),
       el("div", { class: "scroll" }, table),
@@ -416,9 +447,14 @@
     );
 
     async function refresh() {
-      const [data, alerts] = await Promise.all([getJson("/api/v1/latest"), getJson("/api/v1/alerts")]);
+      const [data, alerts, agents] = await Promise.all([
+        getJson("/api/v1/latest"),
+        getJson("/api/v1/alerts"),
+        getJson("/api/v1/agents").catch(() => null),
+      ]);
       if (gen !== generation) return;
       showAlerts(alertPanel, alerts);
+      if (agents) markAgents(heads, agentLine, agents, data.now, cells);
       if (reports.hidden) showReports(reports, alerts.now, alerts.slas && alerts.slas.length > 0);
       const alerting = new Map();
       for (const a of alerts.active) {
@@ -427,6 +463,7 @@
       }
       const latest = new Map(data.latest.map((l) => [l.series, l]));
       for (const [id, c] of cells) {
+        if (c.refused) continue;
         const l = latest.get(id);
         if (!l) {
           c.span.textContent = "–";
@@ -452,6 +489,63 @@
       }
     }
     poll(gen, refresh, OVERVIEW_REFRESH_MS);
+  }
+
+  // An agent's state in a few words, and as a class for its dot.
+  function agentState(a, now) {
+    if (a.revoked_ms) return { cls: "revoked", text: "revoked " + fmtTime(a.revoked_ms, true) };
+    if (a.connected) return { cls: "up", text: "connected" + (a.connected_ms ? " for " + fmtAge(now - a.connected_ms) : "") };
+    if (a.last_seen_ms) return { cls: "down", text: "disconnected, last seen " + fmtAge(now - a.last_seen_ms) + " ago" };
+    return { cls: "down", text: "not connected since the server started" };
+  }
+
+  function dot(cls, title) {
+    return el("span", { class: "dot " + cls, title, "aria-label": title });
+  }
+
+  // Overview: a dot in each agent's column head, and how many are up.
+  // A series an agent will not measure says so in its cell, with why.
+  function markAgents(heads, line, d, now, cells) {
+    for (const c of cells.values()) c.refused = false;
+    const agents = d.agents;
+    if (!d.enabled) {
+      line.hidden = true;
+      return;
+    }
+    if (!agents.length) {
+      line.replaceChildren(
+        "No agents yet. ",
+        el("a", { href: "#/agents", text: isAdmin() ? "Add one on the Agents page" : "Agents page" }),
+        "."
+      );
+      line.hidden = false;
+      return;
+    }
+    let up = 0;
+    for (const a of agents) {
+      for (const r of a.refused || []) {
+        const c = cells.get(r.series);
+        if (!c) continue;
+        c.refused = true;
+        c.span.textContent = "refused";
+        c.span.title = a.name + " does not measure this: " + r.reason;
+        c.span.classList.remove("alerting");
+        c.span.style.borderLeftColor = css("--stale");
+      }
+      const st = agentState(a, now);
+      if (st.cls === "up") up++;
+      const th = heads.get(a.name);
+      if (!th) continue;
+      const title = "Agent " + a.name + ": " + st.text + (a.clock_skewed ? "; clock off by more than 100 ms" : "");
+      th.replaceChildren(
+        el("a", { href: "#/agents", title }, dot(st.cls + (a.clock_skewed ? " skewed" : ""), title), a.name)
+      );
+    }
+    line.replaceChildren(
+      el("a", { href: "#/agents", text: agents.length === 1 ? "1 agent" : agents.length + " agents" }),
+      ", " + up + " connected."
+    );
+    line.hidden = false;
   }
 
   // Links to the reports (UTC months): the incident timeline of this
@@ -481,6 +575,252 @@
     }
     p.replaceChildren(...parts);
     p.hidden = false;
+  }
+
+  // ---------- agents (§21.7 G12) ----------
+
+  const AGENTS_REFRESH_MS = 15e3;
+
+  function fmtBytes(b) {
+    if (b === undefined || b === null) return "–";
+    if (b < 1024) return b + " B";
+    if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+    return (b / 1048576).toFixed(1) + " MB";
+  }
+
+  function fmtOffset(ms) {
+    if (ms === undefined || ms === null) return "–";
+    const a = Math.abs(ms);
+    const t = a < 10 ? ms.toFixed(1) : String(Math.round(ms));
+    return (ms > 0 ? "+" : "") + t + " ms";
+  }
+
+  async function showAgents(gen) {
+    crumbs.replaceChildren(el("a", { href: "#/", text: "Overview" }), el("span", { text: "›" }), el("span", { text: "Agents" }));
+    document.title = "Agents · Routelith";
+    const tbody = el("tbody");
+    const tokens = el("section", { class: "tokens", hidden: true });
+    const enroll = isAdmin() ? enrollForm() : null;
+    const intro = el("p", { class: "muted" });
+    app.replaceChildren(
+      el("h1", { text: "Agents" }),
+      intro,
+      el(
+        "div",
+        { class: "scroll" },
+        el(
+          "table",
+          { class: "agents" },
+          el(
+            "thead",
+            {},
+            el(
+              "tr",
+              {},
+              ...["Agent", "Status", "Address", "Version", "Measures", "Timing", "Clock", "Spool", "Lost rounds", "Last seen", ""].map((h) =>
+                el("th", { text: h })
+              )
+            )
+          ),
+          tbody
+        )
+      ),
+      tokens,
+      enroll
+    );
+    // Revocation asks once more in its row; keep that row as it is
+    // while it does.
+    let confirming = null;
+
+    async function refresh() {
+      const d = await getJson("/api/v1/agents");
+      if (gen !== generation) return;
+      const now = Date.now();
+      const byId = new Map(series.map((s) => [s.id, s]));
+      const counts = new Map();
+      for (const s of series) counts.set(s.vantage, (counts.get(s.vantage) || 0) + 1);
+      intro.textContent = d.agents.length
+        ? "Agents measure from other sites and report here. Each one's series are under its name in the overview."
+        : "No agents yet. " + (isAdmin() ? "Add one below, or" : "An admin adds one here, or") + " on the server: routelith ctl agent add <name>.";
+      if (confirming && d.agents.some((a) => a.name === confirming)) return showTokens(tokens, d.tokens, now);
+      confirming = null;
+      tbody.replaceChildren();
+      for (const a of d.agents) {
+        const st = agentState(a, now);
+        const n = counts.get(a.name) || 0;
+        const clock = el("td", { class: "num" + (a.clock_skewed ? " bad" : ""), text: fmtOffset(a.clock_offset_ms) });
+        if (a.clock_offset_ms !== null && a.clock_offset_ms !== undefined) {
+          clock.title =
+            "Agent clock minus server clock, measured over a " + (a.clock_delay_ms ?? 0).toFixed(1) + " ms round trip" +
+            (a.clock_skewed ? ". More than 100 ms off: its rounds' times are off by as much." : "");
+        }
+        const tr = el(
+          "tr",
+          { "data-agent": a.name },
+          el("th", { scope: "row" }, el("strong", { text: a.name }), el("div", { class: "muted small", text: n === 1 ? "1 series" : n + " series" })),
+          el("td", {}, dot(st.cls, st.text), st.text),
+          el("td", { text: a.addr || "–" }),
+          el("td", {}, a.version || "–", a.os ? el("div", { class: "muted small", text: a.os }) : null),
+          el("td", { text: a.capabilities && a.capabilities.length ? a.capabilities.join(", ") : "–" }),
+          el("td", { text: a.timing && a.timing.length ? a.timing.join("; ") : "–" }),
+          clock,
+          el(
+            "td",
+            { class: "num", title: "Rounds measured and not yet stored here, and the spool's size on the agent" },
+            a.spool_backlog === null || a.spool_backlog === undefined ? "–" : a.spool_backlog + " waiting",
+            el("div", { class: "muted small", text: fmtBytes(a.spool_bytes) })
+          ),
+          el("td", { class: "num" + (a.rounds_lost ? " bad" : ""), text: String(a.rounds_lost || 0), title: "Since the server started" }),
+          el("td", { text: a.connected ? "now" : a.last_seen_ms ? fmtAge(now - a.last_seen_ms) + " ago" : "–" }),
+          el("td", {}, isAdmin() && !a.revoked_ms ? revokeButton(a.name) : null)
+        );
+        tbody.append(tr);
+        if (a.refused && a.refused.length) {
+          tbody.append(
+            el(
+              "tr",
+              { class: "refused" },
+              el(
+                "td",
+                { colspan: 11 },
+                el("strong", { text: "Not measured by " + a.name + ": " }),
+                ...a.refused.flatMap((r, i) => {
+                  const s = byId.get(r.series);
+                  const what = s ? s.target + " (" + s.family + ")" : "series " + r.series;
+                  return [i ? "; " : "", s ? el("a", { href: targetHref(s.target), text: what }) : what, " — " + r.reason];
+                })
+              )
+            )
+          );
+        }
+      }
+      showTokens(tokens, d.tokens, now);
+    }
+
+    function revokeButton(name) {
+      const cell = el("span");
+      const ask = el("button", {
+        class: "link",
+        type: "button",
+        text: "Revoke…",
+        title: "Refuse this agent's certificate from now on",
+        onclick: () => {
+          confirming = name;
+          const msg = el("span", { class: "error", role: "alert" });
+          const yes = el("button", {
+            class: "danger",
+            type: "button",
+            text: "Revoke " + name,
+            onclick: async () => {
+              yes.disabled = true;
+              try {
+                await send("DELETE", "/api/v1/agents/" + encodeURIComponent(name));
+                confirming = null;
+                refresh().catch(() => {});
+              } catch (e) {
+                if (e instanceof LoginNeeded) return route();
+                msg.textContent = " " + e.message;
+                yes.disabled = false;
+              }
+            },
+          });
+          cell.replaceChildren(
+            yes,
+            " ",
+            el("button", {
+              class: "link",
+              type: "button",
+              text: "Cancel",
+              onclick: () => {
+                confirming = null;
+                refresh().catch(() => {});
+              },
+            }),
+            msg
+          );
+          yes.focus();
+        },
+      });
+      cell.append(ask);
+      return cell;
+    }
+
+    function enrollForm() {
+      const name = el("input", {
+        id: "agent-name",
+        "aria-label": "Agent name",
+        placeholder: "plant-genk",
+        required: true,
+        maxlength: 64,
+        pattern: "[A-Za-z0-9][A-Za-z0-9._\\-]*",
+      });
+      const ok = el("button", { type: "submit", text: "Make a token" });
+      const msg = el("span", { class: "error", role: "alert" });
+      const out = el("div", { class: "token", hidden: true });
+      const form = el(
+        "form",
+        { class: "enroll", onsubmit: submit },
+        el("label", { for: "agent-name", text: "Agent name" }),
+        name,
+        ok,
+        msg
+      );
+      async function submit(ev) {
+        ev.preventDefault();
+        ok.disabled = true;
+        msg.textContent = "";
+        try {
+          const t = await send("POST", "/api/v1/agents/enroll-token", { name: name.value.trim() });
+          const code = el("code", { class: "secret", text: t.token });
+          const copy = el("button", {
+            class: "link",
+            type: "button",
+            text: "Copy",
+            onclick: async () => {
+              try {
+                await navigator.clipboard.writeText(t.token);
+                copy.textContent = "Copied";
+              } catch (_) {
+                copy.textContent = "Select the token and copy it";
+              }
+            },
+          });
+          out.replaceChildren(
+            el("p", {}, "Enrollment token for ", el("strong", { text: t.name }), ", works once, until " + fmtTime(t.expires_ms, true) + ":"),
+            el("p", {}, code, " ", copy),
+            el("p", { class: "muted", text: "On the agent: routelith agent enroll --config agent.toml --token <token>, then routelith agent run --config agent.toml." }),
+            el("p", {
+              class: "muted",
+              text: "Groups with vantages = [\"*\"] take in the new agent after the server restarts. The token is shown only now.",
+            })
+          );
+          out.hidden = false;
+          name.value = "";
+          refresh().catch(() => {});
+        } catch (e) {
+          if (e instanceof LoginNeeded) return route();
+          msg.textContent = e.message;
+        } finally {
+          ok.disabled = false;
+        }
+      }
+      return el("section", { class: "enroll" }, el("h2", { text: "Add an agent" }), form, out);
+    }
+
+    poll(gen, refresh, AGENTS_REFRESH_MS);
+  }
+
+  function showTokens(panel, tokens, now) {
+    panel.hidden = !tokens || !tokens.length;
+    if (panel.hidden) return;
+    panel.replaceChildren(
+      el("h2", { text: "Tokens not used yet" }),
+      el(
+        "ul",
+        {},
+        ...tokens.map((t) => el("li", {}, el("strong", { text: t.name }), el("span", { class: "muted", text: " valid until " + fmtTime(t.expires_ms, t.expires_ms - now > 20 * 3600e3) })))
+      )
+    );
   }
 
   // ---------- alerts (§12) ----------
@@ -719,7 +1059,7 @@
 
   // ---------- target view (§20.2) ----------
 
-  async function showTarget(name, range, gen) {
+  async function showTarget(name, range, shared, gen) {
     const list = series
       .filter((s) => s.target === name)
       .sort((a, b) => a.vantage.localeCompare(b.vantage) || a.family.localeCompare(b.family));
@@ -733,23 +1073,60 @@
     const ranges = el(
       "div",
       { class: "ranges", role: "group", "aria-label": "Time range" },
-      ...RANGES.map((r) => el("button", { type: "button", "aria-pressed": r === range ? "true" : "false", text: r, onclick: () => (location.hash = targetHref(name, r)) }))
+      ...RANGES.map((r) => el("button", { type: "button", "aria-pressed": r === range ? "true" : "false", text: r, onclick: () => (location.hash = targetHref(name, r, shared)) }))
     );
-    // This machine's health snapshots (§19), shared by its graphs.
-    const host = { data: null };
-    const hostPanel = el("section", { class: "host", hidden: true });
+    // With more than one graph, one y-axis for all of them makes the
+    // vantages comparable at a glance (§21.7 G12).
+    const vantages = [...new Set(list.map((s) => s.vantage))];
+    const yToggle =
+      list.length > 1
+        ? el(
+            "label",
+            { class: "toggle" },
+            el("input", {
+              type: "checkbox",
+              checked: shared,
+              onchange: (ev) => (location.hash = targetHref(name, range, ev.target.checked)),
+            }),
+            " Same y-axis for every graph"
+          )
+        : null;
+    // Each vantage's health snapshots (§19; agents send theirs, G10),
+    // shared by its graphs.
+    const hosts = new Map(vantages.map((v) => [v, { data: null, panel: el("section", { class: "host", hidden: true }) }]));
     async function loadHost() {
       const width = Math.max(200, Math.round(app.clientWidth || 800));
-      try {
-        const d = await getJson("/api/v1/health?range=" + range + "&points=" + Math.min(5000, width));
-        if (gen !== generation) return;
-        host.data = d;
-      } catch (_) {
-        host.data = null;
-      }
-      showHost(hostPanel, host.data, list);
+      await Promise.all(
+        vantages.map(async (v) => {
+          const h = hosts.get(v);
+          try {
+            const d = await getJson(
+              "/api/v1/health?range=" + range + "&points=" + Math.min(5000, width) + "&vantage=" + encodeURIComponent(v)
+            );
+            if (gen !== generation) return;
+            h.data = d;
+          } catch (_) {
+            h.data = null;
+          }
+          showHost(h.panel, h.data, list);
+        })
+      );
     }
-    const graphs = list.map((s) => makeGraph(s, range, gen, host));
+    // Which vantages are agents, and whether they are connected.
+    async function loadAgents() {
+      if (vantages.every((v) => v === serverVantage)) return;
+      let d;
+      try {
+        d = await getJson("/api/v1/agents");
+      } catch (_) {
+        return;
+      }
+      if (gen !== generation) return;
+      const now = Date.now();
+      const by = new Map(d.agents.map((a) => [a.name, a]));
+      for (const g of graphs) g.setAgent(by.get(g.vantage), now);
+    }
+    const graphs = list.map((s) => makeGraph(s, range, gen, hosts.get(s.vantage)));
     const eventPanel = el("section", { class: "events", hidden: true });
     async function loadEvents() {
       const to = Date.now();
@@ -771,18 +1148,22 @@
         { class: "muted" },
         "group " + first.group + " · " + first.probe + " · " + (first.url || first.host) + " · every " + fmtStep(first.step_s) + ", " + first.pings + " samples per round"
       ),
-      ranges,
+      el("div", { class: "controls" }, ranges, yToggle),
       lossLegend(),
       ...graphs.map((g) => g.root),
       eventPanel,
-      hostPanel
+      ...vantages.map((v) => hosts.get(v).panel)
     );
     // A graph that fails keeps its last data (or its error) while the
     // others show theirs; the next refresh tries it again.
     async function refresh() {
-      await Promise.all([loadHost(), loadEvents()]);
+      await Promise.all([loadHost(), loadEvents(), loadAgents()]);
       if (gen !== generation) return;
       const results = await Promise.allSettled(graphs.map((g) => g.load()));
+      if (shared && gen === generation) {
+        const top = Math.max(0, ...graphs.map((g) => g.ownTop()));
+        for (const g of graphs) g.setTop(top);
+      }
       const failed = results.find((r) => r.status === "rejected");
       if (failed) throw failed.reason;
     }
@@ -825,7 +1206,7 @@
     }
     const now = h.network.length ? h.network[h.network.length - 1] : null;
     const items = [
-      el("h2", { text: "This machine (" + h.vantage + ")" }),
+      el("h2", { text: h.vantage === serverVantage ? "This machine (" + h.vantage + ")" : "Agent " + h.vantage }),
       el(
         "p",
         { class: "host-summary" },
@@ -859,10 +1240,14 @@
     const tip = el("div", { class: "tip", hidden: true });
     const summary = el("div", { class: "summary", text: "Loading…" });
     const svg = el("a", { href: "/api/v1/render/" + s.id + ".svg?range=" + range, target: "_blank", rel: "noopener", text: "SVG" });
+    // For an agent's graph: a word when it is not connected now.
+    const agentNote = el("span", { class: "agent-note", hidden: true });
+    // The shared y-axis top (ms), when the view has one.
+    let sharedTop = null;
     const root = el(
       "section",
       { class: "graph", "data-series": s.id },
-      el("div", { class: "head" }, el("strong", { text: s.family + " from " + s.vantage }), el("span", { class: "meta" }, "series " + s.id + " · ", svg)),
+      el("div", { class: "head" }, el("strong", { text: s.family + " from " + s.vantage }), agentNote, el("span", { class: "meta" }, "series " + s.id + " · ", svg)),
       el("div", { class: "plot" }, canvas, tip),
       summary
     );
@@ -936,13 +1321,7 @@
       const to = data.to;
       const x = (t) => L + ((t - from) / (to - from)) * pw;
 
-      // Y range from the highest p90 (the 18th of 20 quantiles), so a few
-      // outliers are clipped instead of flattening the graph.
-      let top = 0;
-      for (const p of data.points) {
-        if (p.q.length) top = Math.max(top, p.q[Math.floor((p.q.length - 1) * 0.9)]);
-      }
-      top = Math.max(top / 1000, 0.1) * 1.1;
+      const top = sharedTop !== null ? Math.max(sharedTop, ownTop()) : ownTop();
       const tick = niceStep(top, 4);
       const yMax = Math.ceil(top / tick) * tick;
       const y = (ms) => T + ph - (Math.min(ms, yMax) / yMax) * ph;
@@ -1043,6 +1422,36 @@
       }
     }
 
+    // Y range from the highest p90 (the 18th of 20 quantiles), so a few
+    // outliers are clipped instead of flattening the graph; in ms.
+    function ownTop() {
+      if (!data) return 0;
+      let top = 0;
+      for (const p of data.points) {
+        if (p.q.length) top = Math.max(top, p.q[Math.floor((p.q.length - 1) * 0.9)]);
+      }
+      return Math.max(top / 1000, 0.1) * 1.1;
+    }
+
+    function setTop(t) {
+      sharedTop = t;
+      canvas.dataset.top = String(t);
+      draw();
+    }
+
+    function setAgent(a, now) {
+      if (!a) {
+        agentNote.hidden = true;
+        return;
+      }
+      const st = agentState(a, now);
+      agentNote.hidden = st.cls === "up" && !a.clock_skewed;
+      agentNote.replaceChildren(
+        dot(st.cls, st.text),
+        el("a", { href: "#/agents", text: st.cls === "up" ? "clock off by " + fmtOffset(a.clock_offset_ms) : "agent " + st.text })
+      );
+    }
+
     function pointAt(px) {
       if (!data || !layout) return null;
       // The drawn column under the pointer, or the nearest within 3 px, so
@@ -1075,7 +1484,7 @@
         healthLines.push(
           el("div", {
             class: "tip-host",
-            text: "this machine: CPU " + (q.cpu_pct === undefined ? "–" : q.cpu_pct.toFixed(0) + " %") + " · NIC errors " + (q.nic_errors ?? "–") + " · drops " + (q.nic_drops ?? "–"),
+            text: (s.vantage === serverVantage ? "this machine" : s.vantage) + ": CPU " + (q.cpu_pct === undefined ? "–" : q.cpu_pct.toFixed(0) + " %") + " · NIC errors " + (q.nic_errors ?? "–") + " · drops " + (q.nic_drops ?? "–"),
           })
         );
       }
@@ -1110,7 +1519,7 @@
     const theme = window.matchMedia("(prefers-color-scheme: dark)");
     theme.addEventListener("change", draw);
     observers.push({ disconnect: () => theme.removeEventListener("change", draw) });
-    return { root, load };
+    return { root, load, ownTop, setTop, setAgent, vantage: s.vantage };
   }
 
   function niceStep(max, ticks) {

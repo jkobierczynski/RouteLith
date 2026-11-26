@@ -25,6 +25,8 @@ pub struct AgentConfig {
     pub max_pps: u32,
     /// Bounds on the spool of rounds not yet stored by the server.
     pub spool: crate::spool::Limits,
+    /// What this agent agrees to measure (§21.7 G6); empty allows all.
+    pub allow: crate::allow::AllowList,
 }
 
 /// Default `max_pps`, as for the server.
@@ -38,6 +40,8 @@ struct Raw {
     max_pps: Option<i64>,
     spool_max_mb: Option<i64>,
     spool_max_days: Option<i64>,
+    #[serde(default)]
+    allow: Vec<String>,
 }
 
 impl AgentConfig {
@@ -71,6 +75,7 @@ impl AgentConfig {
             data_dir: PathBuf::from(raw.data_dir),
             max_pps,
             spool,
+            allow: crate::allow::AllowList::parse(&raw.allow)?,
         })
     }
 
@@ -91,6 +96,19 @@ mod tests {
             AgentConfig::parse("server = \"mon.example.be\"\ndata_dir = \"/var/lib/a\"\n").unwrap();
         assert_eq!(c.server.port, crate::DEFAULT_PORT);
         assert_eq!(c.data_dir, PathBuf::from("/var/lib/a"));
+    }
+
+    #[test]
+    fn an_allow_list() {
+        let c = AgentConfig::parse(
+            "server = \"x\"\ndata_dir = \"d\"\nallow = [\"10.0.0.0/8\", \"tcp:443\"]\n",
+        )
+        .unwrap();
+        assert!(!c.allow.is_empty());
+        assert!(
+            AgentConfig::parse("server = \"x\"\ndata_dir = \"d\"\nallow = [\"10.0.0.0/40\"]\n")
+                .is_err()
+        );
     }
 
     #[test]

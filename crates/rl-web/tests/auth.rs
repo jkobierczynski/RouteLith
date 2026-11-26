@@ -63,6 +63,14 @@ fn configured_silence() -> rl_core::silence::Silence {
 }
 
 fn fixture(users: &[(&str, Role, &str)], anonymous: bool) -> Fixture {
+    fixture_with(users, anonymous, None)
+}
+
+fn fixture_with(
+    users: &[(&str, Role, &str)],
+    anonymous: bool,
+    agents: Option<Arc<dyn rl_web::agents::AgentAdmin>>,
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     // An empty store, made by the writer so the reader can open it.
     drop(rl_store::Writer::open(dir.path(), rl_store::WriterOptions::default(), 0).unwrap());
@@ -107,7 +115,7 @@ fn fixture(users: &[(&str, Role, &str)], anonymous: bool) -> Fixture {
         auth: Arc::new(auth),
         slas: Vec::new(),
         parents: Default::default(),
-        agents: None,
+        agents,
     };
     Fixture {
         router: rl_web::router(Arc::new(state)),
@@ -694,4 +702,194 @@ async fn without_users_no_one_adds_silences() {
         "{}",
         a.body
     );
+}
+
+/// Agents as the server would have them, in memory.
+#[derive(Default)]
+struct FakeAgents {
+    enrolled: std::sync::Mutex<Vec<String>>,
+    revoked: std::sync::Mutex<Vec<String>>,
+}
+
+impl rl_web::agents::AgentAdmin for FakeAgents {
+    fn list(&self) -> serde_json::Value {
+        let names = self.enrolled.lock().unwrap().clone();
+        serde_json::json!({ "agents": names, "tokens": [] })
+    }
+    fn add_token(&self, name: &str) -> Result<(String, i64), (StatusCode, String)> {
+        if name.contains('/') {
+            return Err((StatusCode::BAD_REQUEST, "bad name".into()));
+        }
+        self.enrolled.lock().unwrap().push(name.to_string());
+        Ok((format!("rlt1-{name}"), 1_000))
+    }
+    fn revoke(&self, name: &str) -> Result<(), (StatusCode, String)> {
+        if !self.enrolled.lock().unwrap().iter().any(|n| n == name) {
+            return Err((StatusCode::NOT_FOUND, format!("no agent named {name}")));
+        }
+        self.revoked.lock().unwrap().push(name.to_string());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn only_admins_enroll_and_revoke_agents() {
+    let agents = Arc::new(FakeAgents::default());
+    let f = fixture_with(
+        &[
+            ("ann", Role::Operator, "correct horse battery"),
+            ("ada", Role::Admin, "correct horse battery"),
+        ],
+        false,
+        Some(agents.clone()),
+    );
+    let body = serde_json::json!({ "name": "plant-genk" });
+    let a = login(&f.router, "ann", "correct horse battery").await;
+    let (ann, ann_csrf) = (cookie(&a), a.body["csrf"].as_str().unwrap().to_string());
+    let a = call(
+        &f.router,
+        write(
+            "POST",
+            "/api/v1/agents/enroll-token",
+            &ann,
+            &ann_csrf,
+            body.clone(),
+        ),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
+    // Operators still read the list.
+    let a = call(
+        &f.router,
+        get("/api/v1/agents")
+            .header(header::COOKIE, &ann)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::OK);
+
+    let a = login(&f.router, "ada", "correct horse battery").await;
+    let (ada, csrf) = (cookie(&a), a.body["csrf"].as_str().unwrap().to_string());
+    // A write needs the CSRF token, as everywhere.
+    let a = call(
+        &f.router,
+        write(
+            "POST",
+            "/api/v1/agents/enroll-token",
+            &ada,
+            "",
+            body.clone(),
+        ),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN);
+    let a = call(
+        &f.router,
+        write(
+            "POST",
+            "/api/v1/agents/enroll-token",
+            &ada,
+            &csrf,
+            body.clone(),
+        ),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["token"], "rlt1-plant-genk");
+    assert_eq!(a.body["expires_ms"], 1_000);
+    let a = call(
+        &f.router,
+        write(
+            "POST",
+            "/api/v1/agents/enroll-token",
+            &ada,
+            &csrf,
+            serde_json::json!({ "name": "a/b" }),
+        ),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+    let a = call(
+        &f.router,
+        write(
+            "POST",
+            "/api/v1/agents/enroll-token",
+            &ada,
+            &csrf,
+            serde_json::json!({ "agent": "x" }),
+        ),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+
+    let a = call(
+        &f.router,
+        write(
+            "DELETE",
+            "/api/v1/agents/plant-genk",
+            &ann,
+            &ann_csrf,
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN);
+    let a = call(
+        &f.router,
+        write(
+            "DELETE",
+            "/api/v1/agents/nope",
+            &ada,
+            &csrf,
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND);
+    let a = call(
+        &f.router,
+        write(
+            "DELETE",
+            "/api/v1/agents/plant-genk",
+            &ada,
+            &csrf,
+            serde_json::Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT);
+    assert_eq!(*agents.revoked.lock().unwrap(), ["plant-genk"]);
+}
+
+#[tokio::test]
+async fn without_agents_the_list_is_empty_and_enrolling_is_refused() {
+    let f = fixture(&[("ada", Role::Admin, "correct horse battery")], false);
+    let a = login(&f.router, "ada", "correct horse battery").await;
+    let (ada, csrf) = (cookie(&a), a.body["csrf"].as_str().unwrap().to_string());
+    let a = call(
+        &f.router,
+        get("/api/v1/agents")
+            .header(header::COOKIE, &ada)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        a.body,
+        serde_json::json!({ "enabled": false, "agents": [], "tokens": [] })
+    );
+    let a = call(
+        &f.router,
+        write(
+            "POST",
+            "/api/v1/agents/enroll-token",
+            &ada,
+            &csrf,
+            serde_json::json!({ "name": "x" }),
+        ),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND);
+    assert!(a.body["error"].as_str().unwrap().contains("listen_agents"));
 }

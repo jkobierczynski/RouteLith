@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Subcommand};
 use rl_core::config::{self, Family, ProbeConfig};
 use rl_fed::agent_config::AgentConfig;
+use rl_fed::allow::{AllowList, Verdict};
 use rl_fed::ca::Ca;
 use rl_fed::client::{self, Identity};
 use rl_fed::pb;
@@ -182,6 +183,7 @@ async fn run(path: &Path) -> ExitCode {
     tokio::pin!(signal);
     let outbox = Arc::new(Outbox::new(spool));
     let mut m = Measuring::new(&id.name, cfg.max_pps, outbox.clone());
+    m.allow = Arc::new(cfg.allow.clone());
     let mut backoff = Backoff::default();
     loop {
         let started = Instant::now();
@@ -472,10 +474,45 @@ async fn session(
     }
 }
 
+/// A probe that measures only addresses in the allow-list: a round whose
+/// host name resolves outside it fails without sending anything.
+struct Guarded {
+    inner: Arc<dyn Probe>,
+    allow: Arc<AllowList>,
+}
+
+impl Probe for Guarded {
+    fn kind(&self) -> rl_probe::ProbeKind {
+        self.inner.kind()
+    }
+
+    fn run_round<'a>(
+        &'a self,
+        target: &'a rl_core::ResolvedTarget,
+        plan: rl_core::RoundPlan,
+    ) -> rl_probe::BoxFuture<'a, Result<rl_core::RoundResult, rl_probe::ProbeError>> {
+        if self.allow.allows_addr(target.addr) {
+            return self.inner.run_round(target, plan);
+        }
+        let msg = format!(
+            "{} resolves to {}, which is not in this agent's allow list",
+            target.name, target.addr
+        );
+        Box::pin(async move {
+            Err(rl_probe::ProbeError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                msg,
+            )))
+        })
+    }
+}
+
 /// The scheduler jobs for the current configuration.
 struct Measuring {
     name: String,
     limiter: Arc<RateLimiter>,
+    /// What this agent agrees to measure (§21.7 G6).
+    allow: Arc<AllowList>,
     stats: Arc<Stats>,
     sink: Sink,
     version: Option<String>,
@@ -506,6 +543,7 @@ impl Measuring {
         Measuring {
             name: name.to_string(),
             limiter: Arc::new(RateLimiter::new(max_pps)),
+            allow: Arc::default(),
             stats: Arc::new(Stats::default()),
             sink,
             version: None,
@@ -545,6 +583,14 @@ impl Measuring {
                     continue;
                 }
             };
+            let each_round = match self.allow.check(&spec.host, &spec.probe) {
+                Verdict::Allowed => false,
+                Verdict::EachRound => true,
+                Verdict::Refused(why) => {
+                    refused.push(refusal(a.series_id, why));
+                    continue;
+                }
+            };
             let mut v6_usable = true;
             if matches!(spec.probe, ProbeConfig::Icmp { .. }) {
                 let mut allowed = |v6: bool| {
@@ -576,6 +622,16 @@ impl Measuring {
                         continue;
                     }
                 },
+            };
+            // A host name passes a network entry only with the address
+            // each round resolves to.
+            let probe: Arc<dyn Probe> = if each_round {
+                Arc::new(Guarded {
+                    inner: probe,
+                    allow: self.allow.clone(),
+                })
+            } else {
+                probe
             };
             let job = Job {
                 series: a.series_id,

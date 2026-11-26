@@ -53,16 +53,6 @@ struct SeriesJson<'a> {
     pings: u16,
 }
 
-/// `GET /api/v1/agents`: enrolled agents and their state (an empty list
-/// when the server takes no agents).
-pub(crate) async fn agents(State(s): State<Arc<AppState>>) -> Response {
-    let list = s
-        .agents
-        .as_ref()
-        .map_or_else(|| serde_json::Value::Array(Vec::new()), |f| f());
-    Json(serde_json::json!({ "agents": list })).into_response()
-}
-
 pub(crate) async fn series(State(s): State<Arc<AppState>>) -> Response {
     let list: Vec<SeriesJson<'_>> = s
         .series

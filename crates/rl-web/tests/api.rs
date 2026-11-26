@@ -510,6 +510,35 @@ async fn health_snapshots_are_summarised_with_network_changes() {
 }
 
 #[tokio::test]
+async fn an_agents_health_is_read_by_its_name() {
+    let f = fixture();
+    // Nothing stored for this agent yet: an empty answer, under its name.
+    let uri = format!(
+        "/api/v1/health?from={T0}&to={}&vantage=plant-genk",
+        T0 + 3_600_000
+    );
+    let (st, _, body) = get(&f.router, &uri).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v = json(&body);
+    assert_eq!(v["vantage"], "plant-genk");
+    assert!(v["points"].as_array().unwrap().is_empty());
+    let uri = format!(
+        "/api/v1/health?from={T0}&to={}&vantage=home",
+        T0 + 3_600_000
+    );
+    assert_eq!(
+        json(&get(&f.router, &uri).await.2)["points"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    // Not a way out of the data directory.
+    let (st, _, _) = get(&f.router, "/api/v1/health?vantage=..").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn metrics_show_the_host_health() {
     let f = fixture();
     let (_, _, body) = get(&f.router, "/metrics").await;
