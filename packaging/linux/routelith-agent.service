@@ -1,0 +1,64 @@
+# A Routelith agent as a systemd service (architecture doc §21.7 G14):
+# measures what its server assigns and sends it the rounds.
+#
+# Install, with agent.toml holding data_dir = "/var/lib/routelith-agent":
+#   install -m 0755 routelith /usr/bin/routelith
+#   install -m 0644 -D agent.toml /etc/routelith/agent.toml
+#   install -m 0644 packaging/linux/routelith-agent.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemd-run --pipe --wait --quiet -p DynamicUser=yes -p User=routelith-agent \
+#     -p StateDirectory=routelith-agent \
+#     /usr/bin/routelith agent enroll -c /etc/routelith/agent.toml --token rlt1-...
+#   systemctl enable --now routelith-agent
+#
+# The agent runs as a transient user (DynamicUser) that can write only its
+# state directory, /var/lib/routelith-agent. Enroll as that same user, as
+# above, so the identity it writes there is readable by the service; do
+# the same to enroll again with a new token. ICMP needs unprivileged ping
+# sockets, as for the server: see 60-routelith-ping.conf. The agent needs
+# no capabilities.
+
+[Unit]
+Description=Routelith agent
+Documentation=https://github.com/jkobierczynski/RouteLith
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/routelith agent run --config /etc/routelith/agent.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+DynamicUser=yes
+StateDirectory=routelith-agent
+StateDirectoryMode=0750
+ConfigurationDirectory=routelith
+UMask=0027
+
+# No privileges and a read-only system apart from the state directory.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

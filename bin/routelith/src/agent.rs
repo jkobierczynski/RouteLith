@@ -123,6 +123,12 @@ async fn run(path: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    serve(path, signal).await
+}
+
+/// Run the agent until `signal` completes (Ctrl-C, or the Windows service
+/// manager's stop request).
+pub(crate) async fn serve(path: &Path, signal: impl std::future::Future<Output = ()>) -> ExitCode {
     let cfg = match AgentConfig::load(path) {
         Ok(c) => c,
         Err(e) => {

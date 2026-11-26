@@ -1,5 +1,6 @@
 //! `routelith service install|uninstall|run`: the server as a Windows
-//! Service (architecture doc §21.3, packaging).
+//! Service (architecture doc §21.3, packaging), or with `--agent` an agent
+//! (§21.7 G14) as the `RoutelithAgent` service.
 //!
 //! The service runs `routelith service run --config <file> --log <file>`
 //! as `NT AUTHORITY\LocalService`, starts with Windows, and is restarted
@@ -8,6 +9,11 @@
 //! service through Windows Installer; these commands are for a plain copy
 //! of the executable. Both register the `Routelith` event source, whose
 //! messages are in routelith.exe, for `type = "eventlog"` outputs.
+//!
+//! An agent's service runs `routelith service run --agent --config
+//! <agent.toml> --log <file>` the same way. Enroll the agent first: the
+//! install checks that its identity is there, and grants the service
+//! account its data folder, identity included.
 //!
 //! On other systems the commands only explain where the service files are.
 
@@ -19,13 +25,16 @@ use clap::{Args, Subcommand};
 /// The service's key name, as used by `sc` and the MSI.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const NAME: &str = "Routelith";
+/// The agent's service (§21.7 G14).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const AGENT_NAME: &str = "RoutelithAgent";
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ServiceAction {
     /// Register the Windows Service and start it (needs Administrator).
     Install(InstallArgs),
     /// Stop and remove the Windows Service (needs Administrator).
-    Uninstall,
+    Uninstall(UninstallArgs),
     /// Entry point for the service manager; not for interactive use
     /// (run `routelith server` instead).
     #[command(hide = true)]
@@ -34,11 +43,15 @@ pub(crate) enum ServiceAction {
 
 #[derive(Debug, Args)]
 pub(crate) struct InstallArgs {
+    /// Install an agent (service RoutelithAgent) instead of the server;
+    /// --config is then its agent.toml.
+    #[arg(long)]
+    agent: bool,
     /// Configuration file the service reads (made absolute).
     #[arg(short, long)]
     config: PathBuf,
-    /// Log file for the server's messages (default: routelith.log next to
-    /// the configuration file).
+    /// Log file for the service's messages (default: routelith.log, or
+    /// routelith-agent.log, next to the configuration file).
     #[arg(long)]
     log: Option<PathBuf>,
     /// Register the service without starting it.
@@ -47,7 +60,16 @@ pub(crate) struct InstallArgs {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct UninstallArgs {
+    /// Remove the agent's service (RoutelithAgent) instead of the server's.
+    #[arg(long)]
+    agent: bool,
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct RunArgs {
+    #[arg(long)]
+    agent: bool,
     #[arg(short, long)]
     config: PathBuf,
     #[arg(long)]
@@ -59,7 +81,7 @@ pub(crate) fn run(action: ServiceAction) -> ExitCode {
     {
         let r = match action {
             ServiceAction::Install(args) => windows::install(&args),
-            ServiceAction::Uninstall => windows::uninstall(),
+            ServiceAction::Uninstall(args) => windows::uninstall(args.agent),
             ServiceAction::Run(args) => return windows::run(args),
         };
         match r {
@@ -75,7 +97,8 @@ pub(crate) fn run(action: ServiceAction) -> ExitCode {
         let _ = action;
         eprintln!(
             "routelith service: Windows only. On Linux, run `routelith server` from the \
-             systemd unit in packaging/linux/routelith.service."
+             systemd unit in packaging/linux/routelith.service, and an agent from \
+             packaging/linux/routelith-agent.service."
         );
         ExitCode::from(2)
     }
@@ -105,7 +128,7 @@ mod windows {
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-    use super::{InstallArgs, NAME, RunArgs, code_number};
+    use super::{AGENT_NAME, InstallArgs, NAME, RunArgs, code_number};
     use crate::server::{self, ServerArgs};
 
     const ACCOUNT: &str = r"NT AUTHORITY\LocalService";
@@ -114,9 +137,41 @@ mod windows {
     /// Seconds between stats lines in the log (the console default is 60).
     const STATS_EVERY: u64 = 3600;
 
-    pub(super) fn install(args: &InstallArgs) -> io::Result<()> {
-        let config = std::path::absolute(&args.config)?;
-        let src = std::fs::read_to_string(&config)
+    /// What a service runs: its name, its configuration's data folder,
+    /// and how it describes itself.
+    struct Kind {
+        name: &'static str,
+        display_name: &'static str,
+        data_dir: PathBuf,
+        description: String,
+        default_log: &'static str,
+    }
+
+    /// Read the configuration the service will use, refusing one it could
+    /// not start with.
+    fn kind(args: &InstallArgs, config: &Path) -> io::Result<Kind> {
+        if args.agent {
+            let cfg = rl_fed::agent_config::AgentConfig::load(config)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            // The identity is made by `agent enroll`, before the service.
+            // (A relative data_dir is refused below.)
+            if cfg.data_dir.is_absolute() {
+                rl_fed::client::Identity::load(&cfg.data_dir).map_err(|e| {
+                    io::Error::other(format!(
+                        "{e}; enroll first: routelith agent enroll -c {} --token rlt1-...",
+                        config.display()
+                    ))
+                })?;
+            }
+            return Ok(Kind {
+                name: AGENT_NAME,
+                display_name: "Routelith agent",
+                data_dir: cfg.data_dir,
+                description: format!("Measures for the Routelith server at {}", cfg.server),
+                default_log: "routelith-agent.log",
+            });
+        }
+        let src = std::fs::read_to_string(config)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", config.display())))?;
         let parsed = rl_core::config::parse(&src);
         let Some(cfg) = parsed.config else {
@@ -125,16 +180,29 @@ mod windows {
                 config.display()
             )));
         };
+        Ok(Kind {
+            name: NAME,
+            display_name: "Routelith network monitor",
+            data_dir: PathBuf::from(&cfg.server.data_dir),
+            description: "Measures network latency and loss; see http://127.0.0.1:8080/".into(),
+            default_log: "routelith.log",
+        })
+    }
+
+    pub(super) fn install(args: &InstallArgs) -> io::Result<()> {
+        let config = std::path::absolute(&args.config)?;
+        let kind = kind(args, &config)?;
+        let name = kind.name;
         let log = match &args.log {
             Some(l) => std::path::absolute(l)?,
-            None => config.with_file_name("routelith.log"),
+            None => config.with_file_name(kind.default_log),
         };
         // The service starts in System32, so a relative data_dir would
         // name a different folder there than the one granted here.
-        let data_dir = PathBuf::from(&cfg.server.data_dir);
+        let data_dir = kind.data_dir.clone();
         if !data_dir.is_absolute() {
             return Err(io::Error::other(format!(
-                "server.data_dir in {} must be an absolute path for the service, not {}",
+                "data_dir in {} must be an absolute path for the service, not {}",
                 config.display(),
                 data_dir.display()
             )));
@@ -158,21 +226,24 @@ mod windows {
             ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
         )
         .map_err(to_io)?;
+        let mut launch: Vec<OsString> = vec!["service".into(), "run".into()];
+        if args.agent {
+            launch.push("--agent".into());
+        }
+        launch.extend([
+            "--config".into(),
+            config.into_os_string(),
+            "--log".into(),
+            log.clone().into_os_string(),
+        ]);
         let info = ServiceInfo {
-            name: NAME.into(),
-            display_name: "Routelith network monitor".into(),
+            name: name.into(),
+            display_name: kind.display_name.into(),
             service_type: ServiceType::OWN_PROCESS,
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
             executable_path: exe.clone(),
-            launch_arguments: vec![
-                "service".into(),
-                "run".into(),
-                "--config".into(),
-                config.into_os_string(),
-                "--log".into(),
-                log.clone().into_os_string(),
-            ],
+            launch_arguments: launch,
             dependencies: vec![],
             account_name: Some(ACCOUNT.into()),
             account_password: None,
@@ -183,9 +254,7 @@ mod windows {
                 ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
             )
             .map_err(to_io)?;
-        service
-            .set_description("Measures network latency and loss; see http://127.0.0.1:8080/")
-            .map_err(to_io)?;
+        service.set_description(&kind.description).map_err(to_io)?;
         let restart = |secs| ServiceAction {
             action_type: ServiceActionType::Restart,
             delay: Duration::from_secs(secs),
@@ -203,31 +272,35 @@ mod windows {
         service
             .set_failure_actions_on_non_crash_failures(true)
             .map_err(to_io)?;
-        // Before the start, so the server_started event already shows as text.
-        rl_sys::eventlog::register_source(rl_out::eventlog::SOURCE, &exe)?;
-        println!("Installed service {NAME}; it logs to {}", log.display());
+        // Before the start, so the server_started event already shows as
+        // text. Agents have no event log outputs.
+        if !args.agent {
+            rl_sys::eventlog::register_source(rl_out::eventlog::SOURCE, &exe)?;
+        }
+        println!("Installed service {name}; it logs to {}", log.display());
         if !args.no_start {
             service.start::<&OsStr>(&[]).map_err(|e| {
                 io::Error::other(format!(
                     "installed, but the service did not start: {}. LocalService must be \
                      able to read {} and every file it uses; a copy outside your user \
                      profile (e.g. C:\\Program Files\\Routelith\\bin) avoids this. Check the \
-                     log, then run `sc start {NAME}`",
+                     log, then run `sc start {name}`",
                     to_io(e),
                     exe.display()
                 ))
             })?;
-            println!("Started service {NAME}");
+            println!("Started service {name}");
         }
         Ok(())
     }
 
-    pub(super) fn uninstall() -> io::Result<()> {
+    pub(super) fn uninstall(agent: bool) -> io::Result<()> {
+        let name = if agent { AGENT_NAME } else { NAME };
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(to_io)?;
         let service = manager
             .open_service(
-                NAME,
+                name,
                 ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
             )
             .map_err(to_io)?;
@@ -236,7 +309,11 @@ mod windows {
         service.delete().map_err(to_io)?;
         // Reported after the stop, so a registry error cannot leave the
         // service running.
-        let source = rl_sys::eventlog::unregister_source(rl_out::eventlog::SOURCE);
+        let source = if agent {
+            Ok(())
+        } else {
+            rl_sys::eventlog::unregister_source(rl_out::eventlog::SOURCE)
+        };
         if service.query_status().map_err(to_io)?.current_state != ServiceState::Stopped {
             service.stop().map_err(to_io)?;
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -250,7 +327,7 @@ mod windows {
             }
         }
         source?;
-        println!("Removed service {NAME}");
+        println!("Removed service {name}");
         Ok(())
     }
 
@@ -264,7 +341,8 @@ mod windows {
                 return ExitCode::from(2);
             }
         }
-        let config = args.config;
+        let (config, agent) = (args.config, args.agent);
+        let name = if agent { AGENT_NAME } else { NAME };
         let body = Box::new(move |stop: rl_sys::service::StopRequest| {
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -281,22 +359,27 @@ mod windows {
                 stop.wait();
                 let _ = tx.send(());
             });
-            let server_args = ServerArgs {
-                config,
-                stats_interval: STATS_EVERY,
-            };
-            let code = rt.block_on(server::serve(server_args, async {
+            let stopped = async {
                 let _ = rx.await;
-            }));
+            };
+            let code = if agent {
+                rt.block_on(crate::agent::serve(&config, stopped))
+            } else {
+                let server_args = ServerArgs {
+                    config,
+                    stats_interval: STATS_EVERY,
+                };
+                rt.block_on(server::serve(server_args, stopped))
+            };
             rt.shutdown_timeout(Duration::from_millis(100));
             code_number(code)
         });
-        match rl_sys::service::run(NAME, body) {
+        match rl_sys::service::run(name, body) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!(
                     "routelith service: not started by the service manager ({e}); \
-                     run `routelith server` instead"
+                     run `routelith server` or `routelith agent run` instead"
                 );
                 ExitCode::from(2)
             }

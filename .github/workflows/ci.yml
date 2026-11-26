@@ -76,6 +76,23 @@ jobs:
       - run: cargo build --release --locked
       - run: tests/lab/schedule-bench.sh target/release/routelith
 
+  # 20 simulated agents x 1,000 targets streaming to one server, and one
+  # real agent with 500 ICMP targets: the server keeps up, the agent stays
+  # under 20 MB and 1 % of a core (architecture doc §21.8, M3 scale).
+  agent-scale:
+    name: agent scale test (20 x 1,000 targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Allow unprivileged ICMP (ping sockets)
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+      - run: cargo build --release --locked -p routelith
+      - run: cargo build --release --locked -p rl-fed --example sim_agents
+      - run: tests/lab/agent-scale.sh target/release/routelith target/release/examples/sim_agents
+
   # Risk R1: timing error of the Windows ICMP API against a raw-socket
   # reference on loopback (runners are Administrator). Results go to the job
   # summary. Exit 1 (target missed) is reported, not failed, until the R1
@@ -122,12 +139,15 @@ jobs:
         run: |
           sudo install -m 0755 target/release/routelith /usr/bin/routelith
           sudo install -m 0644 packaging/linux/routelith.service /etc/systemd/system/
+          sudo install -m 0644 packaging/linux/routelith-agent.service /etc/systemd/system/
           sudo install -m 0644 packaging/linux/60-routelith-ping.conf /etc/sysctl.d/
           sudo sysctl --system > /dev/null
           sudo install -d /etc/routelith
           sudo tee /etc/routelith/routelith.toml > /dev/null <<'TOML'
           [server]
           data_dir = "/var/lib/routelith"
+          vantage = "ci"
+          listen_agents = "127.0.0.1:4443"
           [defaults]
           step = "60s"
           pings = 5
@@ -141,8 +161,21 @@ jobs:
             host = "127.0.0.1"
             probe = "tcp"
             port = 8080
+          # Measured by the server and by the agent service too.
+          [[group]]
+          name = "remote"
+          vantages = ["ci", "ci-agent"]
+          step = "10s"
+            [[group.target]]
+            name = "loopback-remote"
+            host = "127.0.0.1"
+          TOML
+          sudo tee /etc/routelith/agent.toml > /dev/null <<'TOML'
+          server = "127.0.0.1:4443"
+          data_dir = "/var/lib/routelith-agent"
           TOML
           systemd-analyze verify /etc/systemd/system/routelith.service
+          systemd-analyze verify /etc/systemd/system/routelith-agent.service
           sudo systemctl daemon-reload
       - name: Start, measure, stop
         run: |
@@ -160,13 +193,44 @@ jobs:
           curl -fsS http://127.0.0.1:8080/api/v1/latest | jq .
           [ "$n" -ge 2 ] || { echo "::error::no rounds from both targets"; exit 1; }
           sudo ls -l /var/lib/private/routelith
+      - name: Enroll and start the agent service
+        run: |
+          # As the server's and the agent's own dynamic users, as the units
+          # describe, so each service can read what the command writes.
+          token=$(sudo systemd-run --pipe --wait --quiet -p DynamicUser=yes -p User=routelith \
+            -p StateDirectory=routelith \
+            /usr/bin/routelith ctl agent add ci-agent -c /etc/routelith/routelith.toml | grep -o 'rlt1-[^ ]*')
+          sudo systemd-run --pipe --wait --quiet -p DynamicUser=yes -p User=routelith-agent \
+            -p StateDirectory=routelith-agent \
+            /usr/bin/routelith agent enroll -c /etc/routelith/agent.toml --token "$token"
+          sudo systemctl start routelith-agent
+          pid=$(systemctl show -p MainPID --value routelith-agent)
+          user=$(ps -o user= -p "$pid")
+          echo "agent running as $user (pid $pid)"
+          [ "$(id -u "$user")" -ge 61184 ] || { echo "::error::the agent is not a dynamic user"; exit 1; }
+          # The agent connects and its series gets a round with replies.
+          for i in $(seq 90); do
+            ids=$(curl -fsS http://127.0.0.1:8080/api/v1/series | jq '[.series[] | select(.vantage == "ci-agent") | .id]') || ids='[]'
+            n=$(curl -fsS http://127.0.0.1:8080/api/v1/latest | jq --argjson ids "$ids" '[.latest[] | select(.recv > 0 and (.series as $s | $ids | index($s)))] | length') || n=0
+            [ "$n" -ge 1 ] && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/api/v1/agents | jq .
+          [ "$n" -ge 1 ] || { echo "::error::no rounds from the agent service"; exit 1; }
+          sudo ls -lR /var/lib/private/routelith-agent | head -20
+          sudo systemctl stop routelith-agent
+          result=$(systemctl show -p Result --value routelith-agent)
+          status=$(systemctl show -p ExecMainStatus --value routelith-agent)
+          [ "$result" = success ] && [ "$status" = 0 ] || { echo "::error::the agent stopped with $result, exit $status"; exit 1; }
+      - name: Stop the server
+        run: |
           sudo systemctl stop routelith
           result=$(systemctl show -p Result --value routelith)
           status=$(systemctl show -p ExecMainStatus --value routelith)
           [ "$result" = success ] && [ "$status" = 0 ] || { echo "::error::stopped with $result, exit $status"; exit 1; }
       - name: Journal
         if: always()
-        run: sudo journalctl -u routelith --no-pager
+        run: sudo journalctl -u routelith -u routelith-agent --no-pager
 
   msi:
     name: MSI and Windows Service (windows-2022)
@@ -253,6 +317,44 @@ jobs:
           Get-Content C:\rl\routelith.log
           if (Get-Service Routelith -ErrorAction SilentlyContinue) { throw 'the service is still installed' }
           if (Test-Path HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\Routelith) { throw 'the event source is still registered' }
+      - name: routelith service install --agent / uninstall --agent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "$PWD\target\release\routelith.exe"
+          New-Item -ItemType Directory -Force C:\rls, C:\rla | Out-Null
+          Set-Content C:\rls\routelith.toml "[server]`ndata_dir = 'C:\rls\data'`nvantage = 'ci'`nlisten_ui = '127.0.0.1:8090'`nlisten_agents = '127.0.0.1:4443'`n[[group]]`nname = 'remote'`nvantages = ['ci', 'win-agent']`nstep = '10s'`npings = 5`n  [[group.target]]`n  name = 'loopback'`n  host = '127.0.0.1'`n"
+          Set-Content C:\rla\agent.toml "server = '127.0.0.1:4443'`ndata_dir = 'C:\rla\data'`n"
+          & $exe ctl verify --no-resolve C:\rls\routelith.toml
+          if ($LASTEXITCODE -ne 0) { throw 'the test configuration is invalid' }
+          $token = (& $exe ctl agent add win-agent -c C:\rls\routelith.toml | Select-String -Pattern 'rlt1-\S+').Matches[0].Value
+          $server = Start-Process $exe -ArgumentList 'server', '-c', 'C:\rls\routelith.toml' -PassThru -NoNewWindow -RedirectStandardError C:\rls\server.log
+          foreach ($i in 1..60) { try { Invoke-RestMethod http://127.0.0.1:8090/healthz | Out-Null; break } catch { Start-Sleep 1 } }
+          # Installing before enrolling is refused, with what to do.
+          & $exe service install --agent --config C:\rla\agent.toml
+          if ($LASTEXITCODE -eq 0) { throw 'an agent that is not enrolled was installed' }
+          & $exe agent enroll -c C:\rla\agent.toml --token $token
+          if ($LASTEXITCODE -ne 0) { throw "enroll exited with $LASTEXITCODE" }
+          & $exe service install --agent --config C:\rla\agent.toml
+          if ($LASTEXITCODE -ne 0) { throw "install exited with $LASTEXITCODE" }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='RoutelithAgent'"
+          "state $($svc.State), account $($svc.StartName), command $($svc.PathName)"
+          if ($svc.StartName -ne 'NT AUTHORITY\LocalService') { throw 'wrong service account' }
+          # The agent's series gets a round with replies.
+          $ok = $false
+          foreach ($i in 1..90) {
+            $ids = @((Invoke-RestMethod http://127.0.0.1:8090/api/v1/series).series | Where-Object vantage -eq 'win-agent' | ForEach-Object id)
+            $got = @((Invoke-RestMethod http://127.0.0.1:8090/api/v1/latest).latest | Where-Object { $ids -contains $_.series -and $_.recv -gt 0 })
+            if ($got.Count -ge 1) { $ok = $true; break }
+            Start-Sleep 1
+          }
+          Get-Content C:\rla\routelith-agent.log
+          if (-not $ok) { Get-Content C:\rls\server.log; throw 'no rounds from the agent service' }
+          & $exe service uninstall --agent
+          if ($LASTEXITCODE -ne 0) { throw "uninstall exited with $LASTEXITCODE" }
+          if (Get-Service RoutelithAgent -ErrorAction SilentlyContinue) { throw 'the agent service is still installed' }
+          if (-not (Select-String -Path C:\rla\routelith-agent.log -Pattern 'routelith agent: stopping' -Quiet)) { throw 'the agent did not stop cleanly' }
+          Stop-Process -Id $server.Id
       - uses: actions/upload-artifact@v7
         if: always()
         with:
