@@ -6,8 +6,8 @@ hop-by-hop path tracing, measured from federated agents on Linux and Windows,
 shipped as one self-contained binary.
 
 **Status:** pre-alpha. M0 (ICMP, scheduler, store, SVG smoke graphs) and M1
-(TCP/DNS/HTTP, rollups, web UI, services) are done; M2 (alerts, outputs,
-reports) is in progress. `routelith check icmp`, `check tcp`, `check dns` and
+(TCP/DNS/HTTP, rollups, web UI, services), M2 (alerts, outputs, reports)
+and M3 (agents) are done. `routelith check icmp`, `check tcp`, `check dns` and
 `check http` work on Linux and Windows, and `routelith server` measures all
 four kinds of target. The server also answers HTTP on `127.0.0.1:8080`
 (`listen_ui` in `[server]`; `"off"` turns it off): a web UI with an overview
@@ -193,8 +193,7 @@ default). On Windows it uses the ICMP helper API and needs no privileges.
 
 ## Agents
 
-Agents measure from other sites and report to one server (milestone M3,
-in progress). The server accepts them on `listen_agents`, and a group's
+Agents measure from other sites and report to one server (milestone M3). The server accepts them on `listen_agents`, and a group's
 `vantages` says who measures it:
 
 ```toml
@@ -359,6 +358,30 @@ that file and the access granted to `LocalService` with it, and the service
 then fails to start. Keep the configuration, `data_dir` and log outside your
 user profile too, for example under `C:\ProgramData\Routelith`. The MSI is
 not signed yet.
+
+**Agents** use the same binary (§21.7 G14). On Linux,
+`packaging/linux/routelith-agent.service` runs `routelith agent run
+--config /etc/routelith/agent.toml` the same way, writing only
+`/var/lib/routelith-agent` (`data_dir = "/var/lib/routelith-agent"` in
+`agent.toml`). With a dynamic user, enroll as that user, so the service can
+read the identity it writes:
+
+```console
+$ sudo systemd-run --pipe --wait --quiet -p DynamicUser=yes -p User=routelith-agent \
+    -p StateDirectory=routelith-agent \
+    /usr/bin/routelith agent enroll -c /etc/routelith/agent.toml --token rlt1-…
+$ sudo systemctl enable --now routelith-agent
+```
+
+On a server that runs from `routelith.service`, run `ctl agent` commands
+the same way, as `-p User=routelith -p StateDirectory=routelith`, or make
+tokens on the web UI's Agents page. On Windows, enroll first, then
+`routelith service install --agent --config C:\ProgramData\Routelith\agent.toml`
+(as Administrator) registers the `RoutelithAgent` service, which runs as
+`LocalService` and logs to `routelith-agent.log` next to its configuration;
+`routelith service uninstall --agent` removes it. `data_dir` must be an
+absolute path, and the install refuses an agent that is not enrolled yet.
+The MSI installs the server only.
 
 ## Layout
 

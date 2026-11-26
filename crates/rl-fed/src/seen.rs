@@ -44,6 +44,10 @@ pub struct Seen {
     /// One lock per agent, held while a batch is stored, so two streams of
     /// the same agent (one replacing the other) cannot interleave.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held while the file is written: every agent's stream records its
+    /// marks, and two writes at once would share the temporary file, or
+    /// let an older body replace a newer one.
+    write: Mutex<()>,
 }
 
 impl Seen {
@@ -67,6 +71,7 @@ impl Seen {
                 path,
                 marks: Mutex::new(marks),
                 locks: Mutex::new(HashMap::new()),
+                write: Mutex::new(()),
             },
             warning,
         )
@@ -94,6 +99,8 @@ impl Seen {
     /// Everything up to `seq` of `agent`'s spool `spool` is stored. Blocks
     /// on the file write.
     pub fn record(&self, agent: &str, spool: u64, seq: u64) -> Result<(), FedError> {
+        // Taken before the marks, so the body written last is the newest.
+        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
         let body = {
             let mut marks = self.marks.lock().unwrap_or_else(PoisonError::into_inner);
             let m = marks.entry(agent.to_string()).or_default();
@@ -131,6 +138,32 @@ mod tests {
         seen.record("genk", 0xdef, 2).unwrap();
         assert_eq!(seen.stored("genk", 0xabc), 0);
         assert_eq!(seen.stored("hasselt", 1), 3);
+    }
+
+    #[test]
+    fn many_agents_record_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (seen, _) = Seen::load(tmp.path());
+        let seen = Arc::new(seen);
+        let threads: Vec<_> = (0..16)
+            .map(|a| {
+                let seen = seen.clone();
+                std::thread::spawn(move || {
+                    for seq in 1..=50 {
+                        seen.record(&format!("a{a}"), 7, seq).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // The file holds every agent's last mark.
+        let (seen, w) = Seen::load(tmp.path());
+        assert!(w.is_none());
+        for a in 0..16 {
+            assert_eq!(seen.stored(&format!("a{a}"), 7), 50);
+        }
     }
 
     #[test]
