@@ -83,6 +83,9 @@ struct Acc {
 pub struct TraceStats {
     hops: Vec<Acc>,
     sweeps: u64,
+    /// Probes that failed to leave this host, over every TTL (rows past the
+    /// last answer are not shown but still count).
+    send_failed: u64,
     /// Destination distance in the newest sweep that reached it.
     dest_ttl: Option<u8>,
 }
@@ -94,6 +97,11 @@ impl TraceStats {
 
     pub fn sweeps(&self) -> u64 {
         self.sweeps
+    }
+
+    /// Probes that failed to leave this host, at any TTL.
+    pub fn send_failed(&self) -> u64 {
+        self.send_failed
     }
 
     pub fn add(&mut self, sweep: &Sweep) {
@@ -110,7 +118,10 @@ impl TraceStats {
             acc.sent += 1;
             match outcome {
                 Outcome::Lost => {}
-                Outcome::SendFailed(_) => acc.send_failed += 1,
+                Outcome::SendFailed(_) => {
+                    acc.send_failed += 1;
+                    self.send_failed += 1;
+                }
                 answered => {
                     if matches!(answered, Outcome::Unreachable { .. }) {
                         acc.unreachable += 1;
@@ -316,5 +327,13 @@ mod tests {
         assert_eq!(hops.len(), 3);
         assert_eq!(hops[1].loss_pct(), 100.0);
         assert!(!hops[2].is_dest);
+    }
+
+    #[test]
+    fn send_failures_past_the_last_answer_still_count() {
+        let mut st = TraceStats::new();
+        st.add(&sweep(vec![te(1, 1), Outcome::SendFailed("EPERM".into())]));
+        assert_eq!(st.hops().len(), 1);
+        assert_eq!(st.send_failed(), 1);
     }
 }

@@ -129,7 +129,8 @@ pub(crate) async fn run(args: TraceArgs) -> ExitCode {
     let hops = stats.hops();
     // Only an echo reply counts: an Unreachable ends the path short of it.
     let reached = hops.last().is_some_and(|h| h.replies() > 0);
-    let send_failed = hops.iter().any(|h| h.send_failed > 0);
+    // Counted over every TTL: rows past the last answer are not shown.
+    let send_failed = stats.send_failed() > 0;
     if args.json {
         let report = JsonReport {
             host: &args.host,
