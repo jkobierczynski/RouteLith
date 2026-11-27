@@ -55,6 +55,9 @@ impl Sweep {
 pub struct Session {
     plan: SweepPlan,
     dest_ttl: Option<u8>,
+    /// Start of the newest sweep recorded; sweeps overlap and can finish
+    /// out of order, and an older one must not undo a newer one.
+    last_start: Option<SystemTime>,
 }
 
 impl Session {
@@ -62,6 +65,7 @@ impl Session {
         Self {
             plan,
             dest_ttl: None,
+            last_start: None,
         }
     }
 
@@ -83,6 +87,10 @@ impl Session {
 
     /// Update the plan from a finished sweep.
     pub fn record(&mut self, sweep: &Sweep) {
+        if self.last_start.is_some_and(|last| sweep.start < last) {
+            return;
+        }
+        self.last_start = Some(sweep.start);
         if let Some(d) = sweep.dest_ttl() {
             self.dest_ttl = Some(d);
         } else if let Some(d) = self.dest_ttl {
@@ -187,6 +195,18 @@ mod tests {
         // Longer path: a router answers at the old distance.
         s.record(&sweep(vec![te(1), te(2)]));
         assert_eq!(s.next_count(), 10);
+    }
+
+    #[test]
+    fn an_older_sweep_finishing_late_is_ignored() {
+        let mut s = Session::new(SweepPlan::default());
+        let mut newer = sweep(vec![te(1), reply()]);
+        newer.start = SystemTime::UNIX_EPOCH + Duration::from_secs(2);
+        let mut older = sweep(vec![reply()]);
+        older.start = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        s.record(&newer);
+        s.record(&older);
+        assert_eq!(s.next_count(), 2);
     }
 
     #[test]
