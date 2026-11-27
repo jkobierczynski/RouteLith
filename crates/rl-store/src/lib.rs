@@ -34,6 +34,7 @@ mod reader;
 mod rollup;
 mod round;
 mod segment;
+pub mod trace;
 mod varint;
 mod wal;
 mod writer;
@@ -46,6 +47,9 @@ pub use index::SeriesKey;
 pub use reader::{GraphRounds, Reader, Resolution, VerifyReport};
 pub use rollup::{GRAPH_SAMPLES, QUANTILES, RollupPoint, Tier, quantiles};
 pub use round::{ErrorCounts, FLAG_CLOCK_STEP, StoredRound};
+pub use trace::{
+    RTT_UNIT_US, TraceAppended, TraceHop, TraceLog, TraceRecord, TraceStats, read_trace, trace_dir,
+};
 pub use writer::{
     Appended, ImportReport, ImportedHistory, Recovery, Writer, WriterOptions, WriterStats,
 };

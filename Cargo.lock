@@ -1702,6 +1702,7 @@ name = "rl-sched"
 version = "0.0.0"
 dependencies = [
  "rl-core",
+ "rl-path",
  "rl-probe",
  "tokio",
 ]

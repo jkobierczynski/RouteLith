@@ -56,6 +56,20 @@ const DEFAULT_PINGS: u16 = 20;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SIZE: u16 = 56;
 const DEFAULT_MAX_PPS: u32 = 1_000;
+const DEFAULT_TRACE_INTERVAL: Duration = Duration::from_millis(2500);
+const MIN_TRACE_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_TRACE_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_MAX_TTL: u8 = 30;
+const MAX_MAX_TTL: i64 = 64;
+const DEFAULT_TRACE_STEP: Duration = Duration::from_secs(60);
+const DEFAULT_TRACE_HOLD: Duration = Duration::from_secs(600);
+const MAX_TRACE_HOLD: Duration = Duration::from_secs(86_400);
+/// Each probe of a sweep waits this long for its answer (§21.9 P4).
+pub const TRACE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_MAX_TRACE_TARGETS: u32 = 50;
+const MAX_MAX_TRACE_TARGETS: i64 = 1_000;
+const DEFAULT_TRACE_RAW_DAYS: u32 = 7;
+const MAX_TRACE_RAW_DAYS: i64 = 30;
 /// The vantage of a configuration that names none.
 pub const DEFAULT_VANTAGE: &str = "local";
 const MAX_PINGS: i64 = 1_000;
@@ -73,6 +87,9 @@ pub struct Config {
     pub server: ServerConfig,
     /// Targets measured from this vantage, in file order.
     pub targets: Vec<TargetConfig>,
+    /// Targets whose continuous trace this vantage refused, over
+    /// `max_trace_targets` (§21.9 P11); their `trace` is `None`.
+    pub trace_refused: Vec<String>,
     /// Targets measured by agents (§21.7 G5): those of groups whose
     /// `vantages` names another vantage or `"*"`, in file order. A target
     /// the server measures too is in both lists.
@@ -136,6 +153,10 @@ pub struct ServerConfig {
     /// Where agents connect (gRPC with mutual TLS, §21.7 G2); `None`
     /// unless set.
     pub listen_agents: Option<std::net::SocketAddr>,
+    /// Most traces this vantage runs at once (§21.9 P11).
+    pub max_trace_targets: u32,
+    /// Days of raw sweeps kept (§21.9 P7).
+    pub trace_raw_days: u32,
 }
 
 /// PEM files for TLS on the web UI.
@@ -172,8 +193,60 @@ pub struct TargetConfig {
     /// The group's `vantages` as written; empty when it has none (the
     /// server only). `"*"` stands for every enrolled agent and the server.
     pub vantages: Vec<String>,
+    /// The path trace of this target, if it has one (§21.9 P5).
+    pub trace: Option<TraceConfig>,
     /// 1-based line of the target's table, for messages.
     pub line: usize,
+}
+
+/// When a target's path is traced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum TraceMode {
+    /// All the time.
+    Continuous,
+    /// While one of its alerts is raised, and `hold` after.
+    OnAlert,
+}
+
+impl TraceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Continuous => "continuous",
+            Self::OnAlert => "on_alert",
+        }
+    }
+}
+
+/// How a target's path is traced (§21.9 P4, P5). The trace is ICMP to the
+/// target's resolved address, whatever the target's own probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TraceConfig {
+    pub mode: TraceMode,
+    /// Time between sweeps; a sweep's probes are spread over it.
+    pub interval: Duration,
+    /// Highest TTL probed.
+    pub max_ttl: u8,
+    /// One hop round every `step`, aligned like a target's rounds.
+    pub step: Duration,
+    /// How long an on_alert trace runs on after its alert clears.
+    pub hold: Duration,
+}
+
+impl TraceConfig {
+    /// Sweeps per hop round.
+    pub fn sweeps_per_step(&self) -> u32 {
+        let interval = self.interval.as_millis().max(1);
+        u32::try_from(self.step.as_millis() / interval).unwrap_or(u32::MAX)
+    }
+
+    /// Probes per day at most, for one family: every sweep probing up to
+    /// `max_ttl`.
+    pub fn probes_per_day(&self) -> u64 {
+        let interval = u64::try_from(self.interval.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        u64::from(self.max_ttl) * (DAY_SECS * 1000 / interval)
+    }
 }
 
 /// The probe of a target and its settings (architecture doc §4).
@@ -710,6 +783,8 @@ struct RawServer {
     anonymous: Option<Spanned<bool>>,
     tls_cert: Option<Spanned<String>>,
     tls_key: Option<Spanned<String>>,
+    max_trace_targets: Option<Spanned<i64>>,
+    trace_raw_days: Option<Spanned<i64>>,
 }
 
 /// Settings that cascade. Repeated in each table below because serde's
@@ -723,6 +798,11 @@ struct Settings {
     size: Option<Spanned<i64>>,
     family: Option<Spanned<String>>,
     alerts: Option<Spanned<Vec<String>>>,
+    trace: Option<Spanned<String>>,
+    trace_interval: Option<Spanned<String>>,
+    max_ttl: Option<Spanned<i64>>,
+    trace_step: Option<Spanned<String>>,
+    trace_hold: Option<Spanned<String>>,
 }
 
 impl Settings {
@@ -736,6 +816,13 @@ impl Settings {
             size: self.size.or_else(|| parent.size.clone()),
             family: self.family.or_else(|| parent.family.clone()),
             alerts: self.alerts.or_else(|| parent.alerts.clone()),
+            trace: self.trace.or_else(|| parent.trace.clone()),
+            trace_interval: self
+                .trace_interval
+                .or_else(|| parent.trace_interval.clone()),
+            max_ttl: self.max_ttl.or_else(|| parent.max_ttl.clone()),
+            trace_step: self.trace_step.or_else(|| parent.trace_step.clone()),
+            trace_hold: self.trace_hold.or_else(|| parent.trace_hold.clone()),
         }
     }
 }
@@ -753,6 +840,11 @@ macro_rules! settings_struct {
             size: Option<Spanned<i64>>,
             family: Option<Spanned<String>>,
             alerts: Option<Spanned<Vec<String>>>,
+            trace: Option<Spanned<String>>,
+            trace_interval: Option<Spanned<String>>,
+            max_ttl: Option<Spanned<i64>>,
+            trace_step: Option<Spanned<String>>,
+            trace_hold: Option<Spanned<String>>,
         }
 
         impl $name {
@@ -765,6 +857,11 @@ macro_rules! settings_struct {
                     size: self.size.clone(),
                     family: self.family.clone(),
                     alerts: self.alerts.clone(),
+                    trace: self.trace.clone(),
+                    trace_interval: self.trace_interval.clone(),
+                    max_ttl: self.max_ttl.clone(),
+                    trace_step: self.trace_step.clone(),
+                    trace_hold: self.trace_hold.clone(),
                 }
             }
         }
@@ -973,13 +1070,55 @@ impl Validator<'_> {
         let slas = self.slas(&raw.slas, &target_names, &group_names);
 
         let server = server?;
+        // The trace budget (§21.9 P11): continuous traces in file order up
+        // to max_trace_targets; the rest are refused.
+        let mut trace_refused = Vec::new();
+        let mut traced = 0u32;
+        for t in &mut targets {
+            if t.trace.is_none_or(|c| c.mode != TraceMode::Continuous) {
+                continue;
+            }
+            if traced < server.max_trace_targets {
+                traced += 1;
+                continue;
+            }
+            let at = self.line_starts.get(t.line - 1).map_or(0..0, |&o| o..o);
+            self.warning(
+                &at,
+                format!(
+                    "target {:?}: trace refused, over max_trace_targets = {}",
+                    t.id, server.max_trace_targets
+                ),
+            );
+            t.trace = None;
+            trace_refused.push(t.id.clone());
+        }
+        for t in targets
+            .iter()
+            .filter(|t| t.trace.is_some_and(|c| c.mode == TraceMode::OnAlert))
+        {
+            let at = self.line_starts.get(t.line - 1).map_or(0..0, |&o| o..o);
+            self.warning(
+                &at,
+                format!(
+                    "target {:?}: trace = \"on_alert\" is not run by this version yet; \
+                     only continuous traces are",
+                    t.id
+                ),
+            );
+        }
         // Packets per day as integers (every step divides a day), so a
         // budget that is exactly full is not rejected by float rounding.
+        // A trace counts as if every sweep went to max_ttl.
         let per_day: u64 = targets
             .iter()
             .map(|t| {
                 let rounds = DAY_SECS / t.schedule.step.as_secs().max(1);
-                u64::from(t.schedule.pings) * u64::from(t.family.series()) * rounds
+                let trace = t
+                    .trace
+                    .filter(|c| c.mode == TraceMode::Continuous)
+                    .map_or(0, |c| c.probes_per_day());
+                (u64::from(t.schedule.pings) * rounds + trace) * u64::from(t.family.series())
             })
             .sum();
         if per_day > u64::from(server.max_pps) * DAY_SECS {
@@ -989,7 +1128,7 @@ impl Validator<'_> {
                 &server_span,
                 format!(
                     "the targets need {pps:.1} packets/s on average, above max_pps = {}; \
-                     lengthen step, lower pings or raise max_pps",
+                     lengthen step, lower pings, trace fewer targets or raise max_pps",
                     server.max_pps
                 ),
             );
@@ -1010,6 +1149,7 @@ impl Validator<'_> {
         Some(Config {
             server,
             targets,
+            trace_refused,
             agent_targets,
             alerts,
             silences,
@@ -2342,6 +2482,32 @@ impl Validator<'_> {
             self.warning(&v.span(), "tls_cert is unused while listen_ui is \"off\"");
         }
         let anonymous = raw.anonymous.as_ref().is_some_and(|v| *v.get_ref());
+        let mut count = |v: &Option<Spanned<i64>>, key: &str, max: i64, default: u32| match v {
+            None => default,
+            Some(v) => match u32::try_from(*v.get_ref()) {
+                Ok(n) if n >= 1 && i64::from(n) <= max => n,
+                _ => {
+                    self.error(
+                        &v.span(),
+                        format!("{key} must be a whole number from 1 to {max}"),
+                    );
+                    ok = false;
+                    default
+                }
+            },
+        };
+        let max_trace_targets = count(
+            &raw.max_trace_targets,
+            "max_trace_targets",
+            MAX_MAX_TRACE_TARGETS,
+            DEFAULT_MAX_TRACE_TARGETS,
+        );
+        let trace_raw_days = count(
+            &raw.trace_raw_days,
+            "trace_raw_days",
+            MAX_TRACE_RAW_DAYS,
+            DEFAULT_TRACE_RAW_DAYS,
+        );
         ok.then(|| ServerConfig {
             data_dir: PathBuf::from(data_dir),
             vantage,
@@ -2351,7 +2517,105 @@ impl Validator<'_> {
             anonymous,
             tls,
             listen_agents,
+            max_trace_targets,
+            trace_raw_days,
         })
+    }
+
+    /// The trace settings of one layer or target; `None` when the
+    /// target is not traced or a value is wrong (and reported).
+    fn trace(&mut self, s: &Settings) -> Option<TraceConfig> {
+        let mode = match s.trace.as_ref().map(|v| (v, v.get_ref().trim())) {
+            None | Some((_, "off")) => None,
+            Some((_, "continuous")) => Some(TraceMode::Continuous),
+            Some((_, "on_alert")) => Some(TraceMode::OnAlert),
+            Some((v, _)) => {
+                self.error(
+                    &v.span(),
+                    "trace must be \"continuous\", \"on_alert\" or \"off\"",
+                );
+                None
+            }
+        };
+        let interval = match &s.trace_interval {
+            None => Some(DEFAULT_TRACE_INTERVAL),
+            Some(v) => match self.duration("trace_interval", v) {
+                Some(d) if (MIN_TRACE_INTERVAL..=MAX_TRACE_INTERVAL).contains(&d) => Some(d),
+                Some(_) => {
+                    self.error(&v.span(), "trace_interval must be 0.5s to 60s");
+                    None
+                }
+                None => None,
+            },
+        };
+        let max_ttl = match &s.max_ttl {
+            None => Some(DEFAULT_MAX_TTL),
+            Some(v) => match *v.get_ref() {
+                n @ 1..=MAX_MAX_TTL => u8::try_from(n).ok(),
+                _ => {
+                    self.error(&v.span(), format!("max_ttl must be 1 to {MAX_MAX_TTL}"));
+                    None
+                }
+            },
+        };
+        let step = match &s.trace_step {
+            None => Some(DEFAULT_TRACE_STEP),
+            Some(v) => {
+                let d = self.duration("trace_step", v)?;
+                let secs = d.as_secs();
+                if d.subsec_nanos() != 0 || secs == 0 || DAY_SECS % secs != 0 {
+                    self.error(
+                        &v.span(),
+                        "trace_step must be whole seconds that divide a day evenly \
+                         (for example 60s or 300s)",
+                    );
+                    None
+                } else {
+                    Some(d)
+                }
+            }
+        };
+        let hold = match &s.trace_hold {
+            None => Some(DEFAULT_TRACE_HOLD),
+            Some(v) => match self.duration("trace_hold", v) {
+                Some(d) if d <= MAX_TRACE_HOLD => Some(d),
+                Some(_) => {
+                    self.error(&v.span(), "trace_hold must be at most 24h");
+                    None
+                }
+                None => None,
+            },
+        };
+        let (interval, max_ttl, step, hold) = (interval?, max_ttl?, step?, hold?);
+        let cfg = TraceConfig {
+            mode: mode?,
+            interval,
+            max_ttl,
+            step,
+            hold,
+        };
+        let sweeps = cfg.sweeps_per_step();
+        if !(1..=u32::try_from(MAX_PINGS).unwrap_or(u32::MAX)).contains(&sweeps)
+            || cfg.interval * sweeps != cfg.step
+        {
+            let at = s
+                .trace_step
+                .as_ref()
+                .or(s.trace_interval.as_ref())
+                .or(s.trace.as_ref())
+                .map_or(0..0, Spanned::span);
+            self.error(
+                &at,
+                format!(
+                    "trace_step ({}) must be a whole multiple of trace_interval ({}), \
+                     at most {MAX_PINGS} sweeps",
+                    duration::format(cfg.step),
+                    duration::format(cfg.interval)
+                ),
+            );
+            return None;
+        }
+        Some(cfg)
     }
 
     fn target(
@@ -2476,6 +2740,7 @@ impl Validator<'_> {
         }
 
         let alerts = self.alert_refs(s.alerts.as_ref());
+        let trace = self.trace(s);
         let step = self.step(s.step.as_ref());
         let pings = self.pings(s.pings.as_ref());
         let timeout = self.timeout(s.timeout.as_ref());
@@ -2541,6 +2806,7 @@ impl Validator<'_> {
             alerts,
             parent: None,
             vantages: Vec::new(),
+            trace,
             line: self.position(span.start).0,
         })
     }
@@ -2879,6 +3145,7 @@ impl Validator<'_> {
         if let Some(v) = &s.spread {
             self.duration("spread", v);
         }
+        self.trace(s);
         // Names are checked where they are written, so a typo in
         // [defaults] is reported even if every target overrides it.
         if let Some(v) = &s.alerts {
@@ -5077,5 +5344,140 @@ name = "G"
         assert!(d.message.contains("x\\nconfig.toml"), "{:?}", d.message);
         assert_eq!(d.line, src.lines().count());
         assert!(!d.to_string().contains('\n'));
+    }
+
+    const TRACED: &str = r#"
+[server]
+data_dir = "/tmp/rl"
+max_trace_targets = 2
+
+[defaults]
+step = "60s"
+trace_interval = "1s"
+
+[[group]]
+name = "G"
+trace = "continuous"
+max_ttl = 12
+
+  [[group.target]]
+  name = "a"
+  host = "192.0.2.1"
+  trace_step = "30s"
+
+  [[group.target]]
+  name = "b"
+  host = "192.0.2.2"
+  probe = "tcp"
+  port = 443
+
+  [[group.target]]
+  name = "c"
+  host = "192.0.2.3"
+
+  [[group.target]]
+  name = "d"
+  host = "192.0.2.4"
+  trace = "off"
+"#;
+
+    #[test]
+    fn trace_settings_cascade_and_the_budget_refuses_the_rest() {
+        let p = parse(TRACED);
+        let c = p.config.unwrap();
+        let a = c.targets[0].trace.unwrap();
+        assert_eq!(a.mode, TraceMode::Continuous);
+        assert_eq!(a.interval, Duration::from_secs(1));
+        assert_eq!(a.max_ttl, 12);
+        assert_eq!(a.step, Duration::from_secs(30));
+        assert_eq!(a.hold, DEFAULT_TRACE_HOLD);
+        assert_eq!(a.sweeps_per_step(), 30);
+        // A TCP target is traced over ICMP all the same.
+        assert!(c.targets[1].trace.is_some());
+        // The third continuous trace is over max_trace_targets = 2.
+        assert_eq!(c.targets[2].trace, None);
+        assert_eq!(c.trace_refused, vec!["c".to_string()]);
+        assert_eq!(c.targets[3].trace, None);
+        let warnings: Vec<String> = p
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .map(|d| d.to_string())
+            .collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("\"c\": trace refused, over max_trace_targets = 2")),
+            "{warnings:?}"
+        );
+        assert_eq!(c.server.trace_raw_days, DEFAULT_TRACE_RAW_DAYS);
+    }
+
+    #[test]
+    fn untraced_targets_have_no_trace() {
+        let c = parse(ALERTS).config.unwrap();
+        assert!(c.targets.iter().all(|t| t.trace.is_none()));
+        assert!(c.trace_refused.is_empty());
+    }
+
+    #[test]
+    fn bad_trace_values_are_reported() {
+        let with = |line: &str| {
+            format!(
+                "[server]\ndata_dir = \"/x\"\n[[group]]\nname = \"G\"\n  [[group.target]]\n  \
+                 name = \"a\"\n  host = \"192.0.2.1\"\n  trace = \"continuous\"\n  {line}\n"
+            )
+        };
+        for (line, want) in [
+            (
+                "trace_interval = \"100ms\"",
+                "trace_interval must be 0.5s to 60s",
+            ),
+            ("max_ttl = 65", "max_ttl must be 1 to 64"),
+            (
+                "trace_step = \"7s\"",
+                "trace_step must be whole seconds that divide a day",
+            ),
+            ("trace_hold = \"25h\"", "trace_hold must be at most 24h"),
+            (
+                "trace_interval = \"7s\"",
+                "trace_step (1m) must be a whole multiple of trace_interval (7s)",
+            ),
+        ] {
+            let e = errors(&with(line));
+            assert!(e.iter().any(|m| m.contains(want)), "{line}: {e:?}");
+        }
+        let e = errors(&with("").replace("continuous", "always"));
+        assert!(
+            e.iter()
+                .any(|m| m.contains("trace must be \"continuous\", \"on_alert\" or \"off\"")),
+            "{e:?}"
+        );
+        let e = errors("[server]\ndata_dir = \"/x\"\nmax_trace_targets = 0\n");
+        assert!(e[0].contains("max_trace_targets must be a whole number from 1 to 1000"));
+    }
+
+    #[test]
+    fn traces_count_against_max_pps() {
+        // 30 TTLs every 2.5 s is 12 probes a second.
+        let src = "[server]\ndata_dir = \"/x\"\nmax_pps = 10\n[[group]]\nname = \"G\"\n  \
+                   [[group.target]]\n  name = \"a\"\n  host = \"192.0.2.1\"\n  step = \"60s\"\n  \
+                   pings = 1\n  trace = \"continuous\"\n";
+        let e = errors(src);
+        assert!(e.iter().any(|m| m.contains("above max_pps = 10")), "{e:?}");
+    }
+
+    #[test]
+    fn on_alert_traces_are_accepted_with_a_warning() {
+        let src = "[server]\ndata_dir = \"/x\"\n[[group]]\nname = \"G\"\n  \
+                   [[group.target]]\n  name = \"a\"\n  host = \"192.0.2.1\"\n  trace = \"on_alert\"\n";
+        let p = parse(src);
+        let c = p.config.unwrap();
+        assert_eq!(c.targets[0].trace.unwrap().mode, TraceMode::OnAlert);
+        assert!(
+            p.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not run by this version"))
+        );
     }
 }

@@ -23,7 +23,8 @@ use rl_probe::{
 };
 use rl_sched::{Completed, FailCause, Job, Outcome, Sink, Snapshot, Stats};
 use rl_store::{
-    Appended, ErrorCounts, Reader, SeriesKey, StoredRound, Writer, WriterOptions, WriterStats,
+    Appended, ErrorCounts, Reader, SeriesKey, StoredRound, TraceHop, TraceLog, TraceRecord, Writer,
+    WriterOptions, WriterStats,
 };
 use rl_web::{AppState, HttpPhases, Latest, LatestHost, LatestRound, MetricsWriter, SeriesInfo};
 use tokio::sync::watch;
@@ -89,15 +90,20 @@ pub(crate) async fn serve(
     let agent_series = plans.len() - local_n;
     // An ICMP series needs an ICMP socket of its family; prefer-v6 can use
     // either. Other probes use ordinary sockets.
+    // A trace is ICMP whatever the target's probe.
+    let traces = trace_plans(&cfg);
     let icmp = |p: &&SeriesPlan| matches!(p.probe, ProbeConfig::Icmp { .. });
-    let prefer = local
+    let icmp_families: Vec<Family> = local
         .iter()
         .filter(icmp)
-        .any(|p| p.family == Family::PreferV6);
+        .map(|p| p.family)
+        .chain(traces.iter().map(|t| t.family))
+        .collect();
+    let prefer = icmp_families.contains(&Family::PreferV6);
     let mut usable = [true; 2];
     for v6 in [false, true] {
         let own = if v6 { Family::V6 } else { Family::V4 };
-        let required = local.iter().filter(icmp).any(|p| p.family == own);
+        let required = icmp_families.contains(&own);
         if !required && !prefer {
             continue;
         }
@@ -186,6 +192,50 @@ pub(crate) async fn serve(
         eprintln!("routelith server: cannot record series steps: {e}");
         return ExitCode::from(2);
     }
+    // Traces: per TTL a hop series, and one series id for the raw sweeps.
+    let trace_keys: Vec<SeriesKey> = traces
+        .iter()
+        .flat_map(|t| t.keys(&cfg.server.vantage))
+        .collect();
+    let trace_ids = match writer.register(&trace_keys) {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("routelith server: cannot register trace series: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut trace_jobs = Vec::with_capacity(traces.len());
+    let mut hop_steps = Vec::new();
+    let mut ids_left = &trace_ids[..];
+    for t in &traces {
+        let (mine, rest) = ids_left.split_at(1 + usize::from(t.cfg.max_ttl));
+        ids_left = rest;
+        let step_ms = u64::try_from(t.cfg.step.as_millis()).unwrap_or(u64::MAX);
+        hop_steps.extend(mine[1..].iter().map(|&id| (id, step_ms)));
+        trace_jobs.push(rl_sched::TraceJob {
+            hop_series: mine[1..].to_vec(),
+            raw_series: mine[0],
+            vantage: cfg.server.vantage.clone(),
+            target: t.target.clone(),
+            host: t.host.clone(),
+            family: t.family,
+            v6_usable: usable[1],
+            cfg: t.cfg,
+        });
+    }
+    if let Err(e) = writer.set_steps(&hop_steps) {
+        eprintln!("routelith server: cannot record series steps: {e}");
+        return ExitCode::from(2);
+    }
+    let hop_ids: std::collections::HashSet<u64> = hop_steps.iter().map(|&(id, _)| id).collect();
+    let trace_log = match TraceLog::open(&cfg.server.data_dir, i64::from(cfg.server.trace_raw_days))
+    {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("routelith server: cannot open the trace store: {e}");
+            return ExitCode::from(2);
+        }
+    };
 
     // What can still stop start-up comes before the alert engine, which
     // logs "server started" and hands it to the outputs: an exit after it
@@ -359,7 +409,17 @@ pub(crate) async fn serve(
     let shared_counters = store_stats.clone();
     let store = std::thread::spawn(move || {
         let mut alerting = alerting;
-        let r = store_loop(writer, &rx, &store_latest, &shared_counters, &mut alerting);
+        let r = store_loop(
+            Store {
+                writer,
+                traces: trace_log,
+                hops: hop_ids,
+            },
+            &rx,
+            &store_latest,
+            &shared_counters,
+            &mut alerting,
+        );
         let _ = store_done_tx.send(());
         r
     });
@@ -368,6 +428,15 @@ pub(crate) async fn serve(
     let remote_tx = tx.clone();
     let agent_feed = tokio::spawn(feed_agent_rounds(agent_rounds_rx, remote_tx));
     let event_tx = tx.clone();
+    let sweep_tx = tx.clone();
+    let sweeps: rl_sched::SweepSink = Arc::new(move |series, s| {
+        sweep_tx
+            .try_send(Input::Sweep {
+                series,
+                record: trace_record(&s),
+            })
+            .is_ok()
+    });
     let sink: Sink = Arc::new(move |c| tx.try_send(Input::Local(c)).is_ok());
     let (health_stop, health_rx) = mpsc::channel::<()>();
     let health = match crate::health::spawn(
@@ -411,7 +480,19 @@ pub(crate) async fn serve(
             stop_rx.clone(),
         ));
     }
-    drop(sink);
+    let traced = trace_jobs.len();
+    let open: rl_sched::OpenTracer =
+        Arc::new(|addr| rl_path::open(addr).map_err(|e| e.to_string()));
+    for job in trace_jobs {
+        jobs.spawn(rl_sched::run_trace(
+            job,
+            open.clone(),
+            sink.clone(),
+            sweeps.clone(),
+            stop_rx.clone(),
+        ));
+    }
+    drop((sink, sweeps));
     let web = web.map(|(addr, listener, router, tls, auth)| {
         let scheme = if tls.is_some() { "https" } else { "http" };
         eprintln!(
@@ -444,10 +525,15 @@ pub(crate) async fn serve(
         (l, tokio::spawn(log_agent_events(events, event_tx)))
     });
     eprintln!(
-        "routelith server: measuring {} series of {} targets from vantage {:?}, data in {}",
-        jobs.len(),
+        "routelith server: measuring {} series of {} targets from vantage {:?}{}, data in {}",
+        jobs.len() - traced,
         cfg.targets.len(),
         cfg.server.vantage,
+        match traced {
+            0 => String::new(),
+            1 => ", tracing 1 path".to_string(),
+            n => format!(", tracing {n} paths"),
+        },
         cfg.server.data_dir.display()
     );
     if agents.is_some() && !agent_names.is_empty() {
@@ -736,6 +822,102 @@ enum Input {
     Synced(tokio::sync::oneshot::Sender<Result<(), String>>),
     /// An event about an agent (§21.7 G10), for the event log.
     Event(rl_store::Event),
+    /// A sweep of a trace, for the raw trace tier.
+    Sweep {
+        series: u64,
+        record: TraceRecord,
+    },
+}
+
+/// What the store thread owns.
+struct Store {
+    writer: Writer,
+    traces: TraceLog,
+    /// Hop series: stored like any series, but no target alerts.
+    hops: std::collections::HashSet<u64>,
+}
+
+/// One target and family to trace from this vantage.
+#[derive(Debug, Clone, PartialEq)]
+struct TracePlan {
+    target: String,
+    host: String,
+    family: Family,
+    cfg: config::TraceConfig,
+}
+
+impl TracePlan {
+    /// The raw sweeps' series (`<target>#`), then the hop series
+    /// (`<target>#<ttl>`, §21.9 P6) for TTL 1 to `max_ttl`.
+    fn keys(&self, vantage: &str) -> Vec<SeriesKey> {
+        let family = self.family.as_str();
+        std::iter::once(SeriesKey::new(
+            vantage,
+            &format!("{}#", self.target),
+            family,
+        ))
+        .chain(
+            (1..=self.cfg.max_ttl)
+                .map(|ttl| SeriesKey::new(vantage, &format!("{}#{ttl}", self.target), family)),
+        )
+        .collect()
+    }
+}
+
+/// The continuous traces of this vantage's targets, a `both` target once
+/// per family. `on_alert` traces start with alerts (a later step).
+fn trace_plans(cfg: &Config) -> Vec<TracePlan> {
+    let mut out = Vec::new();
+    for t in &cfg.targets {
+        let Some(tc) = t.trace.filter(|c| c.mode == config::TraceMode::Continuous) else {
+            continue;
+        };
+        let families: &[Family] = match t.family {
+            Family::Both => &[Family::V4, Family::V6],
+            Family::V4 => &[Family::V4],
+            Family::V6 => &[Family::V6],
+            Family::PreferV6 => &[Family::PreferV6],
+        };
+        for &family in families {
+            out.push(TracePlan {
+                target: t.id.clone(),
+                host: t.host.clone(),
+                family,
+                cfg: tc,
+            });
+        }
+    }
+    out
+}
+
+/// A sweep as the raw trace tier keeps it.
+fn trace_record(s: &rl_path::Sweep) -> TraceRecord {
+    let us = |d: Duration| u32::try_from(d.as_micros()).unwrap_or(u32::MAX);
+    TraceRecord {
+        ts_ms: to_ms(s.start),
+        timing: Some(s.timing),
+        hops: s
+            .hops
+            .iter()
+            .map(|h| match *h {
+                rl_path::Outcome::TimeExceeded { from, rtt } => TraceHop::TimeExceeded {
+                    from,
+                    rtt_us: us(rtt),
+                },
+                rl_path::Outcome::Reply { from, rtt } => TraceHop::Reply {
+                    from,
+                    rtt_us: us(rtt),
+                },
+                rl_path::Outcome::Unreachable { from, code, rtt } => TraceHop::Unreachable {
+                    from,
+                    code,
+                    rtt_us: us(rtt),
+                },
+                rl_path::Outcome::Lost => TraceHop::Lost,
+                rl_path::Outcome::SendFailed(_) => TraceHop::SendFailed,
+            })
+            .collect(),
+    }
 }
 
 /// An agent event as the event log keeps it, if it goes there.
@@ -1042,7 +1224,7 @@ pub(crate) fn stored(c: &Completed) -> Result<StoredRound, rl_store::StoreError>
 /// ends the loop; the server then shuts down and a restart runs recovery.
 /// Returns how many rounds were rejected as invalid (and so not stored).
 fn store_loop(
-    mut w: Writer,
+    mut st: Store,
     rx: &mpsc::Receiver<Input>,
     latest: &Latest,
     counters: &Mutex<StoreCounters>,
@@ -1050,7 +1232,7 @@ fn store_loop(
 ) -> Result<u64, rl_store::StoreError> {
     let (mut late, mut rejected) = (0u64, 0u64);
     let result = store_rounds(
-        &mut w,
+        &mut st,
         rx,
         latest,
         counters,
@@ -1063,7 +1245,11 @@ fn store_loop(
             "routelith server: store: {late} round(s) were not newer than the last one and were dropped"
         );
     }
-    match result.and_then(|()| w.close()) {
+    let Store {
+        writer: w, traces, ..
+    } = st;
+    let traces_closed = traces.close();
+    match result.and_then(|()| w.close()).and(traces_closed) {
         Ok(()) => alerting.stopped(now_ms()),
         Err(e) => {
             // Still hand on what is queued, as an exit cuts the outputs off.
@@ -1075,7 +1261,7 @@ fn store_loop(
 }
 
 fn store_rounds(
-    w: &mut Writer,
+    st: &mut Store,
     rx: &mpsc::Receiver<Input>,
     latest: &Latest,
     counters: &Mutex<StoreCounters>,
@@ -1092,7 +1278,23 @@ fn store_rounds(
         match rx.recv_timeout(wait) {
             Ok(Input::Synced(done)) => synced.push(done),
             Ok(Input::Event(e)) => alerting.event(e),
-            Ok(input) => match append(w, input) {
+            Ok(Input::Sweep { series, record }) => {
+                match st.traces.append(series, &record, now_ms()) {
+                    Ok(_) => {}
+                    Err(rl_store::StoreError::InvalidRound(msg)) => {
+                        *rejected += 1;
+                        if last_invalid.as_deref() != Some(msg) {
+                            eprintln!(
+                                "routelith server: store: trace {series}: invalid sweep: {msg}"
+                            );
+                            last_invalid = Some(msg.to_string());
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(input) => match append(&mut st.writer, input) {
+                (series, Ok((Appended::Stored, _, _))) if st.hops.contains(&series) => {}
                 (series, Ok((Appended::Stored, newest, r))) => {
                     latest.record(series, newest);
                     alerting.round(series, &r);
@@ -1112,11 +1314,14 @@ fn store_rounds(
         }
         if Instant::now() >= next_sync {
             next_sync += SYNC_EVERY;
+            let w = &mut st.writer;
             w.sync()?;
+            st.traces.sync()?;
             for done in synced.drain(..) {
                 let _ = done.send(Ok(()));
             }
             w.maintain(now_ms())?;
+            st.traces.maintain(now_ms())?;
             *counters.lock().unwrap_or_else(PoisonError::into_inner) = StoreCounters {
                 writer: w.stats(),
                 wal_bytes: w.wal_bytes(),
@@ -1149,7 +1354,7 @@ fn append(
             round,
             latest,
         } => (series, Ok((round, latest))),
-        Input::Synced(_) | Input::Event(_) => {
+        Input::Synced(_) | Input::Event(_) | Input::Sweep { .. } => {
             unreachable!("store_rounds handles sync requests and events itself")
         }
     };
@@ -1550,6 +1755,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn traces_get_a_raw_series_and_one_hop_series_per_ttl() {
+        let src = "[server]\ndata_dir = \"/x\"\n[[group]]\nname = \"G\"\n  [[group.target]]\n  \
+                   name = \"web\"\n  host = \"example.org\"\n  family = \"both\"\n  \
+                   trace = \"continuous\"\n  max_ttl = 3\n  [[group.target]]\n  name = \"db\"\n  \
+                   host = \"192.0.2.9\"\n";
+        let cfg = config::parse(src).config.unwrap();
+        let plans = trace_plans(&cfg);
+        assert_eq!(plans.len(), 2, "one per family, none for db");
+        let names: Vec<String> = plans[1]
+            .keys("local")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "local/web#/v6",
+                "local/web#1/v6",
+                "local/web#2/v6",
+                "local/web#3/v6"
+            ]
+        );
+    }
+
+    #[test]
+    fn sweeps_are_kept_with_their_answers() {
+        let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let ms = Duration::from_millis(1);
+        let s = rl_path::Sweep {
+            start: UNIX_EPOCH + Duration::from_secs(1),
+            hops: vec![
+                rl_path::Outcome::TimeExceeded { from: ip, rtt: ms },
+                rl_path::Outcome::Lost,
+                rl_path::Outcome::SendFailed("x".into()),
+                rl_path::Outcome::Reply { from: ip, rtt: ms },
+            ],
+            timing: rl_core::TimingBackend::LinuxKernelTimestamp,
+        };
+        let r = trace_record(&s);
+        assert_eq!(r.ts_ms, 1000);
+        assert_eq!(
+            r.hops,
+            vec![
+                TraceHop::TimeExceeded {
+                    from: ip,
+                    rtt_us: 1000
+                },
+                TraceHop::Lost,
+                TraceHop::SendFailed,
+                TraceHop::Reply {
+                    from: ip,
+                    rtt_us: 1000
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn both_targets_become_two_series() {
         let src = "[server]\ndata_dir = \"/tmp/x\"\n[[group]]\nname = \"g\"\n[[group.target]]\nname = \"a\"\nhost = \"127.0.0.1\"\n[[group.target]]\nname = \"b\"\nhost = \"localhost\"\nfamily = \"both\"\n";
         let parsed = config::parse(src);
@@ -1825,7 +2088,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            store_loop(w, &rx, &latest, &counters, &mut alerting).unwrap(),
+            store_loop(
+                Store {
+                    writer: w,
+                    traces: TraceLog::open(dir.path(), 7).unwrap(),
+                    hops: Default::default(),
+                },
+                &rx,
+                &latest,
+                &counters,
+                &mut alerting
+            )
+            .unwrap(),
             1
         );
         let rounds = rl_store::Reader::open(dir.path())

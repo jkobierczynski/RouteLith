@@ -79,13 +79,31 @@ fn summary(cfg: &Config, warnings: usize) -> String {
     let pps: f64 = cfg
         .targets
         .iter()
-        .map(|t| t.schedule.pps() * f64::from(t.family.series()))
+        .map(|t| {
+            let trace = t
+                .trace
+                .filter(|c| c.mode == config::TraceMode::Continuous)
+                .map_or(0.0, |c| c.probes_per_day() as f64 / 86_400.0);
+            (t.schedule.pps() + trace) * f64::from(t.family.series())
+        })
         // Not sum(): an empty f64 sum is -0.0, printed "-0.0".
         .fold(0.0, |a, b| a + b);
+    let traced = cfg
+        .targets
+        .iter()
+        .filter(|t| {
+            t.trace
+                .is_some_and(|c| c.mode == config::TraceMode::Continuous)
+        })
+        .count();
     format!(
-        "OK: {} target{}, {series} series, {}{pps:.1} of {} packets/s on average, vantage {:?}{}",
+        "OK: {} target{}{}, {series} series, {}{pps:.1} of {} packets/s on average, vantage {:?}{}",
         cfg.targets.len(),
         if cfg.targets.len() == 1 { "" } else { "s" },
+        match traced {
+            0 => String::new(),
+            n => format!(" ({n} traced)"),
+        },
         match cfg.alerts.len() {
             0 => String::new(),
             1 => "1 alert rule, ".to_string(),
@@ -161,8 +179,9 @@ fn check_privileges(cfg: &Config, resolved: &HashMap<usize, Vec<IpAddr>>, path: 
     // whose addresses are unknown.
     let (mut need, mut maybe) = ([false; 2], [false; 2]);
     for (i, t) in cfg.targets.iter().enumerate() {
-        // Only ICMP needs a privileged socket.
-        if !matches!(t.probe, ProbeConfig::Icmp { .. }) {
+        // Only ICMP needs a privileged socket; a trace is ICMP whatever
+        // the target's probe.
+        if !matches!(t.probe, ProbeConfig::Icmp { .. }) && t.trace.is_none() {
             continue;
         }
         match families_used(t, resolved.get(&i).map(Vec::as_slice)) {
