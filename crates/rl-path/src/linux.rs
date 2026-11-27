@@ -34,6 +34,10 @@ const SEND_ATTEMPTS: u32 = 3;
 
 /// Errors the kernel derives from received ICMP errors (`icmp_err_convert`
 /// and its IPv6 counterpart), which a pending socket error can carry.
+/// Pending socket errors read through in one drain before the reader
+/// backs off.
+const MAX_SOCKET_ERRORS: u32 = 64;
+
 fn is_icmp_errno(e: &io::Error) -> bool {
     matches!(
         e.raw_os_error(),
@@ -46,6 +50,10 @@ fn is_icmp_errno(e: &io::Error) -> bool {
                 | libc::EACCES
                 | libc::ENONET
                 | libc::EOPNOTSUPP
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::ENETDOWN
+                | libc::EREMOTEIO
         )
     )
 }
@@ -318,6 +326,9 @@ async fn read_loop(shared: Arc<Shared>, dest: IpAddr) {
         else {
             return;
         };
+        // A read that keeps failing (a security policy that refuses
+        // MSG_ERRQUEUE, say) must not spin here: back off and try again.
+        let mut stalled = false;
         // Error queue first: Time Exceeded and Unreachable.
         loop {
             match shared.sock.get_ref().recv_err(&mut buf) {
@@ -326,6 +337,16 @@ async fn read_loop(shared: Arc<Shared>, dest: IpAddr) {
                     let Some((seq, nonce)) = quoted_request(v6, &buf[..err.len]) else {
                         continue;
                     };
+                    // Redirects, Source Quench, local errors: the probe may
+                    // still be answered, so leave it waiting.
+                    let useful = match err.kind {
+                        IcmpErrorKind::TimeExceeded => err.offender.is_some(),
+                        IcmpErrorKind::Unreachable => true,
+                        IcmpErrorKind::Other => false,
+                    };
+                    if !useful {
+                        continue;
+                    }
                     let rx = Rx {
                         answer: Answer::Error {
                             kind: err.kind,
@@ -340,14 +361,20 @@ async fn read_loop(shared: Arc<Shared>, dest: IpAddr) {
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                // A malformed message: skip it.
-                Err(_) => continue,
+                // A malformed message (already read): skip it.
+                Err(e) if e.raw_os_error().is_none() => continue,
+                Err(_) => {
+                    stalled = true;
+                    break;
+                }
             }
         }
         // Then echo replies.
+        let mut socket_errors = 0;
         loop {
             match shared.sock.get_ref().recv(&mut buf) {
                 Ok(received) => {
+                    socket_errors = 0;
                     let (wall, user) = (SystemTime::now(), Instant::now());
                     let Some(reply) = parse_echo_reply(v6, &buf[..received.len]) else {
                         continue;
@@ -365,13 +392,27 @@ async fn read_loop(shared: Arc<Shared>, dest: IpAddr) {
                     deliver(&shared, reply.seq, reply.nonce, rx);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 // With IP_RECVERR a queued ICMP error also surfaces once as
-                // an error here (EHOSTUNREACH and the like); the error queue
-                // has the details, so go on reading.
-                Err(_) => continue,
+                // an error here (EHOSTUNREACH and the like), and reading it
+                // clears it; the error queue has the details.
+                // Each queued error clears one; a socket that keeps
+                // failing (a security policy, say) counts as stalled.
+                Err(e) if is_icmp_errno(&e) && socket_errors < MAX_SOCKET_ERRORS => {
+                    socket_errors += 1;
+                }
+                Err(_) => {
+                    stalled = true;
+                    break;
+                }
             }
         }
-        guard.clear_ready();
+        if stalled {
+            drop(guard);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        } else {
+            guard.clear_ready();
+        }
     }
 }
 

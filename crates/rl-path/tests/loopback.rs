@@ -28,10 +28,8 @@ async fn sweeps_to(addr: &str) -> Result<(), TraceError> {
         let sweep = rl_path::run_sweep(tracer.clone(), session.next_count(), plan()).await;
         for hop in &sweep.hops {
             match hop {
-                Outcome::Reply { from, rtt } => {
-                    assert_eq!(*from, dest);
-                    assert!(*rtt < Duration::from_millis(50), "{rtt:?}");
-                }
+                // No RTT bound: a busy runner can delay the reply routine.
+                Outcome::Reply { from, .. } => assert_eq!(*from, dest),
                 other => panic!("loopback answered {other:?}"),
             }
         }

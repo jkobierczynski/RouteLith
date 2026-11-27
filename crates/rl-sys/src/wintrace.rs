@@ -122,9 +122,11 @@ impl InFlight {
         u32::try_from(self.reply.len() * 8).unwrap_or(u32::MAX)
     }
 
+    /// Hand the outcome to the caller. A panic in the callback is caught
+    /// here: it must not unwind into Windows through the APC.
     fn finish(mut self, outcome: TraceOutcome) {
         if let Some(done) = self.done.take() {
-            done(outcome);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| done(outcome)));
         }
     }
 }
@@ -182,8 +184,9 @@ impl TraceWorker {
         }
     }
 
-    /// Queue one probe. `req.done` is called exactly once, on the worker.
-    pub fn submit(&self, req: TraceRequest) {
+    /// Queue one probe. On success `req.done` is called exactly once, on
+    /// the worker thread; on an error it is dropped without being called.
+    pub fn submit(&self, req: TraceRequest) -> io::Result<()> {
         let v6 = req.dest.is_ipv6();
         let (source6, target6) = match req.dest {
             IpAddr::V6(d) => (sockaddr_in6(Ipv6Addr::UNSPECIFIED), sockaddr_in6(d)),
@@ -221,15 +224,13 @@ impl TraceWorker {
         });
         if !self.supports(v6) {
             let family = if v6 { "IPv6" } else { "IPv4" };
-            flight.finish(TraceOutcome::SendError(io::Error::new(
+            return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("no ICMP handle for {family}"),
-            )));
-            return;
+            ));
         }
         let Some(thread) = &self.thread else {
-            flight.finish(TraceOutcome::SendError(io::Error::other("worker stopped")));
-            return;
+            return Err(io::Error::other("worker stopped"));
         };
         let raw = Box::into_raw(flight);
         // SAFETY: the thread handle stays valid while its JoinHandle lives
@@ -239,9 +240,10 @@ impl TraceWorker {
         if queued == 0 {
             let err = io::Error::last_os_error();
             // SAFETY: the APC was not queued, so ownership is still ours.
-            let flight = unsafe { Box::from_raw(raw) };
-            flight.finish(TraceOutcome::SendError(err));
+            drop(unsafe { Box::from_raw(raw) });
+            return Err(err);
         }
+        Ok(())
     }
 }
 
@@ -250,11 +252,15 @@ impl Drop for TraceWorker {
         self.shared.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             // SAFETY: wakes the sleeping thread so it sees `stop`; the handle
-            // is valid until the join below.
+            // is valid until the join below (or the JoinHandle's drop).
             unsafe {
                 QueueUserAPC(Some(wake), thread.as_raw_handle(), 0);
             }
-            let _ = thread.join();
+            // Dropped from a callback on the worker itself: it cannot wait
+            // for itself, so let it finish on its own (detached).
+            if thread.thread().id() != std::thread::current().id() {
+                let _ = thread.join();
+            }
         }
     }
 }

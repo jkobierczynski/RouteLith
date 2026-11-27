@@ -127,7 +127,10 @@ pub(crate) async fn run(args: TraceArgs) -> ExitCode {
         }
     }
     let hops = stats.hops();
-    let reached = hops.last().is_some_and(|h| h.is_dest);
+    // Only an echo reply counts: an Unreachable ends the path short of it.
+    let reached = hops.last().is_some_and(|h| h.replies() > 0);
+    // Counted over every TTL: rows past the last answer are not shown.
+    let send_failed = stats.send_failed() > 0;
     if args.json {
         let report = JsonReport {
             host: &args.host,
@@ -158,8 +161,12 @@ pub(crate) async fn run(args: TraceArgs) -> ExitCode {
             )
         );
     }
+    // As `check`: 0 reached, 1 not reached, 2 when probes failed to leave
+    // this host and nothing reached the destination.
     if reached {
         ExitCode::SUCCESS
+    } else if send_failed {
+        ExitCode::from(2)
     } else {
         ExitCode::from(1)
     }

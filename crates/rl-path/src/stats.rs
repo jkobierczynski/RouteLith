@@ -27,8 +27,8 @@ pub struct HopStats {
     pub send_failed: u64,
     /// Most answers first (ECMP shows as several).
     pub responders: Vec<Responder>,
-    /// Whether this is the destination's TTL in the newest sweep that
-    /// reached the destination.
+    /// Whether this is the TTL where the path ended (echo reply or
+    /// Unreachable) in the newest sweep that ended it.
     pub is_dest: bool,
     pub last_us: Option<u64>,
     pub min_us: Option<u64>,
@@ -41,6 +41,16 @@ pub struct HopStats {
 }
 
 impl HopStats {
+    /// Echo replies from the destination at this TTL (answers that were
+    /// not Unreachable).
+    pub fn replies(&self) -> u64 {
+        if self.is_dest {
+            self.received - self.unreachable
+        } else {
+            0
+        }
+    }
+
     /// Lost share in percent; 0 when nothing was sent.
     pub fn loss_pct(&self) -> f64 {
         if self.sent == 0 {
@@ -73,6 +83,9 @@ struct Acc {
 pub struct TraceStats {
     hops: Vec<Acc>,
     sweeps: u64,
+    /// Probes that failed to leave this host, over every TTL (rows past the
+    /// last answer are not shown but still count).
+    send_failed: u64,
     /// Destination distance in the newest sweep that reached it.
     dest_ttl: Option<u8>,
 }
@@ -84,6 +97,11 @@ impl TraceStats {
 
     pub fn sweeps(&self) -> u64 {
         self.sweeps
+    }
+
+    /// Probes that failed to leave this host, at any TTL.
+    pub fn send_failed(&self) -> u64 {
+        self.send_failed
     }
 
     pub fn add(&mut self, sweep: &Sweep) {
@@ -100,7 +118,10 @@ impl TraceStats {
             acc.sent += 1;
             match outcome {
                 Outcome::Lost => {}
-                Outcome::SendFailed(_) => acc.send_failed += 1,
+                Outcome::SendFailed(_) => {
+                    acc.send_failed += 1;
+                    self.send_failed += 1;
+                }
                 answered => {
                     if matches!(answered, Outcome::Unreachable { .. }) {
                         acc.unreachable += 1;
@@ -157,7 +178,17 @@ impl TraceStats {
                 let stddev = mean.map(|m| (a.sum_sq / n - m * m).max(0.0).sqrt());
                 let mut sorted = a.rtts.clone();
                 sorted.sort_unstable();
-                let median = (!sorted.is_empty()).then(|| sorted[sorted.len() / 2]);
+                let mid = sorted.len() / 2;
+                let median = match sorted.len() {
+                    0 => None,
+                    n if n % 2 == 1 => Some(sorted[mid]),
+                    // Mean of the two middle values, without overflow.
+                    _ => Some(
+                        sorted[mid - 1] / 2
+                            + sorted[mid] / 2
+                            + (sorted[mid - 1] % 2 + sorted[mid] % 2) / 2,
+                    ),
+                };
                 HopStats {
                     ttl: u8::try_from(i + 1).unwrap_or(u8::MAX),
                     sent: a.sent,
@@ -226,7 +257,11 @@ mod tests {
         assert_eq!(hops[0].loss_pct(), 0.0);
         assert_eq!(hops[0].min_us, Some(1000));
         assert_eq!(hops[0].max_us, Some(3000));
-        assert_eq!(hops[0].median_us, Some(2000));
+        assert_eq!(
+            hops[0].median_us,
+            Some(2000),
+            "mean of 2 and 2 (1, 2, 2, 3)"
+        );
         assert_eq!(hops[0].mean_us, Some(2000.0));
         assert_eq!(hops[0].jitter_us, Some(1000.0));
         assert_eq!(hops[1].loss_pct(), 25.0);
@@ -246,6 +281,28 @@ mod tests {
         assert!(hops[2].is_dest && !hops[1].is_dest);
         assert_eq!(hops[2].sent, 4);
         assert_eq!(hops[2].last_us, Some(4000));
+    }
+
+    #[test]
+    fn even_median_is_the_mean_of_the_middle_two() {
+        let mut st = TraceStats::new();
+        st.add(&sweep(vec![reply(10)]));
+        st.add(&sweep(vec![reply(31)]));
+        assert_eq!(st.hops()[0].median_us, Some(20_500));
+    }
+
+    #[test]
+    fn unreachable_ends_the_path_but_is_no_reply() {
+        let mut st = TraceStats::new();
+        let unreach = Outcome::Unreachable {
+            from: Some(ip(1)),
+            code: 1,
+            rtt: Duration::from_millis(1),
+        };
+        st.add(&sweep(vec![unreach]));
+        let hops = st.hops();
+        assert!(hops[0].is_dest);
+        assert_eq!(hops[0].replies(), 0);
     }
 
     #[test]
@@ -270,5 +327,13 @@ mod tests {
         assert_eq!(hops.len(), 3);
         assert_eq!(hops[1].loss_pct(), 100.0);
         assert!(!hops[2].is_dest);
+    }
+
+    #[test]
+    fn send_failures_past_the_last_answer_still_count() {
+        let mut st = TraceStats::new();
+        st.add(&sweep(vec![te(1, 1), Outcome::SendFailed("EPERM".into())]));
+        assert_eq!(st.hops().len(), 1);
+        assert_eq!(st.send_failed(), 1);
     }
 }
