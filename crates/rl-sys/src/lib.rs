@@ -14,6 +14,9 @@ pub mod linux;
 pub mod windows;
 
 #[cfg(windows)]
+pub mod wintrace;
+
+#[cfg(windows)]
 pub mod eventlog;
 
 #[cfg(windows)]

@@ -82,6 +82,10 @@ impl IcmpHandle {
         self.v6
     }
 
+    pub(crate) fn raw(&self) -> HANDLE {
+        self.handle
+    }
+
     /// Send one echo request and wait up to `timeout` for the reply. Blocking.
     pub fn echo(
         &self,

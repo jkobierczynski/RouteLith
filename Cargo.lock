@@ -1656,6 +1656,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rl-path"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "rl-core",
+ "rl-probe",
+ "rl-sys",
+ "serde",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "rl-probe"
 version = "0.0.0"
 dependencies = [
@@ -1755,6 +1768,7 @@ dependencies = [
  "rl-core",
  "rl-fed",
  "rl-out",
+ "rl-path",
  "rl-probe",
  "rl-render",
  "rl-sched",
@@ -1763,6 +1777,7 @@ dependencies = [
  "rl-web",
  "roxmltree",
  "rpassword",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

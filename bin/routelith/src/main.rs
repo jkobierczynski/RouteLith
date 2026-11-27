@@ -2,7 +2,7 @@
 //!
 //! `server`, `service install|uninstall`, `check icmp|tcp|dns|http`,
 //! `ctl calibrate`, `ctl verify`, `ctl render`, `ctl import smokeping`,
-//! `ctl user`, `ctl agent` and `agent enroll|run` work.
+//! `ctl user`, `ctl agent`, `agent enroll|run` and `trace` work.
 #![forbid(unsafe_code)]
 
 mod agent;
@@ -15,6 +15,7 @@ mod render;
 mod report;
 mod server;
 mod service;
+mod trace;
 mod user;
 mod verify;
 
@@ -39,6 +40,8 @@ enum Command {
         #[command(subcommand)]
         probe: CheckProbe,
     },
+    /// Trace the path to a host hop by hop from this machine (no root needed).
+    Trace(trace::TraceArgs),
     /// Run as an agent that measures for a server (§21.7).
     Agent {
         #[command(subcommand)]
@@ -130,6 +133,7 @@ fn main() -> ExitCode {
             action: CtlAction::Verify(args),
         } => run(verify::run(args)),
         Command::Server(args) => run(server::run(args)),
+        Command::Trace(args) => run(trace::run(args)),
         Command::Service { action } => service::run(action),
         Command::Agent { action } => agent::agent(action),
         Command::Ctl {

@@ -335,7 +335,7 @@ fn exit_code(samples: &[Sample]) -> ExitCode {
     }
 }
 
-async fn resolve(host: &str, v4_only: bool, v6_only: bool) -> Result<IpAddr, String> {
+pub(crate) async fn resolve(host: &str, v4_only: bool, v6_only: bool) -> Result<IpAddr, String> {
     let wanted = |a: &IpAddr| (!v4_only || a.is_ipv4()) && (!v6_only || a.is_ipv6());
     if let Ok(addr) = host.parse::<IpAddr>() {
         return if wanted(&addr) {
