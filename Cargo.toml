@@ -25,6 +25,9 @@ rl-out = { path = "crates/rl-out" }
 rl-path = { path = "crates/rl-path" }
 rl-fed = { path = "crates/rl-fed" }
 crc32c = "0.6"
+# Reverse DNS through the OS resolver (getnameinfo), for trace hops.
+dns-lookup = "2.1"
+flate2 = "1"
 # 0.26 needs Rust 1.88, above the 1.85 MSRV.
 hickory-proto = { version = "0.25.2", default-features = false, features = ["std"] }
 # Password hashes for UI users (§21.5 F11); salts come from ring.

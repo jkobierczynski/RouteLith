@@ -70,6 +70,7 @@ pub(crate) async fn run(args: VerifyArgs) -> ExitCode {
         resolved
     };
     warnings += check_privileges(&cfg, &resolved, &args.config);
+    warnings += check_asn_db(&cfg, &args.config);
     println!("{}", summary(&cfg, warnings));
     ExitCode::SUCCESS
 }
@@ -223,6 +224,33 @@ const RESOLVE_PARALLEL: usize = 16;
 /// All lookups together; any still unfinished are reported as unchecked.
 const RESOLVE_ALL: Duration = Duration::from_secs(30);
 
+/// Whether `asn_db` loads; the server runs without it (hops get no AS
+/// numbers), so a problem is a warning.
+fn check_asn_db(cfg: &Config, path: &std::path::Path) -> usize {
+    let Some(file) = &cfg.server.asn_db else {
+        return 0;
+    };
+    match rl_path::enrich::AsnDb::load(file) {
+        Ok(db) if db.is_empty() => {
+            eprintln!(
+                "{}: warning: asn_db {} holds no address ranges",
+                path.display(),
+                file.display()
+            );
+            1
+        }
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!(
+                "{}: warning: asn_db {}: {e}; trace hops will have no AS numbers",
+                path.display(),
+                file.display()
+            );
+            1
+        }
+    }
+}
+
 /// Resolve every host name, warning for each that does not resolve to an
 /// address of its family. Returns the addresses of each lookup that
 /// succeeded, by index in `cfg.targets`, and the number of warnings.
@@ -353,6 +381,26 @@ fn missing_family(family: Family, addrs: &[IpAddr]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_or_empty_asn_db_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ip2asn-combined.tsv");
+        let cfg = |p: &std::path::Path| {
+            config::parse(&format!(
+                "[server]\ndata_dir = \"/x\"\nasn_db = {:?}\n",
+                p.display().to_string()
+            ))
+            .config
+            .unwrap()
+        };
+        let c = cfg(&file);
+        assert_eq!(check_asn_db(&c, dir.path()), 1);
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(check_asn_db(&c, dir.path()), 1);
+        std::fs::write(&file, "1.0.0.0\t1.0.0.255\t13335\tUS\tCLOUDFLARENET\n").unwrap();
+        assert_eq!(check_asn_db(&c, dir.path()), 0);
+    }
 
     #[test]
     fn family_coverage() {

@@ -176,8 +176,24 @@ a series of its own named `<target>#<ttl>` (`routelith ctl render --target
 web --last 10m` prints the hops (loss, RTT and responders) from the store,
 `--json` for scripts. At most `max_trace_targets` (50) targets are traced;
 the rest are refused with a warning, and traces count against `max_pps`.
-The path view, route changes, agent traces and `trace = "on_alert"` come
-in later steps.
+
+`GET /api/v1/paths` lists the traces, and `GET /api/v1/paths/<target>`
+gives the hop table over a window (the last 10 minutes unless `from`/`to`
+or `range` is given; `vantage` and `family` pick the trace): per TTL the
+loss, sent, min, median, avg, max, last and jitter, the hop series' id for
+its timeline (`/api/v1/series/<id>/data`), and who answered with their
+share of the answers (ECMP), reverse DNS name and, given `asn_db`, AS
+number, owner and country. Addresses that are never routed on the internet
+are labelled (`private`, `cgnat`, `link_local`, `documentation`, `bogon`,
+...) and get no AS lookup. `asn_db` is the `ip2asn-combined.tsv.gz` file
+from <https://iptoasn.com> (gzipped or not), downloaded by you, so the
+server makes no outside requests for it; it is read again when the file
+changes. Names are looked up with the system resolver, cached for an hour.
+Windows of more than a day, or past `trace_raw_days`, come from the hop
+series (`"source": "hop_series"`): the same loss and RTTs, but no
+responders. `ctl report path` shows the address classes and AS numbers
+too. The path view, route changes, agent traces and `trace = "on_alert"`
+come in later steps.
 
 History from SmokePing comes over with `routelith ctl import smokeping`,
 with the server stopped. It reads `rrdtool dump` XML, so the RRD files can

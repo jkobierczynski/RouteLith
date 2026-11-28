@@ -133,6 +133,16 @@ pub(crate) struct RangeQuery {
 }
 
 impl RangeQuery {
+    pub(crate) fn new(from: Option<i64>, to: Option<i64>, range: Option<String>) -> Self {
+        Self {
+            from,
+            to,
+            points: None,
+            range,
+            scale: None,
+        }
+    }
+
     #[allow(clippy::result_large_err)] // the error is the response itself
     pub(crate) fn resolve(&self) -> Result<(i64, i64), Response> {
         let to = self.to.unwrap_or_else(now_ms);
@@ -191,8 +201,10 @@ pub(crate) fn now_ms() -> i64 {
 
 #[allow(clippy::result_large_err)]
 fn find(s: &AppState, id: u64) -> Result<&crate::SeriesInfo, Response> {
+    // Hop series have a timeline too, though `/series` leaves them out.
     s.series
         .iter()
+        .chain(s.traces.iter().flat_map(|t| &t.hops))
         .find(|i| i.id == id)
         .ok_or_else(|| error(StatusCode::NOT_FOUND, format!("no series {id}")))
 }

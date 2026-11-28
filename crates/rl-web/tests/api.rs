@@ -23,6 +23,105 @@ struct Fixture {
     _dir: tempfile::TempDir,
     router: axum::Router,
     id: u64,
+    /// Hop series of the `web` trace, TTL 1 first.
+    hop_ids: Vec<u64>,
+}
+
+/// A traced target `web`: 24 sweeps from T0 over a private first hop and
+/// 1.1.1.1, and the hop series' rounds of that minute.
+fn add_trace(dir: &std::path::Path, w: &mut Writer) -> rl_web::TraceInfo {
+    use rl_store::{TraceHop, TraceLog, TraceRecord};
+    let keys: Vec<SeriesKey> = ["web#", "web#1", "web#2"]
+        .iter()
+        .map(|t| SeriesKey::new("home", t, "v4"))
+        .collect();
+    let ids = w.register(&keys).unwrap();
+    w.set_steps(&[(ids[1], 60_000), (ids[2], 60_000)]).unwrap();
+    let gw: std::net::IpAddr = "192.168.1.1".parse().unwrap();
+    let dest: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let mut log = TraceLog::open(dir, 7).unwrap();
+    for i in 0..24 {
+        let hops = vec![
+            TraceHop::TimeExceeded {
+                from: gw,
+                rtt_us: 500,
+            },
+            // One sweep in four loses the destination.
+            if i % 4 == 3 {
+                TraceHop::Lost
+            } else {
+                TraceHop::Reply {
+                    from: dest,
+                    rtt_us: 9000,
+                }
+            },
+        ];
+        let rec = TraceRecord {
+            ts_ms: T0 + i * 2500,
+            timing: None,
+            hops,
+        };
+        log.append(ids[0], &rec, T0).unwrap();
+    }
+    log.sync().unwrap();
+    std::mem::forget(log);
+    for (id, rtts) in [(ids[1], vec![500; 24]), (ids[2], vec![9000; 18])] {
+        w.append(
+            id,
+            StoredRound {
+                ts_ms: T0,
+                sent: 24,
+                rtts_us: rtts,
+                errors: ErrorCounts::default(),
+                resolved: None,
+                timing: None,
+                flags: 0,
+            },
+        )
+        .unwrap();
+    }
+    let hops = keys[1..]
+        .iter()
+        .zip(&ids[1..])
+        .map(|(k, &id)| SeriesInfo {
+            id,
+            key: k.clone(),
+            group: "net".into(),
+            probe: "trace".into(),
+            host: "web.example".into(),
+            url: None,
+            step_ms: 60_000,
+            pings: 24,
+        })
+        .collect();
+    rl_web::TraceInfo {
+        vantage: "home".into(),
+        target: "web".into(),
+        group: "net".into(),
+        host: "web.example".into(),
+        family: "v4".into(),
+        mode: "continuous".into(),
+        interval_ms: 2500,
+        step_ms: 60_000,
+        max_ttl: 2,
+        raw_series: ids[0],
+        hops,
+    }
+}
+
+/// Names from a table and AS 13335 for 1.0.0.0/8, as an iptoasn file.
+fn enricher(dir: &std::path::Path) -> Arc<rl_path::enrich::Enricher> {
+    use rl_path::enrich::{AsnSource, Enricher, Rdns};
+    let file = dir.join("ip2asn-combined.tsv");
+    std::fs::write(&file, "1.0.0.0\t1.255.255.255\t13335\tUS\tCLOUDFLARENET\n").unwrap();
+    let asn = AsnSource::new(file);
+    asn.refresh().unwrap();
+    Arc::new(Enricher {
+        rdns: Rdns::new(Arc::new(|a: std::net::IpAddr| {
+            (a.to_string() == "1.1.1.1").then(|| "one.one.one.one".to_string())
+        })),
+        asn: Some(asn),
+    })
 }
 
 fn fixture() -> Fixture {
@@ -46,6 +145,8 @@ fn fixture() -> Fixture {
         )
         .unwrap();
     }
+    let trace = add_trace(dir.path(), &mut w);
+    let hop_ids = trace.hops.iter().map(|h| h.id).collect();
     w.sync().unwrap();
     // The writer stays open, as in the server: reads see the WAL.
     std::mem::forget(w);
@@ -205,11 +306,14 @@ fn fixture() -> Fixture {
         }],
         parents: Default::default(),
         agents: None,
+        traces: vec![trace],
+        enricher: Some(enricher(dir.path())),
     };
     Fixture {
         _dir: dir,
         router: rl_web::router(Arc::new(state)),
         id,
+        hop_ids,
     }
 }
 
@@ -684,4 +788,68 @@ async fn incident_timelines_come_as_html_json_or_csv() {
         let (st, _, body) = get(&f.router, &format!("/api/v1/reports/incidents?{bad}")).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {body}");
     }
+}
+
+#[tokio::test]
+async fn paths_give_the_hop_table_with_names_and_as_numbers() {
+    let f = fixture();
+    let (st, _, body) = get(&f.router, "/api/v1/paths").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v = json(&body);
+    assert_eq!(v["paths"][0]["target"], "web");
+    assert_eq!(v["paths"][0]["hop_series"], serde_json::json!(f.hop_ids));
+
+    let window = format!("from={T0}&to={}", T0 + 60_000);
+    let (st, _, body) = get(&f.router, &format!("/api/v1/paths/web?{window}")).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v = json(&body);
+    assert_eq!(v["source"], "sweeps");
+    assert_eq!(v["sweeps"], 24);
+    assert_eq!(v["rounds"], 1);
+    let hops = v["hops"].as_array().unwrap();
+    assert_eq!(hops.len(), 2);
+    let gw = &hops[0]["responders"][0];
+    assert_eq!(gw["addr"], "192.168.1.1");
+    assert_eq!(gw["class"], "private");
+    assert!(gw.get("asn").is_none(), "{gw}");
+    assert_eq!(hops[0]["series"], f.hop_ids[0]);
+    let dest = &hops[1];
+    assert_eq!(dest["loss_pct"], 25.0);
+    assert_eq!(dest["is_dest"], true);
+    assert_eq!(dest["median_us"], 9000);
+    let r = &dest["responders"][0];
+    assert_eq!(r["asn"], 13335);
+    assert_eq!(r["org"], "CLOUDFLARENET");
+    assert_eq!(r["country"], "US");
+    assert_eq!(r["rdns"], "one.one.one.one");
+    assert_eq!(r["share_pct"], 100.0);
+
+    // Past a day the hop series stand in: same loss, no responders.
+    let long = format!("from={}&to={}", T0 - 2 * 86_400_000, T0 + 60_000);
+    let (st, _, body) = get(&f.router, &format!("/api/v1/paths/web?{long}")).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let v = json(&body);
+    assert_eq!(v["source"], "hop_series");
+    assert_eq!(v["hops"][1]["loss_pct"], 25.0);
+    assert_eq!(v["hops"][1]["responders"], serde_json::json!([]));
+
+    // A hop series has a timeline like any series.
+    let (st, _, body) = get(
+        &f.router,
+        &format!("/api/v1/series/{}/data?{window}", f.hop_ids[1]),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["points"][0]["recv"], 18);
+
+    for uri in [
+        "/api/v1/paths/nope".to_string(),
+        format!("/api/v1/paths/web?family=v6&{window}"),
+        format!("/api/v1/paths/web?vantage=elsewhere&{window}"),
+    ] {
+        let (st, _, body) = get(&f.router, &uri).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+    let (st, _, _) = get(&f.router, "/api/v1/paths/web?from=5&to=1").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 }

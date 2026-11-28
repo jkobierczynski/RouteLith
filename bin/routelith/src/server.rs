@@ -23,7 +23,7 @@ use rl_probe::{
 };
 use rl_sched::{Completed, FailCause, Job, Outcome, Sink, Snapshot, Stats};
 use rl_store::{
-    Appended, ErrorCounts, Reader, SeriesKey, StoredRound, TraceHop, TraceLog, TraceRecord, Writer,
+    Appended, ErrorCounts, Reader, SeriesKey, StoredRound, TraceLog, TraceRecord, Writer,
     WriterOptions, WriterStats,
 };
 use rl_web::{AppState, HttpPhases, Latest, LatestHost, LatestRound, MetricsWriter, SeriesInfo};
@@ -205,6 +205,7 @@ pub(crate) async fn serve(
         }
     };
     let mut trace_jobs = Vec::with_capacity(traces.len());
+    let mut trace_infos = Vec::with_capacity(traces.len());
     let mut hop_steps = Vec::new();
     let mut ids_left = &trace_ids[..];
     for t in &traces {
@@ -212,6 +213,7 @@ pub(crate) async fn serve(
         ids_left = rest;
         let step_ms = u64::try_from(t.cfg.step.as_millis()).unwrap_or(u64::MAX);
         hop_steps.extend(mine[1..].iter().map(|&id| (id, step_ms)));
+        trace_infos.push(trace_info(t, &cfg.server.vantage, mine));
         trace_jobs.push(rl_sched::TraceJob {
             hop_series: mine[1..].to_vec(),
             raw_series: mine[0],
@@ -366,6 +368,15 @@ pub(crate) async fn serve(
     let host = Arc::new(LatestHost::default());
     let store_stats = Arc::new(Mutex::new(StoreCounters::default()));
     let stats = Arc::new(Stats::default());
+    // Names and AS numbers of trace hops, for the path API (§21.9 P9).
+    let enricher = Arc::new(rl_path::enrich::Enricher {
+        rdns: rl_path::enrich::Rdns::new(Arc::new(rl_path::enrich::system_lookup)),
+        asn: cfg
+            .server
+            .asn_db
+            .clone()
+            .map(rl_path::enrich::AsnSource::new),
+    });
     let web = match ui {
         None => None,
         Some((addr, listener, reader, tls, auth)) => {
@@ -397,6 +408,8 @@ pub(crate) async fn serve(
                 auth: auth.clone(),
                 slas: cfg.slas.clone(),
                 parents: crate::report::parents(&cfg),
+                traces: trace_infos,
+                enricher: Some(enricher.clone()),
             };
             Some((addr, listener, rl_web::router(Arc::new(state)), tls, auth))
         }
@@ -433,7 +446,7 @@ pub(crate) async fn serve(
         sweep_tx
             .try_send(Input::Sweep {
                 series,
-                record: trace_record(&s),
+                record: rl_path::report::record_of(&s),
             })
             .is_ok()
     });
@@ -454,6 +467,8 @@ pub(crate) async fn serve(
     };
 
     let (stop_tx, stop_rx) = watch::channel(false);
+    let asn_refresh = (web.is_some() && enricher.asn.is_some())
+        .then(|| tokio::spawn(refresh_asn_db(enricher.clone(), stop_rx.clone())));
     let mut jobs = tokio::task::JoinSet::new();
     let local_ids: Vec<u64> = ids[..local_n].to_vec();
     for ((plan, series), probe) in plans
@@ -598,6 +613,9 @@ pub(crate) async fn serve(
         events.abort();
     }
     agent_feed.abort();
+    if let Some(t) = asn_refresh {
+        t.abort();
+    }
     while let Some(r) = jobs.join_next().await {
         if r.is_err() {
             panicked += 1;
@@ -841,6 +859,7 @@ struct Store {
 #[derive(Debug, Clone, PartialEq)]
 struct TracePlan {
     target: String,
+    group: String,
     host: String,
     family: Family,
     cfg: config::TraceConfig,
@@ -881,6 +900,7 @@ fn trace_plans(cfg: &Config) -> Vec<TracePlan> {
         for &family in families {
             out.push(TracePlan {
                 target: t.id.clone(),
+                group: t.group.clone(),
                 host: t.host.clone(),
                 family,
                 cfg: tc,
@@ -890,31 +910,77 @@ fn trace_plans(cfg: &Config) -> Vec<TracePlan> {
     out
 }
 
-/// A sweep as the raw trace tier keeps it.
-fn trace_record(s: &rl_path::Sweep) -> TraceRecord {
-    let us = |d: Duration| u32::try_from(d.as_micros()).unwrap_or(u32::MAX);
-    TraceRecord {
-        ts_ms: to_ms(s.start),
-        timing: Some(s.timing),
-        hops: s
-            .hops
+/// How often `asn_db` is checked for a new file.
+const ASN_REFRESH: Duration = Duration::from_secs(60);
+
+/// Loads `asn_db`, then again whenever the file changes, until stopped. A
+/// file that cannot be read is reported once per distinct error; the
+/// ranges loaded before stay in use.
+async fn refresh_asn_db(enricher: Arc<rl_path::enrich::Enricher>, mut stop: watch::Receiver<bool>) {
+    let mut last_error: Option<String> = None;
+    loop {
+        let en = enricher.clone();
+        let r = tokio::task::spawn_blocking(move || en.asn.as_ref().map(|a| a.refresh())).await;
+        let path = enricher
+            .asn
+            .as_ref()
+            .map_or_else(String::new, |a| a.path().display().to_string());
+        match r {
+            Ok(Some(Ok(Some(n)))) => {
+                last_error = None;
+                eprintln!("routelith server: asn_db {path}: {n} address ranges loaded");
+            }
+            Ok(Some(Err(e))) => {
+                let msg = e.to_string();
+                if last_error.as_deref() != Some(msg.as_str()) {
+                    eprintln!(
+                        "routelith server: warning: asn_db {path}: {msg}; hops keep the AS \
+                         numbers loaded before, if any"
+                    );
+                    last_error = Some(msg);
+                }
+            }
+            _ => {}
+        }
+        tokio::select! {
+            _ = stop.wait_for(|s| *s) => return,
+            () = tokio::time::sleep(ASN_REFRESH) => {}
+        }
+    }
+}
+
+/// What the path API shows of a trace; `ids` are its raw series, then
+/// its hop series.
+fn trace_info(t: &TracePlan, vantage: &str, ids: &[u64]) -> rl_web::TraceInfo {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let keys = t.keys(vantage);
+    rl_web::TraceInfo {
+        vantage: vantage.to_string(),
+        target: t.target.clone(),
+        group: t.group.clone(),
+        host: t.host.clone(),
+        family: t.family.as_str().to_string(),
+        mode: match t.cfg.mode {
+            config::TraceMode::Continuous => "continuous",
+            config::TraceMode::OnAlert => "on_alert",
+        }
+        .to_string(),
+        interval_ms: ms(t.cfg.interval),
+        step_ms: ms(t.cfg.step),
+        max_ttl: t.cfg.max_ttl,
+        raw_series: ids[0],
+        hops: keys[1..]
             .iter()
-            .map(|h| match *h {
-                rl_path::Outcome::TimeExceeded { from, rtt } => TraceHop::TimeExceeded {
-                    from,
-                    rtt_us: us(rtt),
-                },
-                rl_path::Outcome::Reply { from, rtt } => TraceHop::Reply {
-                    from,
-                    rtt_us: us(rtt),
-                },
-                rl_path::Outcome::Unreachable { from, code, rtt } => TraceHop::Unreachable {
-                    from,
-                    code,
-                    rtt_us: us(rtt),
-                },
-                rl_path::Outcome::Lost => TraceHop::Lost,
-                rl_path::Outcome::SendFailed(_) => TraceHop::SendFailed,
+            .zip(&ids[1..])
+            .map(|(key, &id)| SeriesInfo {
+                id,
+                key: key.clone(),
+                group: t.group.clone(),
+                probe: "trace".to_string(),
+                host: t.host.clone(),
+                url: None,
+                step_ms: ms(t.cfg.step),
+                pings: u16::try_from(t.cfg.sweeps_per_step()).unwrap_or(u16::MAX),
             })
             .collect(),
     }
@@ -1753,6 +1819,7 @@ pub(crate) fn shutdown_signal() -> std::io::Result<impl std::future::Future<Outp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rl_store::TraceHop;
 
     #[test]
     fn traces_get_a_raw_series_and_one_hop_series_per_ttl() {
@@ -1793,7 +1860,7 @@ mod tests {
             ],
             timing: rl_core::TimingBackend::LinuxKernelTimestamp,
         };
-        let r = trace_record(&s);
+        let r = rl_path::report::record_of(&s);
         assert_eq!(r.ts_ms, 1000);
         assert_eq!(
             r.hops,

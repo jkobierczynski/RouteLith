@@ -16,6 +16,7 @@ pub mod auth;
 mod host;
 pub mod incidents;
 mod metrics;
+mod paths;
 pub mod silences;
 pub mod sla;
 mod ui;
@@ -162,6 +163,30 @@ pub struct AppState {
     /// Enrolled agents, their state and their enrollment; `None`
     /// without `listen_agents`.
     pub agents: Option<Arc<dyn agents::AgentAdmin>>,
+    /// The traces of this vantage (§21.9 P14).
+    pub traces: Vec<TraceInfo>,
+    /// rDNS and ASN lookups for trace hops (§21.9 P9); `None` leaves hops
+    /// with their address class only.
+    pub enricher: Option<Arc<rl_path::enrich::Enricher>>,
+}
+
+/// One traced target and family.
+#[derive(Debug, Clone)]
+pub struct TraceInfo {
+    pub vantage: String,
+    pub target: String,
+    pub group: String,
+    pub host: String,
+    pub family: String,
+    /// `continuous` or `on_alert`.
+    pub mode: String,
+    pub interval_ms: u64,
+    pub step_ms: u64,
+    pub max_ttl: u8,
+    /// The raw sweeps' series.
+    pub raw_series: u64,
+    /// The hop series, TTL 1 first.
+    pub hops: Vec<SeriesInfo>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -186,6 +211,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/agents/enroll-token", post(agents::enroll_token))
         .route("/api/v1/agents/{name}", delete(agents::revoke))
         .route("/api/v1/series/{id}/data", get(api::data))
+        .route("/api/v1/paths", get(paths::list))
+        .route("/api/v1/paths/{target}", get(paths::path))
         .route("/api/v1/health", get(host::history))
         .route("/api/v1/alerts", get(alerts::alerts))
         .route("/api/v1/events", get(alerts::events))

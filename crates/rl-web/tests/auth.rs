@@ -116,6 +116,8 @@ fn fixture_with(
         slas: Vec::new(),
         parents: Default::default(),
         agents,
+        traces: Vec::new(),
+        enricher: None,
     };
     Fixture {
         router: rl_web::router(Arc::new(state)),

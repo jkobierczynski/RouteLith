@@ -1,6 +1,7 @@
 //! Domain types: targets, rounds, samples, config schema and errors.
 #![forbid(unsafe_code)]
 
+pub mod addr;
 pub mod alert;
 pub mod config;
 pub mod duration;
