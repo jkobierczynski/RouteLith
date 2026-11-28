@@ -155,7 +155,9 @@ sudo tests/lab/netem-accuracy.sh target/release/routelith
 sudo DELAY_TOL_MS=1 tests/lab/netem-accuracy.sh target/release/routelith
 
 # `routelith trace` over a fake 5-hop path on a TUN device, run as user
-# nobody, IPv4 and IPv6 (about 2 minutes). Runs in its own network
+# nobody, IPv4 and IPv6, then `routelith server` tracing it continuously
+# for SERVER_SECS (150) and `ctl report path` reading the hop series and
+# raw sweeps back (about 5 minutes). Runs in its own network
 # namespace, so it changes nothing on the host. Needs root, python3,
 # iproute2 and setpriv; no veth or netem, so it also works in containers
 # that have /dev/net/tun.

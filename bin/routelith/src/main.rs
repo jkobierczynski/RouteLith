@@ -11,6 +11,7 @@ mod calibrate;
 mod check;
 mod health;
 mod import;
+mod pathreport;
 mod render;
 mod report;
 mod server;
@@ -103,6 +104,8 @@ enum ReportKind {
     Sla(report::SlaArgs),
     /// A month's NIS2 incident timeline, as HTML, JSON or CSV.
     Incidents(report::IncidentArgs),
+    /// A traced target's hops over a recent window, from the store.
+    Path(pathreport::PathArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -162,6 +165,11 @@ fn main() -> ExitCode {
                     kind: ReportKind::Incidents(args),
                 },
         } => report::run_incidents(&args),
+        Command::Ctl {
+            action: CtlAction::Report {
+                kind: ReportKind::Path(args),
+            },
+        } => pathreport::run(&args),
     }
 }
 

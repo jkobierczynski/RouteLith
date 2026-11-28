@@ -8,7 +8,8 @@ shipped as one self-contained binary.
 **Status:** pre-alpha. M0 (ICMP, scheduler, store, SVG smoke graphs) and M1
 (TCP/DNS/HTTP, rollups, web UI, services), M2 (alerts, outputs, reports)
 and M3 (agents) are done; M3.5 (path monitoring) has started with
-`routelith trace --report`, an unprivileged hop-by-hop trace. `routelith
+`routelith trace --report`, an unprivileged hop-by-hop trace, and
+continuous traces from the server (below). `routelith
 check icmp`, `check tcp`, `check dns` and
 `check http` work on Linux and Windows, and `routelith server` measures all
 four kinds of target. The server also answers HTTP on `127.0.0.1:8080`
@@ -162,6 +163,21 @@ timeline (UTC) comes as HTML, JSON or CSV: `routelith ctl report incidents
 incidents.html`, or `GET
 /api/v1/reports/incidents?month=2026-11&format=json&gap=15` (the gap in
 minutes); the overview links this month's and last month's.
+
+Path tracing: `trace = "continuous"` on a target, group or `[defaults]`
+makes the server trace the path to the target's address over ICMP (also for
+TCP, DNS and HTTP targets; the target's own probe keeps running). Every
+`trace_interval` (2.5 s) one probe per TTL is sent, spread over the
+interval, up to `max_ttl` (30) until the destination answers, then only up
+to its distance. Every `trace_step` (60 s) each hop gets a round, stored as
+a series of its own named `<target>#<ttl>` (`routelith ctl render --target
+'web#3'` draws hop 3), and every sweep is kept for `trace_raw_days` (7) in
+`series/<id>/trace/`. `routelith ctl report path -c routelith.toml --target
+web --last 10m` prints the hops (loss, RTT and responders) from the store,
+`--json` for scripts. At most `max_trace_targets` (50) targets are traced;
+the rest are refused with a warning, and traces count against `max_pps`.
+The path view, route changes, agent traces and `trace = "on_alert"` come
+in later steps.
 
 History from SmokePing comes over with `routelith ctl import smokeping`,
 with the server stopped. It reads `rrdtool dump` XML, so the RRD files can

@@ -11,6 +11,9 @@
 #   - 30 % loss on hop 3 only (a router that rate-limits its ICMP), and
 #     20 % loss from hop 3 on (loss on the link), each within 5 points
 #   - each hop's median RTT within 0.5 ms of its configured delay
+# Then `routelith server` traces the rate-limited path continuously, and
+# `ctl report path` reads its hop series and raw sweeps back: 30 % loss on
+# hop 3's series only (§21.10 "Hop series"), every sweep kept.
 # The fake path's random loss is seeded, so a run is repeatable.
 #
 # Works where veth and netem are missing (the cloud sandbox), as long as
@@ -22,6 +25,7 @@ set -euo pipefail
 BIN=$(realpath "${1:?usage: $0 path/to/routelith}")
 HERE=$(cd "$(dirname "$0")" && pwd)
 SWEEPS=${SWEEPS:-300}
+SERVER_SECS=${SERVER_SECS:-150}
 RTT_TOL_MS=${RTT_TOL_MS:-0.5}
 
 if [[ ${RL_TRACE_LAB_INNER:-} != 1 ]]; then
@@ -43,6 +47,7 @@ SIM=
 OUT=$(mktemp -d)
 cleanup() {
     [[ -n $SIM ]] && kill "$SIM" 2>/dev/null || true
+    [[ -n ${SERVER:-} ]] && kill "$SERVER" 2>/dev/null || true
     rm -rf "$OUT"
 }
 trap cleanup EXIT
@@ -117,5 +122,73 @@ for fam in $FAMILIES; do
     run_trace "-$fam" "$dest" "$OUT/link-$fam.json" || true
     check "ipv$fam lossy link" "$OUT/link-$fam.json" 5 "0 0 0 20 20" "$dest" "$RTT_TOL_MS" 2 || status=1
 done
+
+# The server: a continuous trace at 0.5 s with 10 s hop rounds.
+start_sim HOPS=5 LOSSY=3 LOSS=0.3 FORWARD_LOSS=0 HOP_DELAY_MS=2 SEED=3
+# nobody needs to reach the data directory inside mktemp's 0700 folder.
+chmod 755 "$OUT"
+mkdir "$OUT/data"
+chown 65534:65534 "$OUT/data"
+cat > "$OUT/server.toml" <<EOF
+[server]
+data_dir = "$OUT/data"
+listen_ui = "off"
+
+[defaults]
+step = "60s"
+pings = 5
+
+[[group]]
+name = "lab"
+
+  [[group.target]]
+  name = "dest"
+  host = "198.51.100.10"
+  trace = "continuous"
+  trace_interval = "500ms"
+  trace_step = "10s"
+  max_ttl = 8
+EOF
+setpriv --reuid=65534 --regid=65534 --clear-groups --inh-caps=-all \
+    "$BIN" server -c "$OUT/server.toml" --stats-interval 0 2> "$OUT/server.log" &
+SERVER=$!
+sleep "$SERVER_SECS"
+kill -INT "$SERVER" 2>/dev/null || true
+if ! wait "$SERVER"; then
+    echo "FAIL server exited with an error"
+    status=1
+fi
+cat "$OUT/server.log"
+SERVER=
+setpriv --reuid=65534 --regid=65534 --clear-groups --inh-caps=-all \
+    "$BIN" ctl report path -c "$OUT/server.toml" --target dest --last 1h --json > "$OUT/path.json" || status=1
+python3 - "$OUT/path.json" "$SERVER_SECS" <<'EOF' || status=1
+import json, sys
+r = json.load(open(sys.argv[1]))
+secs = int(sys.argv[2])
+fail = []
+hops = r["hops"]
+if [h["ttl"] for h in hops] != [1, 2, 3, 4, 5]:
+    fail.append(f"hop series {[h['ttl'] for h in hops]}, want 1 to 5")
+want = [0, 0, 30, 0, 0]
+for h in hops[:5]:
+    w = want[h["ttl"] - 1]
+    if abs(h["loss_pct"] - w) > 5:
+        fail.append(f"hop {h['ttl']}: loss {h['loss_pct']:.1f} %, want {w} % +- 5")
+    addrs = [x["addr"] for x in h["responders"]]
+    exp = "198.51.100.10" if h["ttl"] == 5 else f"192.0.2.{h['ttl']}"
+    if addrs != [exp]:
+        fail.append(f"hop {h['ttl']}: responders {addrs}, want [{exp}]")
+    med = (h["median_us"] or 0) / 1000
+    print(f"  server hop {h['ttl']}: {','.join(addrs)} loss {h['loss_pct']:5.1f} % "
+          f"of {h['sent']} median {med:.3f} ms")
+# Sweeps start on 10 s steps: the first may wait up to a step.
+if r["sweeps"] < (secs - 12) * 2:
+    fail.append(f"{r['sweeps']} raw sweeps, want at least {(secs - 12) * 2}")
+if fail:
+    print("FAIL server trace: " + "; ".join(fail))
+    sys.exit(1)
+print(f"PASS server trace ({r['sweeps']} sweeps, {r['rounds']} hop rounds)")
+EOF
 
 exit $status

@@ -12,6 +12,8 @@ data_dir = "/var/lib/routelith"
 #                     # add users with `routelith ctl user add NAME --role ROLE`
 # anonymous = true    # with users: read without logging in (wall displays)
 # listen_agents = "0.0.0.0:4443"  # accept agents (gRPC, mutual TLS); off unless set
+# max_trace_targets = 50  # most continuous traces from this vantage
+# trace_raw_days = 7      # days every sweep of a trace is kept
 
 # Settings here apply to every target unless a group or target overrides them.
 [defaults]
@@ -22,6 +24,11 @@ pings   = 20       # samples per round
 # size    = 56     # ICMP payload bytes
 # family  = "v4"   # v4, v6, both (two series) or prefer-v6
 # alerts  = ["down", "slow"]  # alert rules (below) that apply
+# trace   = "continuous"   # trace the path hop by hop (ICMP, whatever the probe);
+#                          # "on_alert" is accepted but not run yet; default "off"
+# trace_interval = "2.5s"  # one sweep of every TTL per interval (0.5s to 60s)
+# max_ttl = 30             # highest TTL probed
+# trace_step = "60s"       # one round per hop per step (a multiple of the interval)
 # Each target measures ICMP echo unless it sets probe = "tcp" (connect time to
 # its port; mode = "banner" times the server's first byte instead) or
 # probe = "dns" (one query per sample to server; see the dns-quad9-query target)

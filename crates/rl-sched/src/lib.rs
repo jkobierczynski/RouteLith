@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 mod hist;
+pub mod trace;
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +31,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 pub use hist::Histogram;
+pub use trace::{OpenTracer, SweepSink, TraceJob, run_trace};
 
 /// A wall/monotonic disagreement above this is a clock step.
 const CLOCK_STEP_US: i64 = 1_000_000;
