@@ -12,10 +12,13 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+dns-lookup.workspace = true
+flate2.workspace = true
 rl-core.workspace = true
+rl-store.workspace = true
 rl-probe.workspace = true
 rl-sys.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 thiserror.workspace = true
 tokio.workspace = true
 
@@ -23,4 +26,5 @@ tokio.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

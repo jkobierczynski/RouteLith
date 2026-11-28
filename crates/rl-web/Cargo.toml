@@ -21,6 +21,7 @@ rustls.workspace = true
 rustls-pki-types.workspace = true
 rl-alert.workspace = true
 rl-core.workspace = true
+rl-path.workspace = true
 rl-render.workspace = true
 rl-store.workspace = true
 serde.workspace = true

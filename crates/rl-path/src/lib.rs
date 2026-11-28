@@ -11,6 +11,8 @@
 //! and [`HopStats`] summarises them per TTL, as `routelith trace` shows.
 #![forbid(unsafe_code)]
 
+pub mod enrich;
+pub mod report;
 mod stats;
 mod sweep;
 

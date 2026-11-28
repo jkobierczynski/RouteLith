@@ -1,8 +1,9 @@
 //! `routelith ctl report path`: a traced target's hops over a recent
-//! window, read from the store (hop series and raw sweeps, §21.9 P6, P7).
-//! The server may run.
+//! window, read from the store (hop series and raw sweeps, §21.9 P6, P7),
+//! with address classes and, given `asn_db`, AS numbers (P9). The server
+//! may run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -10,7 +11,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Args;
+use rl_core::addr::classify;
 use rl_core::config;
+use rl_path::enrich::{AsnDb, HopInfo};
+use rl_path::report::{PathReport, ResponderRow, Source};
 use rl_store::Reader;
 use serde::Serialize;
 
@@ -35,37 +39,13 @@ pub(crate) struct PathArgs {
     json: bool,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
-struct Responder {
-    addr: IpAddr,
-    replies: u64,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-struct Hop {
-    ttl: u8,
-    sent: u64,
-    received: u64,
-    loss_pct: f64,
-    min_us: Option<u32>,
-    median_us: Option<u32>,
-    max_us: Option<u32>,
-    /// From the raw sweeps; most answers first.
-    responders: Vec<Responder>,
-}
-
 #[derive(Debug, Serialize)]
 struct Report {
     target: String,
     vantage: String,
     family: String,
-    from_ms: i64,
-    to_ms: i64,
-    /// Hop rounds in the window (of the first hop).
-    rounds: usize,
-    /// Raw sweeps in the window.
-    sweeps: usize,
-    hops: Vec<Hop>,
+    #[serde(flatten)]
+    path: PathReport,
 }
 
 /// Exit codes: 0 printed, 1 no such traced target, 2 cannot read.
@@ -139,70 +119,45 @@ fn report(args: &PathArgs, now: i64) -> Result<String, (u8, String)> {
             hop_ids.insert(ttl, *id);
         }
     }
-    let sweeps = rl_store::read_trace(dir, raw_id, from_ms, to_ms)
-        .map_err(|e| (2, format!("reading the sweeps: {e}")))?;
-    let mut responders: BTreeMap<u8, BTreeMap<IpAddr, u64>> = BTreeMap::new();
-    for s in &sweeps {
-        for (i, h) in s.hops.iter().enumerate() {
-            if let (Some(a), Ok(ttl)) = (h.responder(), u8::try_from(i + 1)) {
-                *responders.entry(ttl).or_default().entry(a).or_default() += 1;
+    // TTL 1 up, as long as there is a series for each.
+    let hop_ids: Vec<u64> = (1..=u8::MAX)
+        .map_while(|t| hop_ids.get(&t).copied())
+        .collect();
+    let mut path = rl_path::report::read(&reader, dir, raw_id, &hop_ids, from_ms, to_ms)
+        .map_err(|e| (2, format!("reading the trace: {e}")))?;
+    // AS numbers from `asn_db`; names need the server's lookups.
+    if let Some(file) = &cfg.server.asn_db {
+        match AsnDb::load(file) {
+            Ok(db) => {
+                let info: HashMap<IpAddr, HopInfo> = path
+                    .addrs()
+                    .into_iter()
+                    .map(|a| {
+                        let class = classify(a);
+                        let asn = db.lookup(a).filter(|_| class.is_public());
+                        let info = HopInfo {
+                            rdns: None,
+                            asn: asn.map(|i| i.asn),
+                            org: asn.map(|i| i.org.clone()),
+                            country: asn.map(|i| i.country.clone()),
+                            class,
+                        };
+                        (a, info)
+                    })
+                    .collect();
+                path.enrich(&info);
             }
+            Err(e) => eprintln!(
+                "routelith ctl report path: warning: asn_db {}: {e}",
+                file.display()
+            ),
         }
-    }
-    let mut hops = Vec::new();
-    let mut rounds = 0;
-    for (&ttl, &id) in &hop_ids {
-        let rs = reader
-            .read(id, from_ms, to_ms)
-            .map_err(|e| (2, format!("reading hop {ttl}: {e}")))?;
-        if rs.is_empty() {
-            continue;
-        }
-        if hops.is_empty() {
-            rounds = rs.len();
-        }
-        let mut rtts: Vec<u32> = rs.iter().flat_map(|r| r.rtts_us.iter().copied()).collect();
-        rtts.sort_unstable();
-        let sent: u64 = rs.iter().map(|r| u64::from(r.sent)).sum();
-        let received = rtts.len() as u64;
-        let mid = rtts.len() / 2;
-        let median = match rtts.len() {
-            0 => None,
-            n if n % 2 == 1 => Some(rtts[mid]),
-            _ => Some(rtts[mid - 1] / 2 + rtts[mid] / 2 + (rtts[mid - 1] % 2 + rtts[mid] % 2) / 2),
-        };
-        let mut rs: Vec<Responder> = responders
-            .remove(&ttl)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(addr, replies)| Responder { addr, replies })
-            .collect();
-        rs.sort_by(|a, b| b.replies.cmp(&a.replies).then(a.addr.cmp(&b.addr)));
-        hops.push(Hop {
-            ttl,
-            sent,
-            received,
-            #[allow(clippy::cast_precision_loss)]
-            loss_pct: if sent == 0 {
-                0.0
-            } else {
-                100.0 * (sent - received) as f64 / sent as f64
-            },
-            min_us: rtts.first().copied(),
-            median_us: median,
-            max_us: rtts.last().copied(),
-            responders: rs,
-        });
     }
     let r = Report {
         target: args.target.clone(),
         vantage: vantage.clone(),
         family,
-        from_ms,
-        to_ms,
-        rounds,
-        sweeps: sweeps.len(),
-        hops,
+        path,
     };
     if args.json {
         let mut s = serde_json::to_string_pretty(&r).map_err(|e| (2, e.to_string()))?;
@@ -213,54 +168,74 @@ fn report(args: &PathArgs, now: i64) -> Result<String, (u8, String)> {
     }
 }
 
-fn ms(us: Option<u32>) -> String {
-    us.map_or_else(|| "-".into(), |us| format!("{:.2}", f64::from(us) / 1000.0))
+fn ms(us: Option<f64>) -> String {
+    us.map_or_else(|| "-".into(), |us| format!("{:.2}", us / 1000.0))
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn f(us: Option<u64>) -> Option<f64> {
+    us.map(|u| u as f64)
+}
+
+/// An address, with its class unless it is public.
+fn host(r: &ResponderRow) -> String {
+    if r.class.is_public() {
+        r.addr.to_string()
+    } else {
+        format!("{} ({})", r.addr, r.class.as_str())
+    }
 }
 
 fn render(r: &Report, last: Duration) -> String {
+    let p = &r.path;
     let mut out = String::new();
-    let _ = writeln!(
+    let _ = write!(
         out,
-        "path of {} ({}) from {}, last {}: {} hop rounds, {} sweeps",
+        "path of {} ({}) from {}, last {}: ",
         r.target,
         r.family,
         r.vantage,
         rl_core::duration::format(last),
-        r.rounds,
-        r.sweeps
     );
+    let _ = match p.source {
+        Source::Sweeps => writeln!(out, "{} sweeps, {} hop rounds", p.sweeps, p.rounds),
+        Source::HopSeries => writeln!(
+            out,
+            "{} hop rounds (no raw sweeps in the window, so no responders)",
+            p.rounds
+        ),
+    };
     let _ = writeln!(
         out,
-        "{:>3}  {:<39} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8}",
-        "Hop", "Host", "Loss%", "Sent", "Recv", "Min", "Median", "Max"
+        "{:>3}  {:<39} {:>8} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8}",
+        "Hop", "Host", "ASN", "Loss%", "Sent", "Recv", "Min", "Median", "Avg", "Max"
     );
-    for h in &r.hops {
-        let host = h
-            .responders
-            .first()
-            .map_or_else(|| "???".to_string(), |x| x.addr.to_string());
+    let asn = |x: &ResponderRow| x.asn.map_or_else(|| "-".into(), |a| format!("AS{a}"));
+    for h in &p.hops {
+        let first = h.responders.first();
         let _ = writeln!(
             out,
-            "{:>3}  {:<39} {:>6.1} {:>6} {:>6} {:>8} {:>8} {:>8}",
+            "{:>3}  {:<39} {:>8} {:>6.1} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8}",
             h.ttl,
-            host,
+            first.map_or_else(|| "???".to_string(), host),
+            first.map_or_else(|| "-".to_string(), asn),
             h.loss_pct,
             h.sent,
             h.received,
-            ms(h.min_us),
-            ms(h.median_us),
-            ms(h.max_us)
+            ms(f(h.min_us)),
+            ms(f(h.median_us)),
+            ms(h.avg_us),
+            ms(f(h.max_us))
         );
         if h.responders.len() > 1 {
-            let total: u64 = h.responders.iter().map(|x| x.replies).sum();
             for x in &h.responders {
-                #[allow(clippy::cast_precision_loss)]
-                let share = 100.0 * x.replies as f64 / total.max(1) as f64;
                 let _ = writeln!(
                     out,
-                    "{:>3}  {:<39} {share:>5.1}% of answers",
+                    "{:>3}  {:<39} {:>8} {:>5.1}% of answers",
                     "",
-                    format!("  {}", x.addr)
+                    format!("  {}", host(x)),
+                    asn(x),
+                    x.share_pct
                 );
             }
         }

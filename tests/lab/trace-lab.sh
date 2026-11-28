@@ -11,7 +11,8 @@
 #   - 30 % loss on hop 3 only (a router that rate-limits its ICMP), and
 #     20 % loss from hop 3 on (loss on the link), each within 5 points
 #   - each hop's median RTT within 0.5 ms of its configured delay
-# Then `routelith server` traces the rate-limited path continuously, and
+# Then `routelith server` traces the rate-limited path continuously, the
+# path API answers while it runs (each hop labelled "documentation"), and
 # `ctl report path` reads its hop series and raw sweeps back: 30 % loss on
 # hop 3's series only (§21.10 "Hop series"), every sweep kept.
 # The fake path's random loss is seeded, so a run is repeatable.
@@ -25,6 +26,7 @@ set -euo pipefail
 BIN=$(realpath "${1:?usage: $0 path/to/routelith}")
 HERE=$(cd "$(dirname "$0")" && pwd)
 SWEEPS=${SWEEPS:-300}
+UI_PORT=${UI_PORT:-18080}
 SERVER_SECS=${SERVER_SECS:-150}
 RTT_TOL_MS=${RTT_TOL_MS:-0.5}
 
@@ -132,7 +134,7 @@ chown 65534:65534 "$OUT/data"
 cat > "$OUT/server.toml" <<EOF
 [server]
 data_dir = "$OUT/data"
-listen_ui = "off"
+listen_ui = "127.0.0.1:$UI_PORT"
 
 [defaults]
 step = "60s"
@@ -153,6 +155,29 @@ setpriv --reuid=65534 --regid=65534 --clear-groups --inh-caps=-all \
     "$BIN" server -c "$OUT/server.toml" --stats-interval 0 2> "$OUT/server.log" &
 SERVER=$!
 sleep "$SERVER_SECS"
+# The path API while the server runs: the same hops, each labelled
+# "documentation" (the lab's addresses are RFC 5737 ones).
+python3 - "$UI_PORT" <<'APIEOF' || status=1
+import json, sys, urllib.request
+url = f"http://127.0.0.1:{sys.argv[1]}/api/v1/paths/dest?range=3h"
+r = json.load(urllib.request.urlopen(url, timeout=10))
+hops = r["hops"]
+fail = []
+if r["source"] != "sweeps" or [h["ttl"] for h in hops] != [1, 2, 3, 4, 5]:
+    fail.append(f"source {r['source']}, hops {[h['ttl'] for h in hops]}")
+for h in hops:
+    classes = {x["class"] for x in h["responders"]}
+    if classes != {"documentation"}:
+        fail.append(f"hop {h['ttl']}: classes {classes}")
+    if "series" not in h:
+        fail.append(f"hop {h['ttl']}: no hop series id")
+if not hops[-1]["is_dest"]:
+    fail.append("the last hop is not the destination")
+if fail:
+    print("FAIL path API: " + "; ".join(fail))
+    sys.exit(1)
+print(f"PASS path API ({r['sweeps']} sweeps, hop 3 loss {hops[2]['loss_pct']:.1f} %)")
+APIEOF
 kill -INT "$SERVER" 2>/dev/null || true
 if ! wait "$SERVER"; then
     echo "FAIL server exited with an error"

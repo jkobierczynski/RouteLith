@@ -157,6 +157,10 @@ pub struct ServerConfig {
     pub max_trace_targets: u32,
     /// Days of raw sweeps kept (§21.9 P7).
     pub trace_raw_days: u32,
+    /// An iptoasn.com `ip2asn-combined.tsv` file (optionally `.gz`) that
+    /// gives trace hops their AS number and owner (§21.9 P9); `None`
+    /// unless set.
+    pub asn_db: Option<PathBuf>,
 }
 
 /// PEM files for TLS on the web UI.
@@ -785,6 +789,7 @@ struct RawServer {
     tls_key: Option<Spanned<String>>,
     max_trace_targets: Option<Spanned<i64>>,
     trace_raw_days: Option<Spanned<i64>>,
+    asn_db: Option<Spanned<String>>,
 }
 
 /// Settings that cascade. Repeated in each table below because serde's
@@ -2466,6 +2471,7 @@ impl Validator<'_> {
             Some(v) => path(v, "users_file"),
             None => Some(PathBuf::from(data_dir).join(DEFAULT_USERS_FILE)),
         };
+        let asn_db = raw.asn_db.as_ref().and_then(|v| path(v, "asn_db"));
         let tls = match (&raw.tls_cert, &raw.tls_key) {
             (None, None) => None,
             (Some(c), Some(k)) => match (path(c, "tls_cert"), path(k, "tls_key")) {
@@ -2519,6 +2525,7 @@ impl Validator<'_> {
             listen_agents,
             max_trace_targets,
             trace_raw_days,
+            asn_db,
         })
     }
 
@@ -5411,6 +5418,19 @@ max_ttl = 12
             "{warnings:?}"
         );
         assert_eq!(c.server.trace_raw_days, DEFAULT_TRACE_RAW_DAYS);
+        assert_eq!(c.server.asn_db, None);
+        let c = parse(&TRACED.replace(
+            "max_trace_targets = 2",
+            "max_trace_targets = 2\nasn_db = \"/var/lib/routelith/ip2asn-combined.tsv.gz\"",
+        ))
+        .config
+        .unwrap();
+        assert_eq!(
+            c.server.asn_db.as_deref(),
+            Some(std::path::Path::new(
+                "/var/lib/routelith/ip2asn-combined.tsv.gz"
+            ))
+        );
     }
 
     #[test]
@@ -5455,6 +5475,8 @@ max_ttl = 12
         );
         let e = errors("[server]\ndata_dir = \"/x\"\nmax_trace_targets = 0\n");
         assert!(e[0].contains("max_trace_targets must be a whole number from 1 to 1000"));
+        let e = errors("[server]\ndata_dir = \"/x\"\nasn_db = \" \"\n");
+        assert!(e[0].contains("asn_db must be a file path"), "{e:?}");
     }
 
     #[test]
